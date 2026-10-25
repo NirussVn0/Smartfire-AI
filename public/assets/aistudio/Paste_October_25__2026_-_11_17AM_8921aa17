@@ -1,0 +1,1775 @@
+# MASTER IMPLEMENTATION PROMPT
+## SmartFire AI — Native Android IoT Control Center
+### Kotlin · Jetpack Compose · BLE · Wi-Fi · Indoor Mapping · AI · Local-first
+
+## 0. ROLE & MISSION
+
+Bạn là một Senior Android Engineer, Mobile Solution Architect, IoT Integration Engineer và Product UI/UX Designer.
+
+Nhiệm vụ: **Xây dựng ứng dụng Android Native hoàn chỉnh bằng Kotlin cho dự án SmartFire AI — Sản phẩm STEM Nhóm 2, Lớp 12D3.**
+
+Đây là một ứng dụng thực tế dùng để quản lý hệ thống cảm biến cảnh báo cháy ESP32, không phải landing page, bản vẽ minh họa hoặc UI prototype không có logic.
+
+**Primary goal:** Build a functional, polished, extensible Android app that connects to existing SmartFire ESP32 firmware through documented APIs.
+
+Mục tiêu là tạo ứng dụng:
+- Kết nối ESP32 bằng Wi-Fi/LAN.
+- Thiết lập Wi-Fi cho ESP32 bằng Bluetooth Low Energy (BLE).
+- Tự nhận diện thiết bị theo `device_id`.
+- Quản lý nhiều thiết bị, nhiều phòng, nhiều tầng và nhiều ngôi nhà.
+- Hiển thị cảm biến và trạng thái cảnh báo theo thời gian gần thực.
+- Nhận, lưu và hiển thị lịch sử sự kiện.
+- Hiển thị bản đồ 2D trong nhà với vị trí thiết bị và thiết bị chữa cháy.
+- Hỗ trợ thiết lập bản đồ bằng ảnh, đo đạc và thao tác quét không gian phù hợp với khả năng điện thoại.
+- Tích hợp phân tích dữ liệu, AI insights và kiến trúc mở rộng cho AI inference.
+- Hoạt động chủ yếu offline/local, không yêu cầu cloud database.
+
+### Ràng buộc quan trọng
+
+1. KHÔNG sửa firmware ESP32 trong task này.
+2. KHÔNG tự tạo thêm API endpoint không tồn tại.
+3. KHÔNG tạo backend server hay PostgreSQL.
+4. KHÔNG thay đổi giao thức truyền thông đã cung cấp.
+5. KHÔNG hardcode dữ liệu mô phỏng vào chế độ vận hành thật.
+6. KHÔNG chỉ dựng UI rồi kết thúc.
+7. Phải triển khai một luồng hoạt động end-to-end: kết nối thiết bị → đọc trạng thái → hiển thị → lưu dữ liệu → xử lý sự kiện.
+8. Giữ code sạch, có thể kiểm thử và phát triển lâu dài.
+
+Nếu đã có Android project, hãy inspect codebase trước và phát triển trên project hiện có, không tự ý tạo project mới.
+
+---
+
+# 1. PRODUCT CONTEXT
+
+## 1.1. SmartFire Hardware
+
+Mỗi SmartFire Node dùng một ESP32-WROOM DevKit, có thể bao gồm:
+
+| Hardware | Function |
+|---|---|
+| ESP32-WROOM | Vi điều khiển, Wi-Fi và BLE |
+| MQ-2 | Đo tín hiệu analog liên quan tới khí/hơi dễ cháy |
+| Flame Sensor | Phát hiện tín hiệu ngọn lửa qua digital output |
+| LM2596 | Hạ áp 12V xuống 5V |
+| D4184 MOSFET | Điều khiển còi báo động |
+| 12V Alarm Horn | Báo động âm thanh/đèn tại chỗ |
+| Push Button | Test và Silence |
+| Status LED | Hiển thị trạng thái tại node |
+
+Các GPIO hiện tại:
+- GPIO34: MQ-2 analog qua voltage divider.
+- GPIO27: Flame Sensor DO.
+- GPIO18: Test/Silence button.
+- GPIO25: Status LED.
+- GPIO26: D4184 horn control.
+- GPIO21/22: Dự phòng I²C.
+
+Không có cảm biến nhiệt đã xác nhận trong firmware hiện tại. Nếu thiết kế UI có khu vực nhiệt độ, phải ghi là chưa hỗ trợ, không hiển thị nhiệt độ giả.
+
+MQ-2 hiện trả về `gas_raw`, không phải nồng độ khí ppm đã được hiệu chuẩn.
+
+## 1.2. Local-first Ownership
+
+Quy định rõ:
+
+**ESP32 owns the alarm state. The Android app owns the user configuration, indoor maps and persistent history.**
+
+- ESP32 xử lý phát hiện nguy cơ, trạng thái cảnh báo và còi tại chỗ.
+- Android đọc trạng thái, lưu sự kiện, hiển thị cảnh báo và bản đồ.
+- AI bổ sung thông tin, không thay thế quyết định cảnh báo trên ESP32.
+- Room Database là nguồn dữ liệu bền vững trên điện thoại.
+- Không cần Internet để đọc node trong cùng LAN.
+- Không giả định có khả năng theo dõi từ xa ngoài LAN.
+
+Kiến trúc truyền thông:
+
+ESP32 ↔ BLE GATT ↔ Kotlin App (cấu hình mạng)
+
+ESP32 ↔ Wi-Fi Router/LAN ↔ HTTP REST ↔ Kotlin App (giám sát và lệnh)
+
+Kotlin App ↔ Room SQLite (lưu thông tin thiết bị, nhà, bản đồ, sự kiện)
+
+Kotlin App ↔ AI Analysis (phân tích bổ trợ)
+
+Không dùng Firebase làm database chính.
+
+---
+
+# 2. REQUIRED TECH STACK
+
+Xây dựng Android Native:
+
+- Language: Kotlin.
+- UI: Jetpack Compose.
+- Design System: Material 3.
+- Architecture: Clean Architecture vừa đủ + MVVM.
+- Navigation: Navigation Compose.
+- Asynchronous Operations: Kotlin Coroutines + Flow/StateFlow.
+- Dependency Injection: Hilt.
+- HTTP Client: Retrofit + OkHttp.
+- Serialization: Kotlinx Serialization hoặc Moshi.
+- Local Database: Room SQLite.
+- Preferences: DataStore.
+- Secrets: Android Keystore-backed secure storage.
+- BLE: Android Bluetooth LE / GATT APIs.
+- Background Tasks: WorkManager cho các công việc trì hoãn phù hợp; không dùng nó để giả lập realtime.
+- Notifications: Android NotificationManager.
+- Camera/QR: CameraX + thư viện QR phù hợp.
+- Mapping: Jetpack Compose Canvas và custom gestures.
+- Testing: JUnit, coroutine tests, Compose UI tests.
+
+Dùng stable compatible versions và thiết lập Gradle đúng.
+
+Mục tiêu tối thiểu: Android 8.0+ nếu dependency cho phép, đồng thời xử lý permission theo API level.
+
+Không cần overengineering bằng nhiều abstract factories. Chỉ tạo abstraction ở những ranh giới thực sự quan trọng: HTTP, BLE, Repository, Database, AI Provider.
+
+---
+
+# 3. UI/UX DESIGN SYSTEM
+
+Thiết kế một ứng dụng IoT hiện đại, cao cấp và có khả năng dùng thực tế.
+
+### Visual direction
+
+Phong cách:
+- Modern Smart Home Dashboard.
+- Clean and minimal.
+- Professional industrial IoT aesthetics.
+- Material 3 với khả năng tùy biến.
+- Màu sắc tập trung vào clarity, hierarchy và usability.
+- Motion/animation có mục đích, không lạm dụng.
+- Responsive cho nhiều kích thước màn hình Android.
+
+Color semantics:
+- Primary: Deep Navy / Blue.
+- Accent: Cyan.
+- Success: Green.
+- Warning: Amber.
+- Critical Alarm: Red.
+- Offline/Unknown: Neutral Gray.
+- Background: Off-white hoặc Dark Slate theo theme.
+
+Chú ý: không hiển thị màu xanh thể hiện an toàn khi dữ liệu đã stale hoặc thiết bị mất kết nối.
+
+### UI Requirements
+
+- Light Mode và Dark Mode.
+- Vietnamese là ngôn ngữ chính.
+- Chuẩn bị cấu trúc localization cho English.
+- Typography rõ ràng, hỗ trợ dynamic font scaling.
+- Các card có hierarchy tốt.
+- Icons thống nhất.
+- Skeleton loading, empty states, error states.
+- Haptic feedback cho thao tác phù hợp.
+- Bottom navigation.
+- Animation chuyển trạng thái nhẹ.
+- Không dùng emoji thay thế toàn bộ icon chuyên nghiệp.
+- Có thể hiển thị cả tên thân thiện và technical device ID.
+
+### Navigation đề xuất
+
+5 khu vực chính:
+
+1. Home — Tổng quan.
+2. Map — Bản đồ trong nhà.
+3. Devices — Danh sách cảm biến.
+4. Activity — Cảnh báo và lịch sử.
+5. Settings — Cấu hình hệ thống.
+
+Chia các navigation destination nhỏ hơn qua nested routes khi cần.
+
+---
+
+# 4. HOME DASHBOARD
+
+Đây là màn hình chính khi mở ứng dụng.
+
+## 4.1. Header
+
+Hiển thị:
+- SmartFire AI.
+- Tên ngôi nhà hiện tại.
+- Tên tầng hoặc phạm vi toàn nhà.
+- Connection summary.
+- Shortcut thêm thiết bị.
+- Shortcut tới cảnh báo gần nhất.
+
+Ví dụ:
+
+SmartFire AI  
+Nhà chính · 2 tầng  
+3 Nodes · 2 Online · 1 Offline
+
+## 4.2. House Status Summary
+
+Các summary cards:
+- Số node đã đăng ký.
+- Node đang online.
+- Node offline.
+- Node đang ALARM.
+- Node chưa được commissioning.
+- Thời gian nhận dữ liệu mới nhất.
+
+Status phải được suy ra từ dữ liệu thật, không dùng số mặc định giả.
+
+## 4.3. Live Sensor Cards
+
+Mỗi node hiển thị:
+- Tên do người dùng đặt.
+- Device ID.
+- Tên phòng và tầng.
+- Device connection status.
+- Alarm state.
+- MQ-2 raw ADC value.
+- Flame detection.
+- Gas ready.
+- Gas fault.
+- Horn enabled.
+- Last update.
+- Đi tới Device Detail.
+
+Không biến `gas_raw` thành ppm hoặc % nguy hiểm khi không có calibration.
+
+Nếu cảm biến chưa được commissioning, hiển thị banner rõ ràng.
+
+Ví dụ:
+
+Cảm biến Phòng Khách  
+NODE-01 · Phòng Khách
+
+MQ-2: 1240 ADC  
+Flame: No detection  
+Status: WARMING  
+Updated: 1 second ago
+
+Giá trị là ví dụ UI, không phải số liệu thiết bị thật.
+
+## 4.4. Critical Alarm Overlay
+
+Khi node trả `alarm=true` hoặc state ALARM:
+
+- Hiện banner nguy hiểm có độ ưu tiên cao.
+- Hiển thị nhà, tầng, phòng và node liên quan.
+- Chuyển trạng thái màu đỏ.
+- Đưa ra hướng dẫn hành động ngắn gọn.
+- Nút mở bản đồ.
+- Nút Acknowledge.
+- Nút Silence có giới hạn, chỉ khi hợp lệ.
+- Nút mở chi tiết sự kiện.
+
+Không tự động reset trạng thái ALARM khi người dùng đóng modal.
+
+Hiển thị cảnh báo liên tục theo trạng thái hiện tại, tránh animation nhấp nháy gây khó đọc.
+
+---
+
+# 5. DEVICE MANAGEMENT
+
+## 5.1. Device Identity
+
+Một thiết bị phải được nhận diện bằng `device_id` firmware.
+
+Ví dụ:
+- `smartfire-node-01`
+- `smartfire-node-02`
+
+Người dùng được đặt alias:
+- Cảm biến Phòng Khách.
+- Cảm biến Nhà Bếp.
+- Cảm biến Phòng Ngủ.
+
+**Alias không thay đổi firmware device_id.**
+
+Device identity và display name phải lưu riêng.
+
+## 5.2. Device Detail
+
+Màn hình chi tiết gồm các tab hoặc section:
+
+Overview:
+- Display Name.
+- Device ID.
+- Room ID reported by ESP32.
+- Home/Floor/Room do app gán.
+- IP Address.
+- Connectivity.
+- Firmware/API version nếu nguồn dữ liệu thực sự cung cấp.
+- Uptime.
+- Boot ID.
+- Latest Event Sequence.
+
+Sensors:
+- MQ-2 raw value.
+- Flame status.
+- Gas ready.
+- Gas commissioned.
+- Gas fault.
+- Biểu đồ giá trị theo thời gian.
+
+Alarm:
+- Current state.
+- Alarm flag.
+- Acknowledged.
+- Muted.
+- Horn requested.
+- Horn enabled.
+- Testing.
+
+History:
+- Device-specific events.
+- Event timestamp.
+- Raw telemetry details.
+
+Settings:
+- Rename alias.
+- Change assigned room.
+- Reconfigure Wi-Fi.
+- Change IP/token credentials.
+- Disconnect local association.
+- Remove node from app with confirmation.
+
+Không tạo nút cập nhật firmware, thay đổi ngưỡng, thay đổi room_id firmware hay điều khiển thêm output nếu API chưa hỗ trợ.
+
+## 5.3. Device State Mapping
+
+Hỗ trợ đầy đủ:
+- WARMING.
+- UNCONFIGURED.
+- NORMAL.
+- SUSPECTED.
+- ALARM.
+- OFFLINE (app-derived).
+- STALE (app-derived).
+
+App-derived states không được ghi đè trạng thái firmware. Hãy lưu connection state riêng với alarm state.
+
+Ví dụ một node có thể có:
+- Last known alarm = ALARM.
+- Current connection = OFFLINE.
+
+UI phải hiện cả hai và đánh dấu cảnh báo cuối cùng chưa thể xác minh đã kết thúc.
+
+---
+
+# 6. EXACT EXISTING REST API CONTRACT
+
+Android chỉ đóng vai trò API client.
+
+## 6.1. Base URL
+
+`http://<ESP32_IP>`
+
+Port: 80.
+
+Authentication cho mọi endpoint:
+
+`Authorization: Bearer <NODE_TOKEN>`
+
+Mỗi node có token riêng, dài ít nhất 24 ký tự theo firmware hiện tại.
+
+Không gửi token qua query string.
+
+HTTP chỉ hoạt động trong trusted LAN. Không tự động mở Internet access, không port-forward.
+
+## 6.2. GET /v1/status
+
+Endpoint:
+
+`GET http://<IP>/v1/status`
+
+Response 200, ví dụ:
+
+```json
+{
+  "api_version": 1,
+  "device_id": "smartfire-node-01",
+  "room_id": "room-101",
+  "boot_id": "EXAMPLE_ONLY",
+  "latest_seq": 1,
+  "status": {
+    "uptime_ms": 1234,
+    "state": "WARMING",
+    "gas_raw": 1000,
+    "flame": false,
+    "gas_ready": false,
+    "gas_fault": false,
+    "alarm": false,
+    "muted": false,
+    "acknowledged": false,
+    "testing": false,
+    "horn_requested": false,
+    "horn_enabled": false,
+    "gas_commissioned": false
+  }
+}
+```
+
+Triển khai typed DTO và domain models.
+
+Không giả định field temperature, humidity, battery_percentage hoặc gas_ppm tồn tại.
+
+## 6.3. Polling
+
+Foreground dashboard:
+- Status polling khoảng 1 giây.
+- Timeout đề xuất 2 giây.
+- Events sync định kỳ hoặc khi có latest_seq mới.
+- Tránh concurrent requests không giới hạn.
+- Dừng/giảm polling theo lifecycle.
+- Dùng SupervisorJob và xử lý lỗi riêng từng node.
+
+Nhiều nodes:
+- Quản lý bằng per-device connection workers hoặc coordinator.
+- Có giới hạn concurrency.
+- Không block UI thread.
+- Không làm nghẽn ESP32 bởi request quá mức.
+
+Freshness:
+- Ghi `received_at` bằng thời gian điện thoại.
+- Theo dõi `uptime_ms`.
+- Phát hiện uptime không tiến lên.
+- Phân biệt fresh/stale/offline.
+- Không sử dụng uptime như UTC timestamp.
+
+## 6.4. GET /v1/events
+
+Endpoint:
+
+`GET /v1/events?since=<sequence>`
+
+Các field envelope:
+- device_id.
+- boot_id.
+- latest_seq.
+- oldest_seq.
+- events.
+
+Event chứa:
+- seq.
+- kind.
+- request_id.
+- result.
+- status.
+
+Kinds hiện có:
+- state.
+- button.
+- ack.
+- silence.
+- test.
+
+Results:
+- none.
+- applied.
+- rejected.
+- expired.
+
+Không giả định thêm event types không được đặc tả.
+
+### Sync Algorithm
+
+- Lần đầu: since=0.
+- Khi boot_id thay đổi: bắt đầu session mới, since=0.
+- Những lần sau: since=last successfully persisted seq.
+- Lưu bằng unique key `(device_id, boot_id, seq)`.
+- Dùng database transaction và UPSERT/IGNORE.
+- Kiểm tra `oldest_seq > last_saved_seq + 1`.
+- Nếu đúng, đánh dấu `history_gap=true`.
+- Không tự tạo sự kiện để bù khoảng thiếu.
+- Xử lý sequence counter wrap.
+- Giữ dữ liệu cũ qua reboot.
+
+Firmware chỉ giữ khoảng 32 events trong RAM. App phải thể hiện rõ giới hạn này.
+
+## 6.5. POST Commands
+
+Endpoint có sẵn:
+
+`POST /v1/commands/ack`
+
+`POST /v1/commands/silence`
+
+`POST /v1/commands/test`
+
+Không yêu cầu body.
+
+Phản hồi HTTP 202 chỉ xác nhận lệnh được queue, chưa xác nhận đã thực thi.
+
+App phải:
+1. Gửi command khi người dùng thao tác.
+2. Lưu `request_id` và `boot_id` từ response.
+3. Đánh dấu trạng thái PENDING.
+4. Poll events.
+5. Tìm event theo request_id và boot_id.
+6. Cập nhật APPLIED / REJECTED / EXPIRED.
+7. Nếu không thể xác minh, hiển thị UNKNOWN OUTCOME.
+
+Không hiển thị "Thành công" ngay khi chỉ nhận HTTP 202.
+
+### Safety Rules
+
+ACK:
+- Chỉ khi ALARM.
+- Không tắt còi.
+
+SILENCE:
+- Chỉ khi ALARM.
+- Theo policy firmware.
+- Thời gian im tối đa theo firmware: 30 giây.
+- Không được kéo dài vô hạn.
+- Flame mới hoặc gas fault có thể hủy Silence.
+
+TEST:
+- Gửi lệnh test output.
+- Không khẳng định còi thật đã kêu chỉ vì command applied.
+- `horn_enabled=false` có nghĩa firmware đang khóa output còi.
+
+Không tạo:
+- Disable detector.
+- Permanent mute.
+- Reset alarm.
+- Force clear.
+- Remote power off.
+
+Không tự retry các POST command bị timeout vì firmware chưa cung cấp client idempotency key.
+
+## 6.6. Error Handling
+
+- 200: Read success.
+- 202: Command queued, not applied.
+- 400: Invalid parameter.
+- 401: Unauthorized/invalid token.
+- 404: Unsupported route/method.
+- 503: Queue full hoặc snapshot busy.
+- Timeout: Unknown network outcome.
+- Lost Wi-Fi: Node unreachable.
+- Invalid JSON: Parsing error.
+- Different device_id: Identity mismatch.
+
+Hiển thị lỗi có khả năng phục hồi bằng tiếng Việt.
+
+Tạo màn hình chẩn đoán kết nối để xem:
+- Target IP.
+- Last HTTP status.
+- Last successful contact.
+- Authentication status.
+- Device identity.
+- Network errors.
+
+Không ghi token/password vào log.
+
+---
+
+# 7. BLE PROVISIONING — VERY IMPORTANT
+
+Mục tiêu: Điện thoại có thể thiết lập Wi-Fi lần đầu và cấu hình lại khi người dùng di chuyển thiết bị sang vị trí hoặc ngôi nhà có mạng Wi-Fi mới.
+
+## 7.1. BLE Contract
+
+ESP32 BLE Device Name được đặc tả:
+
+`SmartFire-Node-01`
+
+Service UUID:
+
+`4fafc201-1fb5-459e-8fcc-c5c9c331914b`
+
+CONFIG characteristic:
+
+`beb5483e-36e1-4688-b7f5-ea07361b26a8`
+
+STATUS characteristic:
+
+`1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e`
+
+CCCD:
+
+`00002902-0000-1000-8000-00805f9b34fb`
+
+CONFIG: Write.
+
+STATUS: Read/Notify.
+
+## 7.2. Write Wi-Fi Configuration
+
+Payload:
+
+```json
+{
+  "ssid": "Home_WiFi_2G",
+  "password": "example-password"
+}
+```
+
+Chỉ gửi theo hành động chủ động của người dùng.
+
+Firmware spec cũng mô tả fallback text format `SSID\nPASSWORD`, nhưng ưu tiên JSON.
+
+### Status Notifications
+
+Connecting:
+
+```json
+{
+  "status": "CONNECTING",
+  "ssid": "Home_WiFi_2G"
+}
+```
+
+Connected:
+
+```json
+{
+  "status": "CONNECTED",
+  "ip": "192.168.1.15",
+  "device_id": "smartfire-node-01"
+}
+```
+
+Disconnected:
+
+```json
+{
+  "status": "DISCONNECTED"
+}
+```
+
+Chú ý: đây là protocol contract trong tài liệu BLE. Chưa có bằng chứng đầy đủ rằng firmware đang chạy trên board đã triển khai BLE provisioning. App phải hoạt động đúng khi BLE service không xuất hiện.
+
+## 7.3. Add New Device Flow
+
+Thiết kế một onboarding wizard:
+
+Step 1 — Choose Home:
+- Chọn ngôi nhà.
+- Chọn tầng.
+- Chọn phòng dự kiến.
+
+Step 2 — Discover:
+- Scan BLE.
+- Hiển thị các ESP32 SmartFire tìm thấy.
+- Hiển thị device name và thông tin BLE sẵn có.
+- Cho phép refresh.
+- Cho phép manual IP setup khi không có BLE.
+
+Step 3 — Connect:
+- Kết nối GATT.
+- Discover services.
+- Verify UUIDs.
+- Subscribe STATUS notification.
+- Hiển thị connecting state.
+
+Step 4 — Wi-Fi Setup:
+- Chọn/nhập SSID.
+- Nhập Wi-Fi password.
+- Giải thích rằng ESP32 cần Wi-Fi 2.4GHz.
+- Gửi cấu hình BLE.
+- Hiển thị tiến trình CONNECTING → CONNECTED.
+
+Step 5 — LAN Authentication:
+- Lấy IP từ BLE STATUS.
+- Yêu cầu token riêng của node bằng nhập tay, secure QR import hoặc phương thức đã được tài liệu hóa.
+- Không giả định token tự truyền qua BLE.
+- Gọi GET /v1/status.
+- Xác minh token và device_id.
+
+Step 6 — Device Information:
+- Đặt tên cảm biến.
+- Chọn icon.
+- Gắn với Home/Floor/Room.
+- Đặt vị trí trên Indoor Map.
+
+Step 7 — Finish:
+- Lưu identity và network details.
+- Lưu token trong secure storage.
+- Hiển thị trạng thái vừa xác nhận bằng HTTP.
+- Bắt đầu monitoring.
+
+Nếu không có token hợp lệ, không đánh dấu pairing thành công hoàn toàn.
+
+## 7.4. Relocation & Lost Wi-Fi
+
+Khi node không truy cập được qua IP cũ:
+
+Hiển thị:
+"Không thể kết nối cảm biến qua mạng Wi-Fi hiện tại."
+
+Actions:
+- Retry.
+- Check Network.
+- Reconfigure via Bluetooth.
+- Change IP manually.
+
+Flow:
+1. User chọn thiết bị cũ.
+2. App bắt đầu BLE scan.
+3. User chọn ESP32 đúng.
+4. App kết nối GATT.
+5. Nhập mạng Wi-Fi mới.
+6. Gửi CONFIG.
+7. Đợi STATUS CONNECTED.
+8. Lấy IP mới.
+9. Gọi REST status với token cũ.
+10. Xác minh device_id khớp.
+11. Chỉ sau đó cập nhật IP đã lưu.
+12. Giữ nguyên tên node, lịch sử và map association.
+
+Nếu thiết bị thực sự được chuyển từ Phòng Khách sang Nhà Bếp:
+- User có thể chỉnh room assignment.
+- Không tự suy đoán vị trí vật lý từ địa chỉ IP.
+- Không xóa lịch sử cũ.
+
+Nếu Wi-Fi mới không có Internet nhưng LAN truy cập được, ứng dụng vẫn phải hoạt động bình thường.
+
+## 7.5. BLE Reliability & Security
+
+Implement:
+- Android 12+ BLUETOOTH_SCAN/CONNECT permissions.
+- Legacy location permission khi cần theo API level.
+- Permission rationale.
+- BLE adapter disabled state.
+- GATT timeout.
+- Proper descriptor subscription.
+- Lifecycle cleanup.
+- Scan timeout.
+- Retry with backoff theo thao tác phù hợp.
+- MTU/payload handling.
+- GATT operations serialized, không chồng chéo.
+- Optional fallback name scan rồi verify GATT service nếu quảng bá không chứa service UUID.
+
+Không tự gọi lại write Wi-Fi nhiều lần liên tục.
+
+Nếu BLE provisioning chưa có trên firmware:
+- Hiển thị "Firmware chưa hỗ trợ cấu hình BLE hoặc không tìm thấy dịch vụ".
+- Cho phép kết nối HTTP qua IP thủ công.
+- Không giả lập trạng thái CONNECTED.
+
+BLE contract chưa đặc tả xác thực thiết bị và mã hóa pairing. Không được mặc định rằng Wi-Fi password truyền an toàn nếu chưa xác minh BLE security. Cần cảnh báo phù hợp và tránh gửi credential tới một thiết bị chỉ vì tên quảng bá trùng khớp. Thiết kế sẵn bước xác minh vật lý/pairing cho firmware tương lai.
+
+---
+
+# 8. HOME / BUILDING MANAGEMENT
+
+Xây dựng module quản lý không gian trong nhà.
+
+## 8.1. Home Profile
+
+Cho phép tạo nhiều Home Profiles:
+
+- Tên ngôi nhà/công trình.
+- Mô tả.
+- Loại công trình: nhà ở, trường học, văn phòng, demo.
+- Số tầng.
+- Kích thước tổng thể nếu biết.
+- Đơn vị đo mặc định: mét.
+- Ghi chú.
+- Floorplan.
+- Danh sách phòng.
+- Danh sách nodes.
+- Danh sách bình chữa cháy.
+- Danh sách lối thoát.
+
+Thông tin địa chỉ thực là tùy chọn và không cần lưu để hệ thống hoạt động.
+
+## 8.2. Floor Management
+
+Mỗi tầng có:
+- floor_id.
+- home_id.
+- floor_name.
+- level.
+- width_m.
+- length_m.
+- floorplan asset.
+- scale calibration.
+- room geometry.
+- doors.
+- corridors.
+- stairs.
+- exits.
+
+Nếu người dùng chưa biết kích thước thật, cho phép bắt đầu từ bản đồ không tỷ lệ và hiệu chuẩn sau.
+
+## 8.3. Room Management
+
+Cho phép:
+- Add room.
+- Rename.
+- Change type.
+- Draw polygon/rectangle.
+- Drag corners.
+- Edit dimensions.
+- Assign nodes.
+- Assign extinguishers.
+- Mark doors and entrances.
+- Room color/icon.
+- Notes.
+
+Room types:
+- Bedroom.
+- Kitchen.
+- Living Room.
+- Bathroom.
+- Classroom.
+- Corridor.
+- Storage.
+- Other.
+
+Hỗ trợ không gian tùy biến thay vì bắt buộc mô hình phòng hình chữ nhật.
+
+---
+
+# 9. INDOOR MAPPING SYSTEM
+
+Đây là tính năng khác biệt của SmartFire AI, phải triển khai tương tác thật.
+
+## 9.1. Map Modes
+
+Triển khai 3 modes:
+
+**VIEW MODE**
+- Pan.
+- Zoom.
+- Switch floor.
+- Tap room.
+- Tap node.
+- Tap extinguisher.
+- View active alarms.
+- Select current location.
+
+**EDIT MODE**
+- Create/edit rooms.
+- Place nodes.
+- Move objects.
+- Add exits.
+- Add extinguisher positions.
+- Add wall/corridor/door geometry.
+- Save changes.
+- Undo/redo nếu hợp lý.
+
+**SCAN / IMPORT MODE**
+- Import floorplan image.
+- Capture photo.
+- Calibrate dimensions.
+- Trace floor boundaries.
+- Trace room boundaries.
+- Create editable 2D map.
+
+## 9.2. Indoor Scanning
+
+Người dùng muốn có tính năng "quét vùng trong nhà".
+
+Triển khai theo progressive enhancement:
+
+Level 1 — Always Available:
+- Nhập bản vẽ mặt bằng PNG/JPG.
+- Chụp ảnh mặt bằng hoặc bản vẽ giấy.
+- Căn chỉnh hình ảnh.
+- Người dùng chọn hai điểm có khoảng cách thực tế đã biết.
+- Tính scale.
+- Vẽ polygon cho phòng.
+- Ghi kích thước và vị trí.
+
+Level 2 — Assisted Mapping:
+- Hỗ trợ CameraX.
+- Quy trình ghi nhận kích thước và vị trí theo từng bước.
+- Nếu tích hợp được on-device OCR/ML Kit, có thể nhận dạng nhãn phòng từ ảnh mặt bằng.
+- Mọi nhận dạng phải cho phép người dùng kiểm tra và sửa.
+
+Level 3 — Optional AR:
+- Kiểm tra thiết bị có hỗ trợ ARCore/depth phù hợp hay không.
+- Nếu có, cung cấp workflow đo/phác thảo không gian.
+- Nếu không, fallback về manual mapping.
+- Không tuyên bố mọi Android phone đều có LiDAR hoặc scan 3D chính xác.
+
+Với bản đồ quét/chụp, phải cho phép người dùng review trước khi lưu.
+
+Không quảng cáo tự động dựng bản đồ chính xác khi chưa có thuật toán và kiểm chứng cụ thể.
+
+## 9.3. Map Coordinates
+
+Dùng tọa độ normalized hoặc world coordinates với phép chuyển đổi rõ ràng.
+
+Một point có thể gồm:
+- floor_id.
+- x_normalized.
+- y_normalized.
+
+Room geometry lưu dạng polygon.
+
+Nếu đã calibration:
+- Chuyển đổi tọa độ map thành khoảng cách mét.
+- Đảm bảo pan/zoom không thay đổi vị trí vật lý đã lưu.
+- Transform nhất quán giữa screen-space và map-space.
+
+Thiết kế map engine độc lập với UI để dễ mở rộng.
+
+## 9.4. Map Markers
+
+Các marker:
+- SmartFire Sensor.
+- Fire Alarm Location.
+- Fire Extinguisher.
+- Exit.
+- Stairs.
+- User Position.
+- Assembly Point nếu có dữ liệu.
+
+Các node hiển thị alias và current status.
+
+Nếu node có ALARM, highlight phòng được gán.
+
+Nếu vị trí node chưa được đặt:
+- Hiển thị Unassigned.
+- Không tự vẽ vào tâm phòng rồi tuyên bố đó là vị trí thực.
+
+## 9.5. User Position
+
+V1:
+- Người dùng chọn phòng.
+- Người dùng chạm bản đồ để đánh dấu vị trí.
+- Hoặc quét QR code được app tạo và gán trước cho một phòng/điểm cụ thể.
+
+Không gọi GPS là indoor positioning.
+
+Nếu QR chỉ đánh dấu một phòng, hiển thị độ chính xác ở cấp phòng, không tự khẳng định tọa độ chính xác từng centimet.
+
+## 9.6. Extinguisher Finder
+
+Mỗi bình chữa cháy có:
+- extinguisher_id.
+- display_name.
+- type.
+- home_id.
+- floor_id.
+- room_id.
+- x/y position.
+- notes.
+- last_inspection_date nếu nhập thủ công.
+
+Tính bình gần nhất theo:
+- Euclidean distance khi mới có bản đồ vị trí cơ bản.
+- Graph shortest path khi có topology cửa, hành lang và cầu thang.
+
+Nếu chưa có topology, không được gọi đường thẳng xuyên tường là đường đi thực tế.
+
+Cho phép người dùng vẽ graph các lối đi:
+- Nodes: cửa, giao lộ hành lang, cầu thang, lối ra.
+- Edges: kết nối có thể đi qua.
+- Trọng số: khoảng cách dựa trên scale nếu đã hiệu chuẩn.
+
+Sử dụng Dijkstra hoặc A* theo nhu cầu.
+
+Khi xảy ra ALARM:
+- Highlight khu vực có nguy cơ.
+- Ưu tiên hiển thị lối thoát đã khai báo.
+- Đánh dấu các đường có thể đi qua vùng báo động là chưa xác minh an toàn.
+- Không tự khẳng định tuyến đường an toàn vì chỉ có dữ liệu từ cảm biến tại một số phòng.
+
+Không mặc định hướng dẫn người dùng tiếp cận vùng cháy để lấy bình chữa cháy.
+
+---
+
+# 10. EVENT HISTORY & ANALYTICS
+
+## 10.1. Event Timeline
+
+Hiển thị timeline gồm:
+- Timestamp nhận trên điện thoại.
+- Node name.
+- Event kind.
+- Result.
+- Alarm state.
+- Room/floor association.
+- Connection status.
+- Event details.
+
+Lịch sử có filtering theo:
+- Home.
+- Node.
+- Room.
+- Event type.
+- Time range.
+
+## 10.2. Charts
+
+Hiển thị:
+- MQ-2 raw trend.
+- Node state timeline.
+- Alarm frequency.
+- Connectivity statistics.
+- Gas fault occurrences.
+- Device uptime/reboot sessions.
+
+Biểu đồ phải có trục và đơn vị đúng.
+
+Đối với MQ-2:
+- Label: ADC raw.
+- Không label: ppm khi chưa hiệu chuẩn.
+
+Cho phép xem:
+- Recent window.
+- 1 hour.
+- 24 hours.
+- Custom range nếu dữ liệu local có đủ.
+
+Không dùng interpolation để che những đoạn thiếu dữ liệu mà không đánh dấu.
+
+## 10.3. History Gaps
+
+Nếu đã mất event:
+- Hiển thị Missing Event Range.
+- Lưu dấu hiệu history gap.
+- Không dựng lại lịch sử giả.
+
+Nếu thiết bị reboot:
+- Tạo boot session mới.
+- Không xóa lịch sử cũ.
+
+---
+
+# 11. AI INTEGRATION ARCHITECTURE
+
+Mục tiêu xây dựng một AI-ready architecture với một số tính năng phân tích thật có thể chạy offline.
+
+AI không phải nguồn quyết định báo cháy chính.
+
+## 11.1. Layer Separation
+
+Tách thành:
+
+1. Alarm State: Dữ liệu chính thức từ firmware.
+2. Local Analytics: Phân tích thống kê trên điện thoại.
+3. AI Inference: Model/provider khi được cấu hình.
+4. AI Explanation: Giải thích kết quả và giới hạn.
+
+Không trộn các layer thành một chỉ số an toàn không có căn cứ.
+
+## 11.2. Offline Analytics
+
+Triển khai hoạt động được ngay:
+- Moving Average.
+- EWMA baseline.
+- Trend detection.
+- Rate of change.
+- Statistical outlier detection.
+- Connectivity anomaly detection.
+- Sensor-readiness checks.
+
+Đối với MQ-2, loại hoặc đánh dấu dữ liệu trong warm-up/unconfigured trước khi tính baseline.
+
+Nếu dữ liệu chưa đủ, hiển thị:
+"Chưa đủ dữ liệu để phân tích xu hướng."
+
+Các phân tích thống kê không được quảng cáo là model AI đã được huấn luyện.
+
+## 11.3. AI Insights Screen
+
+Ví dụ các nhận xét có cấu trúc:
+- Tín hiệu MQ-2 tăng so với baseline đã quan sát.
+- Flame module đang báo tín hiệu kích hoạt.
+- Gas sensor chưa hoàn thành commissioning.
+- Dữ liệu mới nhất đã quá hạn.
+- Có khả năng lỗi cảm biến cần kiểm tra.
+- Node vừa khởi động lại.
+
+Mỗi insight có:
+- Title.
+- Explanation.
+- Source measurements.
+- Analysis method.
+- Data freshness.
+- Confidence/quality indicator nếu có căn cứ tính toán.
+- Action recommendation.
+
+Không tự gán "95% fire probability" khi chưa có model hiệu chuẩn và tập dữ liệu đánh giá.
+
+## 11.4. Optional On-device ML
+
+Tạo interface có thể tích hợp TensorFlow Lite/LiteRT hoặc model Android-compatible.
+
+Nếu chưa có model artifact:
+- Không fake prediction.
+- Không báo là đang chạy ML.
+- Hiển thị module inference chưa cấu hình.
+
+Một tính năng ML khả thi riêng biệt là dùng on-device OCR cho ảnh sơ đồ nhà, sau đó để người dùng xác nhận tên phòng.
+
+Nếu triển khai một model ML thật:
+- Ghi model version.
+- Input features.
+- Output schema.
+- Inference errors.
+- Training/evaluation status nếu đã có.
+
+## 11.5. AI Jev / External AI Provider
+
+Kiến trúc cho phép tích hợp provider trong tương lai, bao gồm Jev nếu có tài liệu API thật.
+
+Tạo interface ví dụ:
+- `AiAnalysisProvider`
+- `LocalAnalyticsProvider`
+- `RemoteAiProvider`
+
+Không tự bịa endpoint Jev hay payload ngoài đặc tả.
+
+Nếu provider cần API key:
+- Không hardcode trong APK.
+- Không log API key.
+- Không gửi Wi-Fi password hoặc node token cho AI.
+- Nếu không có backend bảo vệ key, remote AI chỉ được bật trong chế độ thử nghiệm với cảnh báo rủi ro phù hợp, hoặc tắt cho đến khi có cơ chế an toàn.
+
+Có thể triển khai tính năng AI Explanation dựa trên local data và rule templates trước.
+
+## 11.6. AI Safety Boundary
+
+**AI must never override the ESP32 alarm state or silently suppress critical warnings.**
+
+- AI không gửi Silence tự động.
+- AI không reset ALARM.
+- AI không vô hiệu hóa node.
+- AI không biến ALARM thành NORMAL.
+- AI không bảo đảm không có cháy.
+- AI không thay thế đầu báo cháy đạt chuẩn.
+
+---
+
+# 12. LOCAL DATABASE DESIGN
+
+Sử dụng Room làm database chính.
+
+Suggested entities:
+
+**HomeEntity**
+- id.
+- name.
+- buildingType.
+- description.
+- createdAt.
+- updatedAt.
+
+**FloorEntity**
+- id.
+- homeId.
+- name.
+- level.
+- widthMeters.
+- lengthMeters.
+- floorplanUri.
+- calibrationJson.
+
+**RoomEntity**
+- id.
+- floorId.
+- name.
+- type.
+- polygonJson.
+- metadataJson.
+
+**DeviceEntity**
+- deviceId (stable key).
+- displayName.
+- homeId.
+- floorId.
+- roomId.
+- firmwareRoomId.
+- lastKnownIp.
+- bleDeviceHint.
+- lastSeenAt.
+- createdAt.
+- updatedAt.
+
+**DeviceCredential**
+- deviceId.
+- secureStorageReference.
+
+Token không lưu plaintext trong Room.
+
+**DeviceSnapshotEntity**
+- deviceId.
+- bootId.
+- receivedAt.
+- uptimeMs.
+- state.
+- gasRaw.
+- flame.
+- gasReady.
+- gasFault.
+- alarm.
+- telemetryJson.
+
+Có retention policy hợp lý để database không tăng vô hạn.
+
+**DeviceEventEntity**
+- deviceId.
+- bootId.
+- seq.
+- receivedAt.
+- kind.
+- result.
+- requestId.
+- payloadJson.
+
+Unique index:
+`(deviceId, bootId, seq)`
+
+**ExtinguisherEntity**
+- id.
+- floorId.
+- roomId.
+- name.
+- type.
+- xNormalized.
+- yNormalized.
+- notes.
+
+**MapObjectEntity**
+- id.
+- floorId.
+- type.
+- geometryJson.
+- metadataJson.
+
+**MapEdgeEntity**
+- id.
+- floorId.
+- fromPointId.
+- toPointId.
+- lengthMeters.
+- enabled.
+
+**UserLocationEntity**
+- homeId.
+- floorId.
+- roomId.
+- position.
+- source.
+- updatedAt.
+
+**AnalysisInsightEntity**
+- id.
+- deviceId.
+- createdAt.
+- method.
+- payloadJson.
+
+Thêm SyncCursorEntity để quản lý:
+- deviceId.
+- bootId.
+- lastPersistedSeq.
+- historyGap.
+- lastSyncAt.
+
+Định nghĩa foreign keys, indices và migration strategy.
+
+Không lưu ảnh floorplan trực tiếp vào SQLite BLOB lớn nếu có thể quản lý file an toàn bằng URI/file storage.
+
+---
+
+# 13. PROJECT ARCHITECTURE
+
+Gợi ý modular package structure:
+
+```text
+com.smartfire.app/
+  MainActivity.kt
+  SmartFireApplication.kt
+
+  core/
+    model/
+    network/
+    database/
+    security/
+    ui/
+    design/
+    util/
+
+  data/
+    local/
+      dao/
+      entity/
+      migration/
+    remote/
+      api/
+      dto/
+    ble/
+    mapper/
+    repository/
+
+  domain/
+    model/
+    repository/
+    usecase/
+
+  feature/
+    onboarding/
+    dashboard/
+    devices/
+    device_detail/
+    indoor_map/
+    floor_editor/
+    history/
+    ai_insights/
+    settings/
+    diagnostics/
+
+  service/
+    monitoring/
+    notification/
+
+  navigation/
+    AppNavigation.kt
+```
+
+Điều chỉnh cấu trúc nếu cần nhưng phải giữ separation of concerns.
+
+### Required abstractions
+
+`SmartFireApiService`
+- getStatus()
+- getEvents(since)
+- acknowledge()
+- silence()
+- test()
+
+`BleProvisioningManager`
+- scan()
+- connect()
+- discoverServices()
+- subscribeStatus()
+- writeWifiConfig()
+- disconnect()
+
+`DeviceRepository`
+- add/update device.
+- fetch live state.
+- persist telemetry.
+- sync events.
+- update connectivity.
+- manage device assignments.
+
+`MapRepository`
+- manage homes/floors/rooms.
+- manage geometry.
+- manage map markers.
+- manage topology.
+
+`AnalysisRepository`
+- local analytics.
+- optional model inference.
+- persist insights.
+
+`DeviceMonitoringCoordinator`
+- monitor registered nodes.
+- per-node polling.
+- lifecycle.
+- freshness.
+- cancellation.
+- bounded concurrency.
+
+### State Management
+
+Use:
+- ViewModel.
+- StateFlow.
+- Sealed UiState.
+- Immutable domain models.
+- Proper error/result types.
+
+Không đặt HTTP calls trực tiếp trong Composable.
+
+Không đặt database access trực tiếp trong UI.
+
+Không tạo một ViewModel khổng lồ cho mọi màn hình.
+
+---
+
+# 14. NOTIFICATION SYSTEM
+
+Triển khai Android local notifications cho những sự kiện app thật sự phát hiện được.
+
+Channels:
+- Critical Alarm.
+- Device Connectivity.
+- Sensor Health.
+- System Information.
+
+Khi nhận ALARM:
+- Hiển thị local notification.
+- Tên node.
+- Tên phòng.
+- Thời điểm phát hiện bởi app.
+- Deep link vào Device Detail/Map.
+
+Android 13+ phải xin notification permission phù hợp.
+
+### Background Monitoring
+
+Phải trung thực về giới hạn Android:
+
+- Khi app đang foreground và kết nối LAN: hỗ trợ monitoring.
+- Khi app đóng hoặc bị hệ điều hành hạn chế: không cam kết nhận alarm liên tục.
+- WorkManager không phải realtime polling engine.
+- Có thể phát triển user-opt-in foreground monitoring service nếu phù hợp với giới hạn và chính sách Android hiện hành.
+- Nếu không có monitoring service hoạt động, không thể tuyên bố app sẽ nhận cảnh báo khi bị kill.
+
+Không tự quảng cáo cloud push notification khi chưa có push infrastructure.
+
+---
+
+# 15. SETTINGS MODULE
+
+Tổ chức Settings thành:
+
+## General
+- Language.
+- Theme.
+- Notification preferences.
+- Data retention.
+- Export/import local configuration.
+
+## Homes & Floors
+- Manage homes.
+- Floors.
+- Rooms.
+- Floorplans.
+- Scaling.
+- QR location markers.
+
+## Devices
+- Registered nodes.
+- Rename nodes.
+- Assigned location.
+- Wi-Fi reconfiguration.
+- Manual IP.
+- Secure token management.
+- Connection diagnostics.
+
+## Monitoring
+- Foreground polling preferences trong giới hạn API.
+- Stale/offline display policy.
+- Notification channels.
+- Optional background monitoring capabilities.
+
+## AI & Analytics
+- Enable local analytics.
+- Experimental ML model info.
+- AI provider settings.
+- Privacy information.
+- Analysis history.
+
+## Advanced
+- API diagnostics.
+- Export diagnostic logs đã loại secrets.
+- Database export/backup.
+- Demo Mode.
+- Firmware API compatibility info.
+
+---
+
+# 16. OFFLINE-FIRST & MULTI-DEVICE BEHAVIOR
+
+Ứng dụng có thể quản lý:
+- 1 Home → nhiều Floors.
+- 1 Floor → nhiều Rooms.
+- 1 Room → nhiều Devices.
+- 1 Device → một identity duy nhất, vị trí được gán có thể thay đổi.
+
+Không đồng nhất:
+- BLE device name.
+- device_id.
+- room_id firmware.
+- Alias.
+- Room assignment của app.
+
+Khi app offline:
+- Hiển thị dữ liệu đã lưu.
+- Dán nhãn Last known.
+- Không xem dữ liệu cũ là trạng thái hiện tại.
+- Không gửi commands khi node unreachable.
+
+Khi online trở lại:
+- Xác thực lại device identity.
+- Poll fresh status.
+- Sync events.
+- Detect boot_id changes.
+- Detect gaps.
+- Update local history.
+
+Có Manual Mode để nhập IP, token và kiểm thử API khi firmware chưa hỗ trợ BLE.
+
+---
+
+# 17. DEMO MODE FOR STEM PRESENTATION
+
+Vì đây là dự án STEM, cần chế độ trình diễn trong app.
+
+Tạo một Demo Mode tách biệt hoàn toàn với dữ liệu thiết bị thật.
+
+Demo Mode có thể mô phỏng:
+- 1 nhà.
+- 2 tầng.
+- 4 phòng.
+- 3 nodes.
+- 2 extinguishers.
+- 1 active alarm.
+- Wi-Fi disconnected.
+- Warm-up.
+- Event gap.
+- Device reboot.
+
+UI phải hiển thị nổi bật "DEMO / SIMULATED DATA".
+
+Không lưu các node demo như node thật trừ khi người dùng thực hiện import có chủ đích.
+
+Mock repository phải sử dụng cùng domain models với real repository.
+
+Demo giúp kiểm thử và trình diễn mà không phải tạo cháy thật.
+
+---
+
+# 18. CRITICAL USER FLOWS
+
+Phải triển khai tối thiểu các luồng sau:
+
+### Flow A — First Setup
+
+Open App → Create Home → Create Floor → Create Room → Add Device → BLE Configuration hoặc Manual IP → Enter Token → Verify REST API → Name Sensor → Place on Map → Dashboard.
+
+### Flow B — Fire Alarm
+
+ESP32 detects condition → GET status returns ALARM → App updates UI → Notification while monitoring active → User opens map → Correct room highlighted → User acknowledges → Command pending → Event confirms result → Alarm state remains controlled by firmware.
+
+### Flow C — Wi-Fi Relocation
+
+ESP32 becomes unreachable → App shows offline → User selects Reconfigure via BLE → Connects to selected node → Sends new Wi-Fi → Receives new IP → Verifies REST identity → Saves new IP → Resumes monitoring.
+
+### Flow D — Building Setup
+
+Create Home → Define Floors → Add Rooms → Draw/Import Floorplan → Calibrate Dimensions → Mark Nodes → Mark Extinguishers → Mark Exits → Save Map → View Map.
+
+### Flow E — User Position
+
+Open Map → Select current room or scan location QR → App shows manually determined/QR-derived location → Display nearby assets with clear limitations.
+
+### Flow F — AI Insights
+
+Receive real samples → Persist history → Compute local trends → Generate source-backed insight → Display analysis details → Never change firmware alarm policy.
+
+### Flow G — Lost Connection During Alarm
+
+Last known ALARM → Network lost → Keep last known alarm visible with offline indicator → Do not mark NORMAL → Resume connection and verify fresh state.
+
+---
+
+# 19. TESTING REQUIREMENTS
+
+## Unit Tests
+
+Test:
+- Status JSON parsing.
+- Missing/invalid fields.
+- Device identity mismatch.
+- Alarm state mapping.
+- Offline/stale transitions.
+- Event deduplication.
+- Boot ID change.
+- History gap detection.
+- Sequence wrap handling.
+- 202 pending command semantics.
+- Command applied/rejected.
+- Command timeout unknown outcome.
+- Coordinate transformations.
+- Map persistence.
+- Shortest-path logic on known topology.
+- Local statistical analysis.
+- Database migration.
+
+## BLE Tests
+
+Using mock/fake BLE transport, test:
+- Service discovery.
+- Unsupported service.
+- GATT disconnect.
+- CONNECTING/CONNECTED/DISCONNECTED.
+- Invalid STATUS payload.
+- Wi-Fi configuration flow.
+- Missing IP.
+- Retry/cancellation.
+- Token not supplied by BLE.
+
+Hardware BLE integration must be reported as UNVERIFIED until tested against real firmware.
+
+## UI Tests
+
+Test:
+- Bottom navigation.
+- Dashboard rendering.
+- Device detail.
+- Offline banner.
+- Add device wizard.
+- Rename sensor.
+- Home/floor/room creation.
+- Map placement.
+- Alarm modal.
+- Error states.
+- Theme switching.
+
+## Build Validation
+
+Run when environment supports it:
+- Gradle build.
+- Unit tests.
+- Android lint.
+- Compose tests where available.
+
+Do not claim tests passed without their actual results.
+
+---
+
+# 20. IMPLEMENTATION ORDER
+
+Ưu tiên working vertical slices.
+
+### Phase 1 — Real Device Foundation
+
+Build:
+1. Android project + theme/navigation.
+2. Retrofit client.
+3. Typed DTO models.
+4. Secure token storage.
+5. Room database.
+6. Manual IP + token onboarding.
+7. Real GET status.
+8. Device Detail.
+9. Event sync.
+10. Basic Dashboard.
+
+At the end of this phase, a real ESP32 should be readable via LAN when the firmware and network are available.
+
+### Phase 2 — BLE Provisioning
+
+Build:
+1. BLE scanning.
+2. GATT connection.
+3. Characteristic discovery.
+4. Wi-Fi CONFIG write.
+5. STATUS notification.
+6. IP verification.
+7. Reconfiguration flow.
+8. Graceful fallback when unsupported.
+
+### Phase 3 — Home Mapping
+
+Build:
+1. Home/Floor/Room CRUD.
+2. Interactive 2D map.
+3. Image import.
+4. Scale calibration.
+5. Node placement.
+6. Extinguisher placement.
+7. Manual current location.
+8. QR mapping.
+9. Map geometry persistence.
+
+### Phase 4 — Monitoring & Analytics
+
+Build:
+1. Alarm overlay.
+2. Notifications.
+3. Command result tracking.
+4. Telemetry charts.
+5. Local analysis.
+6. AI insights.
+7. Optional AI provider interface.
+
+### Phase 5 — Polish & Validation
+
+- Loading/error/empty states.
+- Smooth animations.
+- Accessibility.
+- Better diagnostics.
+- Demo Mode.
+- Tests.
+- README.
+- APK build if the environment supports it.
+
+Không trì hoãn các chức năng end-to-end để hoàn thiện animation hoặc giao diện trang trí trước.
+
+---
+
+# 21. STRICT ACCEPTANCE CRITERIA
+
+Chỉ coi project hoàn thành khi:
+
+- [ ] App Android Kotlin thực sự build được.
+- [ ] Giao diện dùng Jetpack Compose.
+- [ ] Có Home Dashboard có thể đọc trạng thái từ API thật.
+- [ ] Thêm node qua IP + token hoạt động theo contract.
+- [ ] Có BLE provisioning UI và GATT implementation theo UUID đã nêu.
+- [ ] Có fallback khi firmware chưa hỗ trợ BLE.
+- [ ] Có quản lý nhiều thiết bị.
+- [ ] Có đổi tên cảm biến.
+- [ ] Có Room Database.
+- [ ] Có events sync đúng boot_id/seq.
+- [ ] Có ACK/Silence/Test theo API thật.
+- [ ] Không báo thành công giả khi command mới queued.
+- [ ] Có trạng thái offline/stale.
+- [ ] Có local notification trong các trạng thái Android hỗ trợ.
+- [ ] Có quản lý nhà/tầng/phòng.
+- [ ] Có Indoor Map 2D tương tác.
+- [ ] Có tạo/sửa vị trí node và bình chữa cháy.
+- [ ] Có import hoặc phác thảo floorplan thực sự.
+- [ ] Có manual/QR-based user location.
+- [ ] Có dashboard AI/analytics dựa trên dữ liệu thật.
+- [ ] Không fake AI confidence.
+- [ ] Không hiển thị MQ-2 raw thành ppm.
+- [ ] Không dùng simulated data trong Real Mode.
+- [ ] Có Demo Mode được gắn nhãn rõ.
+- [ ] Có tests thiết yếu.
+- [ ] Có tài liệu build và sử dụng.
+- [ ] Có danh sách giới hạn đã biết/chưa kiểm chứng.
+
+---
+
+# 22. REQUIRED FINAL DELIVERABLES
+
+Cung cấp:
+
+1. Full Android Studio Kotlin project.
+2. Source code có cấu trúc rõ ràng.
+3. Jetpack Compose screens.
+4. API integration.
+5. BLE provisioning integration.
+6. Room database + migrations.
+7. Interactive Indoor Map.
+8. AI/Analytics module.
+9. Device simulator/mock mode.
+10. Unit tests.
+11. README hướng dẫn build và chạy.
+12. API & BLE integration notes.
+13. Known limitations.
+14. Actual build/test results.
+15. Debug APK nếu build environment hỗ trợ.
+
+README phải giải thích cách kết nối ESP32 thật:
+- Flash firmware.
+- Kết nối ESP32 vào Wi-Fi.
+- Lấy IP.
+- Lấy/cấu hình token riêng.
+- Thêm node vào app.
+- Kiểm tra REST API.
+- Theo dõi thông số.
+- Gửi Test/ACK/Silence.
+- Cấu hình lại Wi-Fi qua BLE khi firmware hỗ trợ.
+
+## FINAL WORKING PRINCIPLE
+
+**Do not replace a working implementation with visual mockups. Build the real integration first, then polish the UI.**
+
+Chỉ tuyên bố feature hoàn thành khi đã có implementation, dữ liệu thật hoặc test xác minh tương ứng.
+
+Các phần bị chặn bởi firmware hoặc thiếu model/API credential phải được triển khai tới ranh giới có thể thực hiện, ghi rõ blocked dependency, và không ngụy tạo thành công.
+
+**Start by inspecting the available project and documentation, then implement Phase 1 end-to-end before progressing through the remaining phases.**

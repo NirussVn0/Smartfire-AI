@@ -1,0 +1,6 @@
+{
+  "name": "SmartFire AI",
+  "description": "Trung tâm điều khiển IoT Android Native cho hệ thống cảm biến cảnh báo cháy ESP32 — STEM của SOV labs. Hỗ trợ kết nối LAN HTTP, cấu hình Wi-Fi BLE, bản đồ 2D siêu mượt quét khu vực, tìm bình chữa cháy và phân tích dữ liệu AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
