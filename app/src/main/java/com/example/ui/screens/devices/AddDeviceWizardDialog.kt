@@ -75,10 +75,11 @@ fun AddDeviceWizardDialog(
     val scope = rememberCoroutineScope()
     val bleManager = remember { BleProvisioningManager(context) }
 
-    var displayName by remember { mutableStateOf("Báo cháy Khu Vực 1") }
+    var displayName by remember { mutableStateOf("Báo cháy Khu Vực Mới") }
+    var isDemoDevice by remember { mutableStateOf(true) }
     var targetIp by remember { mutableStateOf("192.168.1.150") }
-    var detectedDeviceId by remember { mutableStateOf("smartfire-node-01") }
-    var nodeToken by remember { mutableStateOf("") }
+    var detectedDeviceId by remember { mutableStateOf("smartfire-node-${(10..99).random()}") }
+    var nodeToken by remember { mutableStateOf("smartfire-sov-labs-token-2026") }
 
     var isBleScanOpen by remember { mutableStateOf(false) }
     var isVerifying by remember { mutableStateOf(false) }
@@ -122,13 +123,13 @@ fun AddDeviceWizardDialog(
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
                             Text(
-                                text = "Thêm Cảm Biến Báo Cháy",
+                                text = "Thêm Cảm Biến Báo Cháy (Có Đo Nhiệt Độ °C)",
                                 color = TextPrimary,
-                                fontSize = 16.sp,
+                                fontSize = 15.sp,
                                 fontWeight = FontWeight.Bold
                             )
                             Text(
-                                text = "Kết nối qua mạng LAN hoặc Bluetooth",
+                                text = "Chọn Máy Demo hoặc ESP32 thực tế qua LAN / BLE",
                                 color = TextSecondary,
                                 fontSize = 11.sp
                             )
@@ -140,13 +141,55 @@ fun AddDeviceWizardDialog(
                     }
                 }
 
-                Spacer(modifier = Modifier.height(18.dp))
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // Toggle: Máy Báo Cháy DEMO vs Máy Thật ESP32
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Button(
+                        onClick = { isDemoDevice = true },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(40.dp)
+                            .testTag("btn_select_demo_sensor_type"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isDemoDevice) Color(0xFF9333EA) else LightSurfaceVariant,
+                            contentColor = if (isDemoDevice) Color.White else TextPrimary
+                        ),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("Máy Báo Cháy DEMO", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    Button(
+                        onClick = { isDemoDevice = false },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(40.dp)
+                            .testTag("btn_select_real_sensor_type"),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (!isDemoDevice) PrimaryBlue else LightSurfaceVariant,
+                            contentColor = if (!isDemoDevice) Color.White else TextPrimary
+                        ),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text("ESP32 Thực Tế (LAN)", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
 
                 // 1. Tên / Gán nhãn cảm biến
                 OutlinedTextField(
                     value = displayName,
                     onValueChange = { displayName = it },
-                    label = { Text("Gán nhãn / Tên cảm biến") },
+                    label = {
+                        Text(
+                            if (isDemoDevice) "Tên cảm biến (Sẽ tự gắn nhãn [DEMO])" else "Gán nhãn / Tên cảm biến"
+                        )
+                    },
                     placeholder = { Text("Ví dụ: Báo cháy Nhà Bếp, Cảm biến Hành Lang...") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth(),
@@ -282,8 +325,8 @@ fun AddDeviceWizardDialog(
                 // Action Buttons
                 Button(
                     onClick = {
-                        if (nodeToken.length < 8) {
-                            errorMessage = "Token phải có ít nhất 24 ký tự theo chuẩn SmartFire"
+                        if (displayName.isBlank()) {
+                            errorMessage = "Vui lòng nhập tên gán nhãn cho cảm biến"
                             return@Button
                         }
                         isVerifying = true
@@ -291,19 +334,20 @@ fun AddDeviceWizardDialog(
                         scope.launch {
                             val result = repository.registerDevice(
                                 deviceId = detectedDeviceId,
-                                displayName = displayName,
+                                displayName = displayName.trim(),
                                 homeId = "home_main",
                                 floorId = "floor_1",
                                 roomId = "room_main",
                                 ipAddress = targetIp,
-                                token = nodeToken
+                                token = nodeToken.ifBlank { "smartfire-sov-labs-token-2026" },
+                                isDemo = isDemoDevice
                             )
                             isVerifying = false
                             if (result.isSuccess) {
                                 bleManager.disconnect()
                                 onSuccess()
                             } else {
-                                errorMessage = result.exceptionOrNull()?.localizedMessage ?: "Không thể kết nối tới node qua IP"
+                                errorMessage = result.exceptionOrNull()?.localizedMessage ?: "Không thể lưu cảm biến"
                             }
                         }
                     },
@@ -313,14 +357,20 @@ fun AddDeviceWizardDialog(
                         .height(48.dp)
                         .testTag("btn_verify_and_register"),
                     shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue)
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (isDemoDevice) Color(0xFF9333EA) else PrimaryBlue
+                    )
                 ) {
                     if (isVerifying) {
                         CircularProgressIndicator(modifier = Modifier.size(18.dp), color = Color.White, strokeWidth = 2.dp)
                         Spacer(modifier = Modifier.width(8.dp))
-                        Text("Đang kiểm tra kết nối...")
+                        Text("Đang lưu cảm biến...")
                     } else {
-                        Text("Xác Nhận & Lưu Cảm Biến", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                        Text(
+                            if (isDemoDevice) "Lưu Máy Báo Cháy [DEMO]" else "Xác Nhận & Lưu Cảm Biến ESP32",
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 14.sp
+                        )
                     }
                 }
             }

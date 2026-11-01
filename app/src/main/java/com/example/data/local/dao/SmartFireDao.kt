@@ -189,6 +189,9 @@ interface SmartFireDao {
     @Delete
     suspend fun deleteExtinguisher(extinguisher: ExtinguisherEntity)
 
+    @Query("DELETE FROM extinguishers WHERE floorId = :floorId")
+    suspend fun clearExtinguishersForFloor(floorId: String)
+
     // --- MAP OBJECTS & EDGES ---
     @Query("SELECT * FROM map_objects WHERE floorId = :floorId")
     fun getMapObjectsForFloor(floorId: String): Flow<List<MapObjectEntity>>
@@ -199,6 +202,9 @@ interface SmartFireDao {
     @Delete
     suspend fun deleteMapObject(mapObject: MapObjectEntity)
 
+    @Query("DELETE FROM map_objects WHERE floorId = :floorId")
+    suspend fun clearMapObjectsForFloor(floorId: String)
+
     @Query("SELECT * FROM map_edges WHERE floorId = :floorId")
     fun getMapEdgesForFloor(floorId: String): Flow<List<MapEdgeEntity>>
 
@@ -207,6 +213,18 @@ interface SmartFireDao {
 
     @Delete
     suspend fun deleteMapEdge(mapEdge: MapEdgeEntity)
+
+    @Query("DELETE FROM map_edges WHERE floorId = :floorId")
+    suspend fun clearMapEdgesForFloor(floorId: String)
+
+    @Query("DELETE FROM rooms WHERE floorId = :floorId")
+    suspend fun clearRoomsForFloor(floorId: String)
+
+    @Query("UPDATE floors SET widthMeters = :width, lengthMeters = :length WHERE id = :floorId")
+    suspend fun updateFloorDimensions(floorId: String, width: Float, length: Float)
+
+    @Query("DELETE FROM device_events")
+    suspend fun clearAllEvents()
 
     // --- USER LOCATION ---
     @Query("SELECT * FROM user_locations WHERE homeId = :homeId LIMIT 1")

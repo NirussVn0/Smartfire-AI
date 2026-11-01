@@ -287,6 +287,8 @@ fun OverviewTab(node: SmartFireNode) {
                     Spacer(modifier = Modifier.height(10.dp))
 
                     DetailRow("Gán nhãn / Tên", node.displayName)
+                    DetailRow("Phân loại máy", if (node.isDemoSensor || node.displayName.contains("DEMO", ignoreCase = true)) "MÁY BÁO CHÁY DEMO [DEMO]" else "Cảm biến ESP32 Thực Tế")
+                    DetailRow("Nhiệt độ hiện tại", String.format(java.util.Locale.US, "%.1f °C", node.telemetry.temperatureCelsius))
                     DetailRow("Device ID", node.deviceId)
                     DetailRow("Địa chỉ IP mạng LAN", node.ipAddress)
                     DetailRow("Thời gian hoạt động", "${node.telemetry.uptimeMs / 1000}s (${node.telemetry.uptimeMs} ms)")
@@ -304,13 +306,13 @@ fun OverviewTab(node: SmartFireNode) {
                 border = CardDefaults.outlinedCardBorder()
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
-                    Text("Thông Tin Phần Cứng STEM", color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+                    Text("Thông Tin Phần Cứng STEM (Thế Hệ Mới)", color = TextPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        "• Cảm biến khí MQ-2: Đo giá trị analog ADC thô [0..4095].\n" +
+                        "• Cảm biến nhiệt độ môi trường: Đo nhiệt độ thực tế (°C), cảnh báo khi vượt ngưỡng 55°C.\n" +
+                                "• Cảm biến khí MQ-2: Đo giá trị analog ADC thô [0..4095].\n" +
                                 "• Cảm biến lửa: Đầu ra số (DO) quang học nhạy bức xạ hồng ngoại ngọn lửa.\n" +
-                                "• Còi 12V: Điều khiển qua MOSFET D4184 GPIO26.\n" +
-                                "• Nhiệt độ: Firmware hiện tại không tích hợp cảm biến nhiệt độ (không hiển thị số liệu giả).",
+                                "• Còi 12V: Điều khiển qua MOSFET D4184 GPIO26.",
                         color = TextSecondary,
                         fontSize = 11.sp,
                         lineHeight = 17.sp
@@ -347,6 +349,7 @@ fun SensorsTab(node: SmartFireNode) {
                     Text("Chi Tiết Đo Đạc Thời Gian Thực", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(10.dp))
 
+                    DetailRow("Nhiệt độ đo được", String.format(java.util.Locale.US, "%.1f °C", node.telemetry.temperatureCelsius))
                     DetailRow("Khí dễ cháy MQ-2", "${node.telemetry.gasRaw} ADC raw")
                     DetailRow("Trạng thái làm nóng", if (node.telemetry.gasReady) "Sẵn sàng (gas_ready=true)" else "Đang sấy nóng")
                     DetailRow("Ngọn lửa quang học", if (node.telemetry.flame) "CÓ LỬA (DO=true)" else "Bình thường")
