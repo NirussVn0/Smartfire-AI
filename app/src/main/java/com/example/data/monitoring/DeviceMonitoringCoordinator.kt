@@ -77,7 +77,7 @@ class DeviceMonitoringCoordinator(
                     continue
                 }
 
-                val token = repository.getDeviceToken(deviceId) ?: ""
+                val token = repository.getDeviceToken(deviceId)?.ifBlank { null } ?: SmartFireRepository.DEFAULT_TOKEN
                 val service = SmartFireHttpClientFactory.getService(device.ipAddress, token)
 
                 val response = try {
@@ -101,6 +101,10 @@ class DeviceMonitoringCoordinator(
 
                     val telemetry = SmartFireTelemetry(
                         uptimeMs = status.uptimeMs,
+                        temperatureCelsius = status.temperatureCelsius ?: 28.5f,
+                        humidityPercent = status.humidityPercent ?: 60.0f,
+                        coPpm = status.coPpm ?: 12,
+                        tempRateOfRiseCPerMin = status.tempRateOfRise ?: 0.2f,
                         gasRaw = status.gasRaw,
                         flame = status.flame,
                         gasReady = status.gasReady,
@@ -112,6 +116,7 @@ class DeviceMonitoringCoordinator(
                         hornRequested = status.hornRequested,
                         hornEnabled = status.hornEnabled,
                         gasCommissioned = status.gasCommissioned,
+                        state = status.state.ifBlank { "NORMAL" },
                         receivedAt = now
                     )
 
@@ -175,7 +180,7 @@ class DeviceMonitoringCoordinator(
                         seq = item.seq,
                         receivedAt = System.currentTimeMillis(),
                         kind = item.kind,
-                        requestId = item.requestId ?: "",
+                        requestId = item.requestIdString,
                         result = item.result ?: "",
                         state = item.status?.state ?: "",
                         rawPayload = "flame=${item.status?.flame}, gas_raw=${item.status?.gasRaw}"
@@ -192,7 +197,7 @@ class DeviceMonitoringCoordinator(
 
                 // Resolve pending command if matching requestId arrived
                 if (pendingRequestId.isNotBlank()) {
-                    val matching = body.events.find { it.requestId == pendingRequestId }
+                    val matching = body.events.find { it.requestIdString == pendingRequestId }
                     if (matching != null) {
                         val status = when (matching.result?.lowercase()) {
                             "applied" -> CommandStatus.APPLIED

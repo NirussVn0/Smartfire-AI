@@ -53,6 +53,10 @@ import java.util.UUID
 
 class SmartFireRepository(context: Context) {
 
+    companion object {
+        const val DEFAULT_TOKEN = "b57701282c9b134039851e5ba993be6a3f025322f437644f"
+    }
+
     private val db = SmartFireDatabase.getInstance(context)
     private val dao = db.smartFireDao()
     private val tokenStore = SecureTokenStore(context)
@@ -261,95 +265,106 @@ class SmartFireRepository(context: Context) {
             } else {
                 val dbDevs = dao.getAllDevices().firstOrNull() ?: emptyList()
                 val nextMap = _liveTelemetry.value.toMutableMap()
+                var hasUpdates = false
                 dbDevs.forEach { entity ->
-                    val cur = nextMap[entity.deviceId] ?: SmartFireTelemetry(
-                        gasRaw = if (entity.lastKnownAlarm) 2150 else 920,
-                        temperatureCelsius = if (entity.lastKnownAlarm) 72.5f else 28.6f,
-                        tempRateOfRiseCPerMin = if (entity.lastKnownAlarm) 8.4f else 0.4f,
-                        coPpm = if (entity.lastKnownAlarm) 135 else 12,
-                        humidityPercent = if (entity.lastKnownAlarm) 28.0f else 61.5f,
-                        irFlameIntensity = if (entity.lastKnownAlarm) 0.88f else 0.03f,
-                        rssiDbm = -52,
-                        alarmStartedAtMs = if (entity.lastKnownAlarm) (now - 5000L) else 0L,
-                        flame = entity.lastKnownAlarm,
-                        gasReady = true,
-                        alarm = entity.lastKnownAlarm,
-                        hornRequested = entity.lastKnownAlarm,
-                        hornEnabled = true,
-                        state = entity.lastKnownState.ifBlank { "NORMAL" },
-                        receivedAt = now
-                    )
-                    val isCurrentlyAlarm = entity.lastKnownAlarm || cur.alarm
-                    val jitterTemp = ((-3..4).random() * 0.1f)
-                    val jitterGas = (-16..20).random()
-                    val jitterCo = (-2..3).random()
-                    val jitterHum = ((-3..3).random() * 0.15f)
-                    val jitterRssi = (-2..2).random()
+                    val isDemo = entity.firmwareRoomId.startsWith("demo") ||
+                            entity.firmwareRoomId.startsWith("sov-") ||
+                            entity.displayName.contains("DEMO", ignoreCase = true)
 
-                    val nextTemp = if (isCurrentlyAlarm) {
-                        (cur.temperatureCelsius + 0.4f).coerceIn(58f, 105f)
-                    } else {
-                        (cur.temperatureCelsius + jitterTemp).coerceIn(26.5f, 36.0f)
-                    }
-                    val nextRor = if (isCurrentlyAlarm) {
-                        (cur.tempRateOfRiseCPerMin + 0.25f).coerceIn(6.0f, 18.0f)
-                    } else {
-                        (0.35f + ((-2..3).random() * 0.1f)).coerceIn(0.1f, 2.2f)
-                    }
-                    val nextGas = if (isCurrentlyAlarm) {
-                        (cur.gasRaw + 22).coerceIn(1820, 3600)
-                    } else {
-                        (cur.gasRaw + jitterGas).coerceIn(720, 1320)
-                    }
-                    val nextCo = if (isCurrentlyAlarm) {
-                        (cur.coPpm + 4).coerceIn(95, 320)
-                    } else {
-                        (cur.coPpm + jitterCo).coerceIn(6, 30)
-                    }
-                    val nextHum = if (isCurrentlyAlarm) {
-                        (cur.humidityPercent - 0.5f).coerceIn(18f, 38f)
-                    } else {
-                        (cur.humidityPercent + jitterHum).coerceIn(50f, 68f)
-                    }
-                    val nextIr = if (isCurrentlyAlarm) {
-                        (cur.irFlameIntensity + 0.02f).coerceIn(0.78f, 0.99f)
-                    } else {
-                        cur.irFlameIntensity.coerceIn(0.01f, 0.15f)
-                    }
-                    val nextRssi = (cur.rssiDbm + jitterRssi).coerceIn(-78, -42)
-                    val alarmStart = if (isCurrentlyAlarm) {
-                        if (cur.alarmStartedAtMs > 0L) cur.alarmStartedAtMs else now - 3000L
-                    } else {
-                        0L
-                    }
+                    // Never overwrite telemetry of real ESP32 nodes with simulated jitter
+                    if (isDemo) {
+                        hasUpdates = true
+                        val cur = nextMap[entity.deviceId] ?: SmartFireTelemetry(
+                            gasRaw = if (entity.lastKnownAlarm) 2150 else 920,
+                            temperatureCelsius = if (entity.lastKnownAlarm) 72.5f else 28.6f,
+                            tempRateOfRiseCPerMin = if (entity.lastKnownAlarm) 8.4f else 0.4f,
+                            coPpm = if (entity.lastKnownAlarm) 135 else 12,
+                            humidityPercent = if (entity.lastKnownAlarm) 28.0f else 61.5f,
+                            irFlameIntensity = if (entity.lastKnownAlarm) 0.88f else 0.03f,
+                            rssiDbm = -52,
+                            alarmStartedAtMs = if (entity.lastKnownAlarm) (now - 5000L) else 0L,
+                            flame = entity.lastKnownAlarm,
+                            gasReady = true,
+                            alarm = entity.lastKnownAlarm,
+                            hornRequested = entity.lastKnownAlarm,
+                            hornEnabled = true,
+                            state = entity.lastKnownState.ifBlank { "NORMAL" },
+                            receivedAt = now
+                        )
+                        val isCurrentlyAlarm = entity.lastKnownAlarm || cur.alarm
+                        val jitterTemp = ((-3..4).random() * 0.1f)
+                        val jitterGas = (-16..20).random()
+                        val jitterCo = (-2..3).random()
+                        val jitterHum = ((-3..3).random() * 0.15f)
+                        val jitterRssi = (-2..2).random()
 
-                    val candidate = cur.copy(
-                        temperatureCelsius = nextTemp,
-                        tempRateOfRiseCPerMin = nextRor,
-                        gasRaw = nextGas,
-                        coPpm = nextCo,
-                        humidityPercent = nextHum,
-                        irFlameIntensity = nextIr,
-                        rssiDbm = nextRssi,
-                        alarmStartedAtMs = alarmStart,
-                        receivedAt = now
-                    )
-                    val prob = candidate.calculateFireProbability().totalProbabilityPercent
-                    val probAlarm = prob >= 75f
-                    val probState = when {
-                        prob >= 75f -> "ALARM"
-                        prob >= 45f -> "SUSPECTED"
-                        else -> "NORMAL"
+                        val nextTemp = if (isCurrentlyAlarm) {
+                            (cur.temperatureCelsius + 0.4f).coerceIn(58f, 105f)
+                        } else {
+                            (cur.temperatureCelsius + jitterTemp).coerceIn(26.5f, 36.0f)
+                        }
+                        val nextRor = if (isCurrentlyAlarm) {
+                            (cur.tempRateOfRiseCPerMin + 0.25f).coerceIn(6.0f, 18.0f)
+                        } else {
+                            (0.35f + ((-2..3).random() * 0.1f)).coerceIn(0.1f, 2.2f)
+                        }
+                        val nextGas = if (isCurrentlyAlarm) {
+                            (cur.gasRaw + 22).coerceIn(1820, 3600)
+                        } else {
+                            (cur.gasRaw + jitterGas).coerceIn(720, 1320)
+                        }
+                        val nextCo = if (isCurrentlyAlarm) {
+                            (cur.coPpm + 4).coerceIn(95, 320)
+                        } else {
+                            (cur.coPpm + jitterCo).coerceIn(6, 30)
+                        }
+                        val nextHum = if (isCurrentlyAlarm) {
+                            (cur.humidityPercent - 0.5f).coerceIn(18f, 38f)
+                        } else {
+                            (cur.humidityPercent + jitterHum).coerceIn(50f, 68f)
+                        }
+                        val nextIr = if (isCurrentlyAlarm) {
+                            (cur.irFlameIntensity + 0.02f).coerceIn(0.78f, 0.99f)
+                        } else {
+                            cur.irFlameIntensity.coerceIn(0.01f, 0.15f)
+                        }
+                        val nextRssi = (cur.rssiDbm + jitterRssi).coerceIn(-78, -42)
+                        val alarmStart = if (isCurrentlyAlarm) {
+                            if (cur.alarmStartedAtMs > 0L) cur.alarmStartedAtMs else now - 3000L
+                        } else {
+                            0L
+                        }
+
+                        val candidate = cur.copy(
+                            temperatureCelsius = nextTemp,
+                            tempRateOfRiseCPerMin = nextRor,
+                            gasRaw = nextGas,
+                            coPpm = nextCo,
+                            humidityPercent = nextHum,
+                            irFlameIntensity = nextIr,
+                            rssiDbm = nextRssi,
+                            alarmStartedAtMs = alarmStart,
+                            receivedAt = now
+                        )
+                        val prob = candidate.calculateFireProbability().totalProbabilityPercent
+                        val probAlarm = prob >= 75f
+                        val probState = when {
+                            prob >= 75f -> "ALARM"
+                            prob >= 45f -> "SUSPECTED"
+                            else -> "NORMAL"
+                        }
+                        nextMap[entity.deviceId] = candidate.copy(
+                            alarm = probAlarm,
+                            flame = probAlarm || nextIr >= 0.65f,
+                            hornRequested = probAlarm && !candidate.muted,
+                            state = probState,
+                            alarmStartedAtMs = if (probAlarm) (if (alarmStart > 0L) alarmStart else now) else 0L
+                        )
                     }
-                    nextMap[entity.deviceId] = candidate.copy(
-                        alarm = probAlarm,
-                        flame = probAlarm || nextIr >= 0.65f,
-                        hornRequested = probAlarm && !candidate.muted,
-                        state = probState,
-                        alarmStartedAtMs = if (probAlarm) (if (alarmStart > 0L) alarmStart else now) else 0L
-                    )
                 }
-                _liveTelemetry.value = nextMap
+                if (hasUpdates) {
+                    _liveTelemetry.value = nextMap
+                }
             }
         }
     }
@@ -630,7 +645,7 @@ class SmartFireRepository(context: Context) {
         val rawName = displayName.trim().ifBlank { cleanId }
         val cleanName = if (isDemo && !rawName.contains("[DEMO]", ignoreCase = true)) "[DEMO] $rawName" else rawName
         val cleanIp = ipAddress.trim().ifBlank { "192.168.1.150" }
-        val cleanToken = token.trim().ifBlank { "smartfire-sov-labs-token-2026" }
+        val cleanToken = token.trim().ifBlank { DEFAULT_TOKEN }
 
         if (_isDemoMode.value) {
             val newNode = SmartFireNode(
@@ -863,7 +878,7 @@ class SmartFireRepository(context: Context) {
         }
 
         val device = dao.getDeviceById(deviceId)
-        val token = getDeviceToken(deviceId) ?: "smartfire-sov-labs-token-2026"
+        val token = getDeviceToken(deviceId)?.ifBlank { null } ?: DEFAULT_TOKEN
         val now = System.currentTimeMillis()
 
         if (device != null) {
@@ -879,9 +894,9 @@ class SmartFireRepository(context: Context) {
 
                 if (response != null && response.code() == 202) {
                     val body = response.body()
-                    val reqId = body?.requestId ?: "req_$now"
+                    val reqId = body?.requestIdString?.ifBlank { null } ?: "req_$now"
                     _liveCommandRequestIds.value = _liveCommandRequestIds.value + (deviceId to reqId)
-                    _liveCommandStatus.value = _liveCommandStatus.value + (deviceId to CommandStatus.APPLIED)
+                    _liveCommandStatus.value = _liveCommandStatus.value + (deviceId to CommandStatus.PENDING)
                     return@withContext Result.success(reqId)
                 }
             } catch (_: Throwable) {
@@ -1478,21 +1493,25 @@ class SmartFireRepository(context: Context) {
                 )
             )
 
-            // Seed 2 demo sensor nodes clearly labeled [DEMO] so the user knows they are demo nodes and can delete or test them
+            // Seed SmartFire ESP32 Node 01 with configured default token
             val now = System.currentTimeMillis()
+            try {
+                tokenStore.saveToken("smartfire-node-01", DEFAULT_TOKEN)
+            } catch (_: Throwable) {}
+
             dao.insertDevice(
                 DeviceEntity(
                     deviceId = "smartfire-node-01",
-                    displayName = "[DEMO] Báo cháy Khu Vực 1 (SOV Lab)",
+                    displayName = "Cảm biến Báo Cháy ESP32",
                     homeId = homeId,
                     floorId = floor1Id,
                     roomId = "room_main",
-                    firmwareRoomId = "demo-sov-01",
+                    firmwareRoomId = "room-101",
                     lastKnownIp = "192.168.1.150",
                     lastSeenAt = now,
-                    bootId = "boot-sov-01",
-                    latestSeq = 10L,
-                    lastKnownState = "NORMAL",
+                    bootId = "boot-node-01",
+                    latestSeq = 0L,
+                    lastKnownState = "WARMING",
                     lastKnownAlarm = false,
                     xNormalized = 0.35f,
                     yNormalized = 0.35f

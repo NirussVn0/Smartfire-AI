@@ -104,6 +104,8 @@ fun DeviceDetailScreen(
 
     var showRenameDialog by remember { mutableStateOf(false) }
     var newAliasInput by remember { mutableStateOf(node?.displayName ?: "") }
+    var showUpdateIpDialog by remember { mutableStateOf(false) }
+    var newIpInput by remember { mutableStateOf(node?.ipAddress ?: "") }
     var showDeleteConfirmDialog by remember { mutableStateOf(false) }
 
     if (node == null) {
@@ -201,6 +203,10 @@ fun DeviceDetailScreen(
                         newAliasInput = node.displayName
                         showRenameDialog = true
                     },
+                    onUpdateIpClick = {
+                        newIpInput = node.ipAddress
+                        showUpdateIpDialog = true
+                    },
                     onReconfigureBleClick = onReconfigureBleClick,
                     onDeleteClick = { showDeleteConfirmDialog = true }
                 )
@@ -235,6 +241,39 @@ fun DeviceDetailScreen(
             },
             dismissButton = {
                 TextButton(onClick = { showRenameDialog = false }) { Text("Hủy") }
+            },
+            containerColor = LightCard
+        )
+    }
+
+    // Update IP Dialog
+    if (showUpdateIpDialog) {
+        AlertDialog(
+            onDismissRequest = { showUpdateIpDialog = false },
+            title = { Text("Cập nhật địa chỉ IP ESP32", color = TextPrimary) },
+            text = {
+                OutlinedTextField(
+                    value = newIpInput,
+                    onValueChange = { newIpInput = it },
+                    label = { Text("Địa chỉ IP mạng LAN") },
+                    placeholder = { Text("192.168.1.150") },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedBorderColor = PrimaryBlue,
+                        focusedTextColor = TextPrimary,
+                        unfocusedTextColor = TextPrimary
+                    )
+                )
+            },
+            confirmButton = {
+                Button(onClick = {
+                    scope.launch {
+                        repository.updateDeviceIp(node.deviceId, newIpInput.trim())
+                        showUpdateIpDialog = false
+                    }
+                }) { Text("Lưu IP") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showUpdateIpDialog = false }) { Text("Hủy") }
             },
             containerColor = LightCard
         )
@@ -505,6 +544,7 @@ fun HistoryTab(events: List<DeviceEvent>) {
 fun SettingsTab(
     node: SmartFireNode,
     onRenameClick: () -> Unit,
+    onUpdateIpClick: () -> Unit,
     onReconfigureBleClick: () -> Unit,
     onDeleteClick: () -> Unit
 ) {
@@ -529,6 +569,19 @@ fun SettingsTab(
                         Icon(Icons.Default.Edit, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(16.dp))
                         Spacer(modifier = Modifier.width(8.dp))
                         Text("Đổi tên / Gán nhãn cảm biến", color = TextPrimary)
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    Button(
+                        onClick = onUpdateIpClick,
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(containerColor = LightSurfaceVariant),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.Lan, contentDescription = null, tint = TextPrimary, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text("Đổi địa chỉ IP mạng LAN (${node.ipAddress})", color = TextPrimary)
                     }
 
                     Spacer(modifier = Modifier.height(8.dp))

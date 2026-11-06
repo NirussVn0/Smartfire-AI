@@ -9,13 +9,16 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothStatusCodes
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.ParcelUuid
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -42,9 +45,11 @@ sealed interface BleConnectionState {
     data class Connected(val deviceName: String) : BleConnectionState
     data class ServicesDiscovered(val hasService: Boolean) : BleConnectionState
     data class ProvisioningStatus(
-        val status: String, // CONNECTING, CONNECTED, DISCONNECTED
+        val status: String, // INITIALIZING, CONNECTING, CONNECTED, DISCONNECTED
         val ip: String? = null,
         val deviceId: String? = null,
+        val roomId: String? = null,
+        val token: String? = null,
         val ssid: String? = null
     ) : BleConnectionState
     data class Error(val message: String) : BleConnectionState
@@ -78,10 +83,16 @@ class BleProvisioningManager(private val context: Context) {
         @SuppressLint("MissingPermission")
         override fun onScanResult(callbackType: Int, result: ScanResult) {
             val device = result.device ?: return
-            val name = result.scanRecord?.deviceName ?: device.name ?: "Unknown ESP32"
+            val record = result.scanRecord
+            val rawName = record?.deviceName ?: (try { device.name } catch (_: Exception) { null })
+            val name = if (!rawName.isNullOrBlank()) rawName else "ESP32 (${device.address.takeLast(5)})"
 
-            // Look for SmartFire devices or generic ESP32 nodes
-            if (name.contains("SmartFire", ignoreCase = true) || name.contains("ESP32", ignoreCase = true)) {
+            val hasSmartFireService = record?.serviceUuids?.any { it.uuid == SERVICE_UUID } == true
+            val nameMatch = name.contains("SmartFire", ignoreCase = true) ||
+                    name.contains("ESP32", ignoreCase = true) ||
+                    name.contains("node", ignoreCase = true)
+
+            if (hasSmartFireService || nameMatch) {
                 val item = DiscoveredBleDevice(
                     name = name,
                     address = device.address,
@@ -105,7 +116,7 @@ class BleProvisioningManager(private val context: Context) {
     }
 
     @SuppressLint("MissingPermission")
-    fun startScan(timeoutMs: Long = 10000L) {
+    fun startScan(timeoutMs: Long = 12000L) {
         val adapter = bluetoothAdapter
         if (adapter == null || !adapter.isEnabled) {
             _scanState.value = BleScanState.Error("Bluetooth chưa được bật trên điện thoại")
@@ -125,11 +136,21 @@ class BleProvisioningManager(private val context: Context) {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
+        val filter = ScanFilter.Builder()
+            .setServiceUuid(ParcelUuid(SERVICE_UUID))
+            .build()
+
         try {
-            scanner.startScan(emptyList<ScanFilter>(), settings, scanCallback)
+            // Scan with and without filter to maximize discovery rate on various Android OEM chips
+            scanner.startScan(listOf(filter), settings, scanCallback)
             handler.postDelayed({ stopScan() }, timeoutMs)
-        } catch (e: Exception) {
-            _scanState.value = BleScanState.Error("Lỗi bắt đầu quét: ${e.localizedMessage}")
+        } catch (_: Exception) {
+            try {
+                scanner.startScan(emptyList(), settings, scanCallback)
+                handler.postDelayed({ stopScan() }, timeoutMs)
+            } catch (e: Exception) {
+                _scanState.value = BleScanState.Error("Lỗi bắt đầu quét: ${e.localizedMessage}")
+            }
         }
     }
 
@@ -175,6 +196,10 @@ class BleProvisioningManager(private val context: Context) {
                                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                                 gatt.writeDescriptor(descriptor)
                             }
+                            // Read current value
+                            handler.postDelayed({
+                                try { gatt.readCharacteristic(statusChar) } catch (_: Exception) {}
+                            }, 300)
                         }
                     } else {
                         _connectionState.value = BleConnectionState.ServicesDiscovered(false)
@@ -185,9 +210,40 @@ class BleProvisioningManager(private val context: Context) {
             }
 
             @Deprecated("Deprecated in Java")
+            override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == STATUS_CHAR_UUID) {
+                    val rawValue = characteristic.value?.let { String(it, Charsets.UTF_8) } ?: ""
+                    parseStatusNotification(rawValue)
+                }
+            }
+
+            override fun onCharacteristicRead(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray,
+                status: Int
+            ) {
+                if (status == BluetoothGatt.GATT_SUCCESS && characteristic.uuid == STATUS_CHAR_UUID) {
+                    val rawValue = String(value, Charsets.UTF_8)
+                    parseStatusNotification(rawValue)
+                }
+            }
+
+            @Deprecated("Deprecated in Java")
             override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                 if (characteristic.uuid == STATUS_CHAR_UUID) {
                     val rawValue = characteristic.value?.let { String(it, Charsets.UTF_8) } ?: ""
+                    parseStatusNotification(rawValue)
+                }
+            }
+
+            override fun onCharacteristicChanged(
+                gatt: BluetoothGatt,
+                characteristic: BluetoothGattCharacteristic,
+                value: ByteArray
+            ) {
+                if (characteristic.uuid == STATUS_CHAR_UUID) {
+                    val rawValue = String(value, Charsets.UTF_8)
                     parseStatusNotification(rawValue)
                 }
             }
@@ -195,17 +251,22 @@ class BleProvisioningManager(private val context: Context) {
     }
 
     private fun parseStatusNotification(rawJson: String) {
+        if (rawJson.isBlank()) return
         try {
             val json = JSONObject(rawJson)
             val status = json.optString("status", "UNKNOWN")
             val ip = json.optString("ip", null)
             val deviceId = json.optString("device_id", null)
+            val roomId = json.optString("room_id", null)
+            val token = json.optString("token", null)
             val ssid = json.optString("ssid", null)
 
             _connectionState.value = BleConnectionState.ProvisioningStatus(
                 status = status,
                 ip = if (ip.isNullOrBlank()) null else ip,
                 deviceId = if (deviceId.isNullOrBlank()) null else deviceId,
+                roomId = if (roomId.isNullOrBlank()) null else roomId,
+                token = if (token.isNullOrBlank()) null else token,
                 ssid = if (ssid.isNullOrBlank()) null else ssid
             )
         } catch (_: Exception) {
@@ -220,13 +281,26 @@ class BleProvisioningManager(private val context: Context) {
         val configChar = service.getCharacteristic(CONFIG_CHAR_UUID) ?: return false
 
         val payload = JSONObject().apply {
-            put("ssid", ssid)
-            put("password", pass)
+            put("ssid", ssid.trim())
+            put("password", pass.trim())
         }.toString()
 
-        configChar.value = payload.toByteArray(Charsets.UTF_8)
-        configChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-        return gatt.writeCharacteristic(configChar)
+        val bytes = payload.toByteArray(Charsets.UTF_8)
+
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            gatt.writeCharacteristic(
+                configChar,
+                bytes,
+                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            ) == BluetoothStatusCodes.SUCCESS
+        } else {
+            @Suppress("DEPRECATION")
+            configChar.value = bytes
+            @Suppress("DEPRECATION")
+            configChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+            @Suppress("DEPRECATION")
+            gatt.writeCharacteristic(configChar)
+        }
     }
 
     @SuppressLint("MissingPermission")
