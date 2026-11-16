@@ -18,15 +18,16 @@ object SmartFireHttpClientFactory {
 
     private val clientCache = ConcurrentHashMap<String, SmartFireApiService>()
 
-    fun getService(ipAddress: String, bearerToken: String): SmartFireApiService {
+    fun getService(ipAddress: String, bearerToken: String, timeoutSeconds: Int = 2): SmartFireApiService {
         val sanitizedIp = ipAddress.trim().removePrefix("http://").removePrefix("https://").trimEnd('/')
-        val cacheKey = "$sanitizedIp::$bearerToken"
+        val clampedTimeout = timeoutSeconds.coerceIn(1, 15).toLong()
+        val cacheKey = "$sanitizedIp::$bearerToken::$clampedTimeout"
 
         return clientCache.getOrPut(cacheKey) {
             val okHttpClient = OkHttpClient.Builder()
-                .connectTimeout(2, TimeUnit.SECONDS)
-                .readTimeout(2, TimeUnit.SECONDS)
-                .writeTimeout(2, TimeUnit.SECONDS)
+                .connectTimeout(clampedTimeout, TimeUnit.SECONDS)
+                .readTimeout(clampedTimeout, TimeUnit.SECONDS)
+                .writeTimeout(clampedTimeout, TimeUnit.SECONDS)
                 .addInterceptor(AuthInterceptor(bearerToken))
                 .build()
 

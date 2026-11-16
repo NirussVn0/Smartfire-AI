@@ -41,15 +41,21 @@ class DeviceMonitoringCoordinator(
                     return@collect
                 }
 
-                val currentDeviceIds = devices.map { it.deviceId }.toSet()
+                val realDevices = devices.filterNot { d ->
+                    d.isDemoSensor ||
+                        d.displayName.contains("DEMO", ignoreCase = true) ||
+                        d.firmwareRoomId.startsWith("demo") ||
+                        d.firmwareRoomId.startsWith("sov-")
+                }
+                val currentDeviceIds = realDevices.map { it.deviceId }.toSet()
 
-                // Cancel jobs for removed devices
+                // Cancel jobs for removed or demo devices
                 pollingJobs.keys.filter { it !in currentDeviceIds }.forEach { id ->
                     pollingJobs.remove(id)?.cancel()
                 }
 
-                // Launch poller for each active device
-                devices.forEach { device ->
+                // Launch poller only for real ESP32 devices
+                realDevices.forEach { device ->
                     if (!pollingJobs.containsKey(device.deviceId)) {
                         val job = coordinatorScope.launch {
                             pollDeviceLoop(device.deviceId)
@@ -77,8 +83,15 @@ class DeviceMonitoringCoordinator(
                     continue
                 }
 
+                if (device.isDemoSensor || device.displayName.contains("DEMO", ignoreCase = true) || device.firmwareRoomId.startsWith("demo")) {
+                    repository.updateConnectionOnly(deviceId, DeviceConnectionState.ONLINE_FRESH)
+                    delay(3000L)
+                    continue
+                }
+
                 val token = repository.getDeviceToken(deviceId)?.ifBlank { null } ?: SmartFireRepository.DEFAULT_TOKEN
-                val service = SmartFireHttpClientFactory.getService(device.ipAddress, token)
+                val timeoutSec = repository.httpTimeoutSeconds.value
+                val service = SmartFireHttpClientFactory.getService(device.ipAddress, token, timeoutSec)
 
                 val response = try {
                     service.getStatus()
@@ -99,12 +112,21 @@ class DeviceMonitoringCoordinator(
 
                     val connState = if (isUptimeFrozen) DeviceConnectionState.STALE else DeviceConnectionState.ONLINE_FRESH
 
+                    val prevAlarmStart = device.telemetry.alarmStartedAtMs
+                    val alarmStartMs = if (status.alarm) {
+                        if (prevAlarmStart > 0L) prevAlarmStart else now
+                    } else {
+                        0L
+                    }
+
                     val telemetry = SmartFireTelemetry(
                         uptimeMs = status.uptimeMs,
-                        temperatureCelsius = status.temperatureCelsius ?: 28.5f,
-                        humidityPercent = status.humidityPercent ?: 60.0f,
-                        coPpm = status.coPpm ?: 12,
-                        tempRateOfRiseCPerMin = status.tempRateOfRise ?: 0.2f,
+                        temperatureCelsius = status.temperatureCelsius ?: (if (status.alarm) 68.0f else 28.5f),
+                        humidityPercent = status.humidityPercent ?: (if (status.alarm) 32.0f else 60.0f),
+                        coPpm = status.coPpm ?: (if (status.alarm) 140 else 12),
+                        tempRateOfRiseCPerMin = status.tempRateOfRise ?: (if (status.alarm) 8.5f else 0.2f),
+                        irFlameIntensity = if (status.flame) 0.95f else 0.02f,
+                        alarmStartedAtMs = alarmStartMs,
                         gasRaw = status.gasRaw,
                         flame = status.flame,
                         gasReady = status.gasReady,
@@ -157,8 +179,9 @@ class DeviceMonitoringCoordinator(
                 repository.updateConnectionOnly(deviceId, DeviceConnectionState.OFFLINE)
             }
 
-            // Normal foreground polling interval ~1.2s
-            delay(1200L)
+            // Dynamic polling interval synchronized with SettingsScreen
+            val intervalMs = repository.pollingIntervalMs.value.coerceIn(800L, 10000L)
+            delay(intervalMs)
         }
     }
 

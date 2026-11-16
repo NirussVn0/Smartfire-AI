@@ -32,6 +32,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.SmartFireApplication
+import com.example.data.repository.SmartFireRepository
 import com.example.domain.model.ExtinguisherType
 import com.example.domain.model.FirmwareState
 import com.example.domain.model.MapNavigationRequest
@@ -100,9 +101,17 @@ fun AppNavigation(modifier: Modifier = Modifier) {
     val userLocation by repository.getUserLocation(currentHome?.id ?: "").collectAsState(initial = null)
     val events by repository.allEvents.collectAsState(initial = emptyList())
     val isDemoMode by repository.isDemoMode.collectAsState()
+    val gasThresholdAdc by repository.gasThresholdAdc.collectAsState()
+    val stepStrideMeters by repository.stepStrideMeters.collectAsState()
+    val autoRouteOnAlarm by repository.autoRouteOnAlarm.collectAsState()
+    val recentSnapshots by repository.allRecentSnapshots.collectAsState(initial = emptyList())
+    val aiInsights by repository.allInsights.collectAsState(initial = emptyList())
 
     // Track active fire alarms and compute nearest alarming sensor to user's standing position
-    val alarmNodes = nodes.filter { it.lastKnownAlarm || it.firmwareState == FirmwareState.ALARM }
+    val alarmNodes = nodes.filter {
+        it.lastKnownAlarm || it.firmwareState == FirmwareState.ALARM ||
+            it.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent >= 75f
+    }
     val userPos = userLocation?.position ?: Point2D(0.50f, 0.78f)
     val nearestAlarmNode = alarmNodes.minByOrNull { n ->
         hypot((n.xNormalized - userPos.x).toDouble(), (n.yNormalized - userPos.y).toDouble())
@@ -119,13 +128,13 @@ fun AppNavigation(modifier: Modifier = Modifier) {
     // Full-screen flashing & beeping emergency popup stays active while fire alarm is active,
     // until the user presses "Dẫn tới Bình Chữa Cháy", "Dẫn tới Báo Cháy", or "Tắt Báo Cháy"
     var popupDismissedForCurrentAlarm by remember { mutableStateOf(false) }
-    LaunchedEffect(alarmNodes.size) {
+    LaunchedEffect(alarmNodes.size, autoRouteOnAlarm) {
         if (alarmNodes.isEmpty()) {
             popupDismissedForCurrentAlarm = false
-        } else {
-            // Auto-activate route to nearest alarming fire sensor whenever an alarm triggers
+        } else if (autoRouteOnAlarm) {
+            // Auto-activate 2-stage route (Extinguisher -> Fire) when autoRouteOnAlarm is enabled
             repository.requestMapNavigation(
-                MapNavigationRequest(targetType = MapNavigationTargetType.NEAREST_FIRE_SENSOR)
+                MapNavigationRequest(targetType = MapNavigationTargetType.TWO_STAGE_EXTINGUISHER_TO_FIRE)
             )
         }
     }
@@ -249,6 +258,9 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                         nodes = nodes,
                         currentHome = currentHome,
                         isDemoMode = isDemoMode,
+                        gasThresholdAdc = gasThresholdAdc,
+                        snapshots = recentSnapshots,
+                        insights = aiInsights,
                         loggedInEmail = loggedInEmail,
                         loggedInRole = loggedInRole,
                         onNodeClick = { id -> selectedDeviceId = id },
@@ -315,17 +327,25 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                         mapObjects = mapObjects,
                         mapEdges = mapEdges,
                         userLocation = userLocation,
+                        gasThresholdAdc = gasThresholdAdc,
+                        stepStrideMeters = stepStrideMeters,
+                        autoRouteOnAlarm = autoRouteOnAlarm,
                         initialInSetupMode = mapInSetupMode,
                         navigationRequest = mapNavigationRequest,
                         onConsumeNavigationRequest = {
                             repository.requestMapNavigation(null)
                         },
-                        onSaveScannedSetup = { _, doors, stairs, exts, exits, mainDoors ->
+                        onSaveScannedSetup = { sensorPts, doors, stairs, exts, exits, mainDoors ->
                             scope.launch {
                                 val flId = currentFloor?.id ?: "floor_1"
-                                repository.clearMapConfiguration(flId)
+                                repository.clearObjectsOnlyForFloor(flId)
                                 if ((currentFloor?.widthMeters ?: 0f) <= 0f) {
                                     repository.updateFloorDimensions(flId, 12f, 16f)
+                                }
+                                sensorPts.forEachIndexed { i, pt ->
+                                    nodes.getOrNull(i)?.let { n ->
+                                        repository.updateDeviceMapPosition(n.deviceId, pt.x, pt.y)
+                                    }
                                 }
                                 mainDoors.forEachIndexed { i, pt ->
                                     repository.addMapObject(flId, "Cửa Chính #${i + 1}", com.example.domain.model.MapObjectType.MAIN_DOOR, pt.x, pt.y)
@@ -345,9 +365,34 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                                 mapInSetupMode = false
                             }
                         },
+                        onSaveBoundaryPolygon = { flId, poly, widthM, lengthM ->
+                            scope.launch {
+                                repository.saveBoundaryPolygon(flId, poly, widthM, lengthM)
+                            }
+                        },
                         onBindSensorPosition = { deviceId, x, y ->
                             scope.launch {
                                 repository.updateDeviceMapPosition(deviceId, x, y)
+                            }
+                        },
+                        onDeleteExtinguisher = { extId ->
+                            scope.launch {
+                                repository.deleteExtinguisher(extId)
+                            }
+                        },
+                        onUpdateExtinguisherPosition = { extId, x, y ->
+                            scope.launch {
+                                repository.updateExtinguisherPosition(extId, x, y)
+                            }
+                        },
+                        onDeleteMapObject = { objId ->
+                            scope.launch {
+                                repository.deleteMapObject(objId)
+                            }
+                        },
+                        onUpdateMapObjectPosition = { objId, x, y ->
+                            scope.launch {
+                                repository.updateMapObjectPosition(objId, x, y)
                             }
                         },
                         onUpdateFloorDimensions = { flId, widthM, lengthM ->
@@ -412,6 +457,15 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                         mapInSetupMode = false
                         repository.requestMapNavigation(
                             MapNavigationRequest(targetType = MapNavigationTargetType.NEAREST_FIRE_SENSOR)
+                        )
+                        currentTab = StreamlinedTab.MAP_2D
+                    },
+                    onRouteTwoStageExtinguisherToFire = {
+                        popupDismissedForCurrentAlarm = true
+                        selectedDeviceId = null
+                        mapInSetupMode = false
+                        repository.requestMapNavigation(
+                            MapNavigationRequest(targetType = MapNavigationTargetType.TWO_STAGE_EXTINGUISHER_TO_FIRE)
                         )
                         currentTab = StreamlinedTab.MAP_2D
                     },

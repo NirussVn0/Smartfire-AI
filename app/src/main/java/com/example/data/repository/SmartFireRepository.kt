@@ -30,6 +30,7 @@ import com.example.domain.model.MapNodeItem
 import com.example.domain.model.MapObjectType
 import com.example.domain.model.Point2D
 import com.example.domain.model.RoomSpace
+import com.example.domain.model.SensorSnapshotPoint
 import com.example.domain.model.SmartFireNode
 import com.example.domain.model.SmartFireTelemetry
 import com.example.domain.model.UserPosition
@@ -241,7 +242,7 @@ class SmartFireRepository(context: Context) {
                         alarmStartedAtMs = alarmStart,
                         receivedAt = now
                     )
-                    val prob = candidateTelem.calculateFireProbability().totalProbabilityPercent
+                    val prob = candidateTelem.calculateFireProbability(_gasThresholdAdc.value).totalProbabilityPercent
                     val probAlarm = prob >= 75f
                     val probState = when {
                         prob >= 75f -> "ALARM"
@@ -254,6 +255,26 @@ class SmartFireRepository(context: Context) {
                         hornRequested = probAlarm && !candidateTelem.muted,
                         state = probState,
                         alarmStartedAtMs = if (probAlarm) (if (alarmStart > 0L) alarmStart else now) else 0L
+                    )
+                    dao.insertSnapshot(
+                        DeviceSnapshotEntity(
+                            deviceId = node.deviceId,
+                            bootId = node.bootId.ifBlank { "boot-demo" },
+                            receivedAt = now,
+                            uptimeMs = finalTelem.uptimeMs + 2500L,
+                            state = finalTelem.state,
+                            gasRaw = finalTelem.gasRaw,
+                            flame = finalTelem.flame,
+                            gasReady = true,
+                            gasFault = false,
+                            alarm = finalTelem.alarm,
+                            muted = finalTelem.muted,
+                            acknowledged = finalTelem.acknowledged,
+                            testing = finalTelem.testing,
+                            hornRequested = finalTelem.hornRequested,
+                            hornEnabled = true,
+                            gasCommissioned = true
+                        )
                     )
                     node.copy(
                         firmwareState = FirmwareState.fromString(probState),
@@ -346,19 +367,40 @@ class SmartFireRepository(context: Context) {
                             alarmStartedAtMs = alarmStart,
                             receivedAt = now
                         )
-                        val prob = candidate.calculateFireProbability().totalProbabilityPercent
+                        val prob = candidate.calculateFireProbability(_gasThresholdAdc.value).totalProbabilityPercent
                         val probAlarm = prob >= 75f
                         val probState = when {
                             prob >= 75f -> "ALARM"
                             prob >= 45f -> "SUSPECTED"
                             else -> "NORMAL"
                         }
-                        nextMap[entity.deviceId] = candidate.copy(
+                        val finalTelem = candidate.copy(
                             alarm = probAlarm,
                             flame = probAlarm || nextIr >= 0.65f,
                             hornRequested = probAlarm && !candidate.muted,
                             state = probState,
                             alarmStartedAtMs = if (probAlarm) (if (alarmStart > 0L) alarmStart else now) else 0L
+                        )
+                        nextMap[entity.deviceId] = finalTelem
+                        dao.insertSnapshot(
+                            DeviceSnapshotEntity(
+                                deviceId = entity.deviceId,
+                                bootId = entity.bootId.ifBlank { "boot-sov" },
+                                receivedAt = now,
+                                uptimeMs = finalTelem.uptimeMs + 2500L,
+                                state = finalTelem.state,
+                                gasRaw = finalTelem.gasRaw,
+                                flame = finalTelem.flame,
+                                gasReady = true,
+                                gasFault = false,
+                                alarm = finalTelem.alarm,
+                                muted = finalTelem.muted,
+                                acknowledged = finalTelem.acknowledged,
+                                testing = finalTelem.testing,
+                                hornRequested = finalTelem.hornRequested,
+                                hornEnabled = true,
+                                gasCommissioned = true
+                            )
                         )
                     }
                 }
@@ -397,7 +439,7 @@ class SmartFireRepository(context: Context) {
             gasCommissioned = true,
             receivedAt = now
         )
-        val breakdown = tempTelem.calculateFireProbability()
+        val breakdown = tempTelem.calculateFireProbability(_gasThresholdAdc.value)
         val isAlarm = breakdown.totalProbabilityPercent >= 75f
         val newState = when {
             breakdown.totalProbabilityPercent >= 75f -> "ALARM"
@@ -412,6 +454,67 @@ class SmartFireRepository(context: Context) {
             alarmStartedAtMs = if (isAlarm) now else 0L
         )
 
+        dao.insertSnapshot(
+            DeviceSnapshotEntity(
+                deviceId = deviceId,
+                bootId = "boot-sim",
+                receivedAt = now,
+                uptimeMs = 120_000L,
+                state = newState,
+                gasRaw = gasRaw,
+                flame = finalTelem.flame,
+                gasReady = true,
+                gasFault = false,
+                alarm = isAlarm,
+                muted = false,
+                acknowledged = false,
+                testing = false,
+                hornRequested = isAlarm,
+                hornEnabled = true,
+                gasCommissioned = true
+            )
+        )
+
+        val simInsight = AiInsight(
+            id = now,
+            deviceId = deviceId,
+            title = when {
+                isAlarm -> "BÁO ĐỘNG ĐA THÔNG SỐ: P(Cháy)=${String.format(java.util.Locale.US, "%.1f%%", breakdown.totalProbabilityPercent)} tại $deviceId"
+                breakdown.totalProbabilityPercent >= 45f -> "CẢNH BÁO SỚM: Biến động nhiệt (${String.format(java.util.Locale.US, "%.1f°C", temperatureCelsius)}) & khói ($gasRaw ADC)"
+                else -> "Phân tích đa cảm biến ổn định (P=${String.format(java.util.Locale.US, "%.1f%%", breakdown.totalProbabilityPercent)})"
+            },
+            explanation = "Tổ hợp 5 thông số: Nhiệt=${String.format(java.util.Locale.US, "%.1f°C", temperatureCelsius)} (+${String.format(java.util.Locale.US, "%.1f°/p", tempRateOfRiseCPerMin)}), MQ-2=$gasRaw ADC (Ngưỡng ${_gasThresholdAdc.value}), CO=$coPpm ppm, Ẩm=${String.format(java.util.Locale.US, "%.0f%%", humidityPercent)}.",
+            sourceMeasurements = "Temp=${String.format(java.util.Locale.US, "%.1f°C", temperatureCelsius)}, Gas=$gasRaw ADC, CO=${coPpm}ppm, IR=${(irFlameIntensity * 100).toInt()}%",
+            analysisMethod = "Mô hình kết hợp xác suất Bayesian / Logistic 5 thông số",
+            freshness = "Vừa cập nhật",
+            severity = when {
+                isAlarm -> "CRITICAL"
+                breakdown.totalProbabilityPercent >= 45f -> "WARNING"
+                else -> "INFO"
+            },
+            recommendation = if (isAlarm) {
+                "Bấm 'Dẫn đường 2 chặng (Bình CC ➔ Đám cháy)' trên Bản đồ 2D để xử lý ngay."
+            } else {
+                "Tiếp tục giám sát tự động qua mạng LAN."
+            },
+            timestamp = now
+        )
+
+        dao.deleteInsightsForDevice(deviceId)
+        dao.insertInsight(
+            AnalysisInsightEntity(
+                deviceId = simInsight.deviceId,
+                title = simInsight.title,
+                explanation = simInsight.explanation,
+                sourceMeasurements = simInsight.sourceMeasurements,
+                analysisMethod = simInsight.analysisMethod,
+                freshness = simInsight.freshness,
+                severity = simInsight.severity,
+                recommendation = simInsight.recommendation,
+                timestamp = simInsight.timestamp
+            )
+        )
+
         if (_isDemoMode.value) {
             _demoNodes.value = _demoNodes.value.map { n ->
                 if (n.deviceId == deviceId) {
@@ -422,6 +525,7 @@ class SmartFireRepository(context: Context) {
                     )
                 } else n
             }
+            _demoInsights.value = listOf(simInsight) + _demoInsights.value.filterNot { it.deviceId == deviceId }.take(8)
         } else {
             _liveTelemetry.value = _liveTelemetry.value + (deviceId to finalTelem)
             val device = dao.getDeviceById(deviceId)
@@ -532,7 +636,39 @@ class SmartFireRepository(context: Context) {
     }
 
     suspend fun updateFloorDimensions(floorId: String, widthMeters: Float, lengthMeters: Float) = withContext(Dispatchers.IO) {
+        if (widthMeters <= 0f || lengthMeters <= 0f) {
+            dao.updateFloorDimensions(floorId, 0f, 0f)
+        } else {
+            dao.updateFloorDimensions(floorId, widthMeters.coerceIn(3f, 200f), lengthMeters.coerceIn(3f, 200f))
+        }
+    }
+
+    suspend fun saveBoundaryPolygon(
+        floorId: String,
+        polygon: List<Point2D>,
+        widthMeters: Float,
+        lengthMeters: Float
+    ) = withContext(Dispatchers.IO) {
         dao.updateFloorDimensions(floorId, widthMeters.coerceIn(3f, 200f), lengthMeters.coerceIn(3f, 200f))
+        dao.clearRoomsForFloor(floorId)
+        if (polygon.size >= 3) {
+            dao.insertRoom(
+                RoomEntity(
+                    id = "boundary_$floorId",
+                    floorId = floorId,
+                    name = "Khung Khoanh Vùng Nhà",
+                    type = "MAIN_BOUNDARY",
+                    polygonJson = serializePolygon(polygon),
+                    colorHex = "#2563EB"
+                )
+            )
+        }
+    }
+
+    suspend fun clearObjectsOnlyForFloor(floorId: String) = withContext(Dispatchers.IO) {
+        dao.clearMapObjectsForFloor(floorId)
+        dao.clearExtinguishersForFloor(floorId)
+        dao.clearMapEdgesForFloor(floorId)
     }
 
     suspend fun clearMapConfiguration(floorId: String) = withContext(Dispatchers.IO) {
@@ -694,6 +830,11 @@ class SmartFireRepository(context: Context) {
             val body = response.body()
             if (response.isSuccessful && body != null) {
                 val finalId = body.deviceId.ifBlank { cleanId }
+                try {
+                    tokenStore.saveToken(finalId, cleanToken)
+                } catch (_: Throwable) {}
+                val now = System.currentTimeMillis()
+                val st = body.status
                 val entity = DeviceEntity(
                     deviceId = finalId,
                     displayName = cleanName,
@@ -702,15 +843,38 @@ class SmartFireRepository(context: Context) {
                     roomId = roomId,
                     firmwareRoomId = body.roomId ?: (if (isDemo) "demo-node" else "user-node"),
                     lastKnownIp = cleanIp,
-                    lastSeenAt = System.currentTimeMillis(),
+                    lastSeenAt = now,
                     bootId = body.bootId,
                     latestSeq = body.latestSeq,
-                    lastKnownState = body.status.state,
-                    lastKnownAlarm = body.status.alarm,
+                    lastKnownState = st.state,
+                    lastKnownAlarm = st.alarm,
                     xNormalized = xNormalized,
                     yNormalized = yNormalized
                 )
                 dao.insertDevice(entity)
+                _liveTelemetry.value = _liveTelemetry.value + (finalId to SmartFireTelemetry(
+                    uptimeMs = st.uptimeMs,
+                    temperatureCelsius = st.temperatureCelsius ?: (if (st.alarm) 68.0f else 28.5f),
+                    humidityPercent = st.humidityPercent ?: (if (st.alarm) 32.0f else 60.0f),
+                    coPpm = st.coPpm ?: (if (st.alarm) 140 else 12),
+                    tempRateOfRiseCPerMin = st.tempRateOfRise ?: (if (st.alarm) 8.5f else 0.2f),
+                    irFlameIntensity = if (st.flame) 0.95f else 0.02f,
+                    alarmStartedAtMs = if (st.alarm) now else 0L,
+                    gasRaw = st.gasRaw,
+                    flame = st.flame,
+                    gasReady = st.gasReady,
+                    gasFault = st.gasFault,
+                    alarm = st.alarm,
+                    muted = st.muted,
+                    acknowledged = st.acknowledged,
+                    testing = st.testing,
+                    hornRequested = st.hornRequested,
+                    hornEnabled = st.hornEnabled,
+                    gasCommissioned = st.gasCommissioned,
+                    state = st.state.ifBlank { "NORMAL" },
+                    receivedAt = now
+                ))
+                _liveConnectionState.value = _liveConnectionState.value + (finalId to DeviceConnectionState.ONLINE_FRESH)
                 return@withContext Result.success(Unit)
             }
         } catch (_: Throwable) {
@@ -776,7 +940,13 @@ class SmartFireRepository(context: Context) {
     }
 
     suspend fun updateDeviceIp(deviceId: String, newIp: String) = withContext(Dispatchers.IO) {
-        dao.updateDeviceIp(deviceId, newIp)
+        val cleanIp = newIp.trim()
+        dao.updateDeviceIp(deviceId, cleanIp)
+        if (_isDemoMode.value) {
+            _demoNodes.value = _demoNodes.value.map {
+                if (it.deviceId == deviceId) it.copy(ipAddress = cleanIp) else it
+            }
+        }
     }
 
     suspend fun removeDevice(deviceId: String) = withContext(Dispatchers.IO) {
@@ -1085,7 +1255,11 @@ class SmartFireRepository(context: Context) {
     }
 
     suspend fun deleteExtinguisher(id: String) = withContext(Dispatchers.IO) {
-        val list = dao.getExtinguishersForFloor("").firstOrNull()
+        dao.deleteExtinguisherById(id)
+    }
+
+    suspend fun updateExtinguisherPosition(id: String, x: Float, y: Float) = withContext(Dispatchers.IO) {
+        dao.updateExtinguisherPosition(id, x.coerceIn(0.05f, 0.95f), y.coerceIn(0.05f, 0.95f))
     }
 
     fun getMapObjectsForFloor(floorId: String): Flow<List<MapNodeItem>> {
@@ -1113,6 +1287,14 @@ class SmartFireRepository(context: Context) {
                 yNormalized = y
             )
         )
+    }
+
+    suspend fun deleteMapObject(id: String) = withContext(Dispatchers.IO) {
+        dao.deleteMapObjectById(id)
+    }
+
+    suspend fun updateMapObjectPosition(id: String, x: Float, y: Float) = withContext(Dispatchers.IO) {
+        dao.updateMapObjectPosition(id, x.coerceIn(0.05f, 0.95f), y.coerceIn(0.05f, 0.95f))
     }
 
     fun getMapEdgesForFloor(floorId: String): Flow<List<MapEdgeItem>> {
@@ -1172,9 +1354,74 @@ class SmartFireRepository(context: Context) {
         )
     }
 
+    // --- HISTORICAL SNAPSHOTS FOR CHARTS ---
+    val allRecentSnapshots: Flow<List<SensorSnapshotPoint>> = combine(
+        dao.getAllRecentSnapshots(limit = 140),
+        _gasThresholdAdc
+    ) { list, threshold ->
+        list.reversed().map { snap ->
+            val estTemp = if (snap.alarm || snap.flame) {
+                (58f + (snap.gasRaw - 1600).coerceAtLeast(0) * 0.015f).coerceIn(55f, 96f)
+            } else {
+                (27.5f + ((snap.gasRaw - 700).coerceAtLeast(0) * 0.006f)).coerceIn(26f, 46f)
+            }
+            val telem = SmartFireTelemetry(
+                gasRaw = snap.gasRaw,
+                temperatureCelsius = estTemp,
+                tempRateOfRiseCPerMin = if (snap.alarm) 8.2f else 0.4f,
+                coPpm = if (snap.alarm) 145 else 14,
+                humidityPercent = if (snap.alarm) 28f else 61f,
+                irFlameIntensity = if (snap.flame) 0.90f else 0.03f,
+                flame = snap.flame,
+                alarm = snap.alarm,
+                state = snap.state,
+                receivedAt = snap.receivedAt
+            )
+            SensorSnapshotPoint(
+                deviceId = snap.deviceId,
+                timestamp = snap.receivedAt,
+                gasRaw = snap.gasRaw,
+                temperatureCelsius = estTemp,
+                fireProbabilityPercent = telem.calculateFireProbability(threshold).totalProbabilityPercent
+            )
+        }
+    }.flowOn(Dispatchers.IO)
+
+    fun getDeviceSnapshots(deviceId: String): Flow<List<SensorSnapshotPoint>> = combine(
+        dao.getRecentSnapshots(deviceId, limit = 60),
+        _gasThresholdAdc
+    ) { list, threshold ->
+        list.reversed().map { snap ->
+            val estTemp = if (snap.alarm || snap.flame) {
+                (58f + (snap.gasRaw - 1600).coerceAtLeast(0) * 0.015f).coerceIn(55f, 96f)
+            } else {
+                (27.5f + ((snap.gasRaw - 700).coerceAtLeast(0) * 0.006f)).coerceIn(26f, 46f)
+            }
+            val telem = SmartFireTelemetry(
+                gasRaw = snap.gasRaw,
+                temperatureCelsius = estTemp,
+                tempRateOfRiseCPerMin = if (snap.alarm) 8.2f else 0.4f,
+                coPpm = if (snap.alarm) 145 else 14,
+                humidityPercent = if (snap.alarm) 28f else 61f,
+                irFlameIntensity = if (snap.flame) 0.90f else 0.03f,
+                flame = snap.flame,
+                alarm = snap.alarm,
+                state = snap.state,
+                receivedAt = snap.receivedAt
+            )
+            SensorSnapshotPoint(
+                deviceId = snap.deviceId,
+                timestamp = snap.receivedAt,
+                gasRaw = snap.gasRaw,
+                temperatureCelsius = estTemp,
+                fireProbabilityPercent = telem.calculateFireProbability(threshold).totalProbabilityPercent
+            )
+        }
+    }.flowOn(Dispatchers.IO)
+
     // --- INSIGHTS ---
     val allInsights: Flow<List<AiInsight>> = combine(dao.getAllInsights(), _isDemoMode, _demoInsights) { dbInsights, isDemo, demoList ->
-        if (isDemo) {
+        if (isDemo && demoList.isNotEmpty()) {
             demoList
         } else {
             dbInsights.map {
@@ -1533,6 +1780,47 @@ class SmartFireRepository(context: Context) {
                     lastKnownAlarm = false,
                     xNormalized = 0.68f,
                     yNormalized = 0.35f
+                )
+            )
+
+            // Seed initial historical snapshots in Room DB so charts have real persisted points immediately
+            val seedGasSeries = listOf(840, 880, 910, 895, 935, 960, 945)
+            seedGasSeries.forEachIndexed { idx, gasVal ->
+                val ts = now - (seedGasSeries.size - idx) * 60_000L
+                dao.insertSnapshot(
+                    DeviceSnapshotEntity(
+                        deviceId = "smartfire-node-01",
+                        bootId = "boot-node-01",
+                        receivedAt = ts,
+                        uptimeMs = (idx + 1) * 60_000L,
+                        state = "NORMAL",
+                        gasRaw = gasVal,
+                        flame = false,
+                        gasReady = true,
+                        gasFault = false,
+                        alarm = false,
+                        muted = false,
+                        acknowledged = false,
+                        testing = false,
+                        hornRequested = false,
+                        hornEnabled = true,
+                        gasCommissioned = true
+                    )
+                )
+            }
+
+            // Seed initial AI Insights from LocalAnalyticsEngine
+            dao.insertInsight(
+                AnalysisInsightEntity(
+                    deviceId = "smartfire-node-01",
+                    title = "Đường cơ sở EWMA & Z-Score ổn định (An toàn)",
+                    explanation = "Chỉ số MQ-2 dao động quanh nền ~920 ADC (thấp hơn nhiều so với ngưỡng cảnh báo ${_gasThresholdAdc.value} ADC). Nhiệt độ phòng ổn định 28.6°C.",
+                    sourceMeasurements = "MQ-2: 920 ADC · Nhiệt: 28.6°C · CO: 12 ppm",
+                    analysisMethod = "Thống kê Z-Score & Kết hợp 5 thông số P(Cháy)",
+                    freshness = "Thời gian thực",
+                    severity = "INFO",
+                    recommendation = "Hệ thống hoạt động bình thường. Có thể thử nghiệm độ nhạy bằng thanh trượt 5 thông số hoặc nút Test Còi.",
+                    timestamp = now
                 )
             )
         }

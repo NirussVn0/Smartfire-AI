@@ -119,6 +119,9 @@ interface SmartFireDao {
     @Query("SELECT * FROM device_snapshots WHERE deviceId = :deviceId ORDER BY receivedAt DESC LIMIT :limit")
     fun getRecentSnapshots(deviceId: String, limit: Int = 100): Flow<List<DeviceSnapshotEntity>>
 
+    @Query("SELECT * FROM device_snapshots ORDER BY receivedAt DESC LIMIT :limit")
+    fun getAllRecentSnapshots(limit: Int = 140): Flow<List<DeviceSnapshotEntity>>
+
     @Query("SELECT * FROM device_snapshots WHERE deviceId = :deviceId AND receivedAt >= :sinceTimestamp ORDER BY receivedAt ASC")
     suspend fun getSnapshotsSince(deviceId: String, sinceTimestamp: Long): List<DeviceSnapshotEntity>
 
@@ -189,6 +192,12 @@ interface SmartFireDao {
     @Delete
     suspend fun deleteExtinguisher(extinguisher: ExtinguisherEntity)
 
+    @Query("DELETE FROM extinguishers WHERE id = :id")
+    suspend fun deleteExtinguisherById(id: String)
+
+    @Query("UPDATE extinguishers SET xNormalized = :x, yNormalized = :y WHERE id = :id")
+    suspend fun updateExtinguisherPosition(id: String, x: Float, y: Float)
+
     @Query("DELETE FROM extinguishers WHERE floorId = :floorId")
     suspend fun clearExtinguishersForFloor(floorId: String)
 
@@ -201,6 +210,12 @@ interface SmartFireDao {
 
     @Delete
     suspend fun deleteMapObject(mapObject: MapObjectEntity)
+
+    @Query("DELETE FROM map_objects WHERE id = :id")
+    suspend fun deleteMapObjectById(id: String)
+
+    @Query("UPDATE map_objects SET xNormalized = :x, yNormalized = :y WHERE id = :id")
+    suspend fun updateMapObjectPosition(id: String, x: Float, y: Float)
 
     @Query("DELETE FROM map_objects WHERE floorId = :floorId")
     suspend fun clearMapObjectsForFloor(floorId: String)

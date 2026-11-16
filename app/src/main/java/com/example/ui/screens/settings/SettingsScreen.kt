@@ -1,5 +1,10 @@
 package com.example.ui.screens.settings
 
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.widget.Toast
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -19,11 +24,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.DirectionsWalk
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Science
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.Warning
@@ -57,6 +64,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -546,49 +554,116 @@ fun LogsTabContent(
     events: List<DeviceEvent>,
     nodes: List<SmartFireNode>
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var filterKind by remember { mutableStateOf<String?>(null) }
     val filtered = if (filterKind == null) events else events.filter { it.kind.equals(filterKind, ignoreCase = true) }
 
+    fun buildCsvContent(items: List<DeviceEvent>): String {
+        val dateFormat = java.text.SimpleDateFormat("yyyy-MM-dd HH:mm:ss", java.util.Locale.US)
+        val sb = StringBuilder()
+        sb.appendLine("Seq,Time,DeviceId,DeviceName,Kind,State,Result,Payload")
+        items.forEach { ev ->
+            val nodeName = (nodes.find { it.deviceId == ev.deviceId }?.displayName ?: ev.deviceId).replace(",", " ")
+            val timeStr = dateFormat.format(java.util.Date(ev.receivedAt))
+            val safePayload = ev.rawPayload.replace("\"", "'").replace("\n", " ")
+            sb.appendLine("${ev.seq},\"$timeStr\",\"${ev.deviceId}\",\"$nodeName\",\"${ev.kind}\",\"${ev.state}\",\"${ev.result}\",\"$safePayload\"")
+        }
+        return sb.toString()
+    }
+
     LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         item {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                LazyRow(
-                    modifier = Modifier.weight(1f),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    val kinds = listOf("Tất cả", "state", "ack", "silence", "test")
-                    items(kinds) { k ->
-                        val isSelected = (k == "Tất cả" && filterKind == null) || (k == filterKind)
-                        FilterChip(
-                            selected = isSelected,
-                            onClick = { filterKind = if (k == "Tất cả") null else k },
-                            label = { Text(k, fontSize = 11.sp) },
-                            colors = FilterChipDefaults.filterChipColors(
-                                selectedContainerColor = PrimaryBlue,
-                                selectedLabelColor = Color.White,
-                                containerColor = LightCard,
-                                labelColor = TextSecondary
+                    LazyRow(
+                        modifier = Modifier.weight(1f),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        val kinds = listOf("Tất cả", "state", "ack", "silence", "test")
+                        items(kinds) { k ->
+                            val isSelected = (k == "Tất cả" && filterKind == null) || (k == filterKind)
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = { filterKind = if (k == "Tất cả") null else k },
+                                label = { Text(k, fontSize = 11.sp) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = PrimaryBlue,
+                                    selectedLabelColor = Color.White,
+                                    containerColor = LightCard,
+                                    labelColor = TextSecondary
+                                )
                             )
-                        )
+                        }
                     }
                 }
 
                 if (events.isNotEmpty()) {
-                    Spacer(modifier = Modifier.width(8.dp))
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch { repository.clearAllEvents() }
-                        },
-                        shape = RoundedCornerShape(8.dp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(Icons.Default.DeleteSweep, contentDescription = null, tint = CriticalAlarmRed, modifier = Modifier.size(16.dp))
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text("Xóa", color = CriticalAlarmRed, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        Button(
+                            onClick = {
+                                val csv = buildCsvContent(filtered)
+                                val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                    type = "text/csv"
+                                    putExtra(Intent.EXTRA_SUBJECT, "SmartFire AI - Nhật ký sự kiện báo cháy (${filtered.size} bản ghi)")
+                                    putExtra(Intent.EXTRA_TEXT, csv)
+                                }
+                                try {
+                                    context.startActivity(Intent.createChooser(sendIntent, "Xuất / Chia sẻ Nhật ký CSV"))
+                                } catch (_: Exception) {
+                                    Toast.makeText(context, "Không tìm thấy ứng dụng chia sẻ", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1.2f)
+                                .height(36.dp)
+                                .testTag("btn_export_logs_csv")
+                        ) {
+                            Icon(Icons.Default.Share, contentDescription = null, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text("Xuất CSV / Chia sẻ", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                val csv = buildCsvContent(filtered)
+                                val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                clipboard?.setPrimaryClip(ClipData.newPlainText("SmartFire Event Logs CSV", csv))
+                                Toast.makeText(context, "Đã sao chép ${filtered.size} dòng nhật ký CSV!", Toast.LENGTH_SHORT).show()
+                            },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(0.9f)
+                                .height(36.dp)
+                                .testTag("btn_copy_logs_csv")
+                        ) {
+                            Icon(Icons.Default.ContentCopy, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Sao chép", color = PrimaryBlue, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch { repository.clearAllEvents() }
+                            },
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .height(36.dp)
+                                .testTag("btn_clear_all_logs")
+                        ) {
+                            Icon(Icons.Default.DeleteSweep, contentDescription = null, tint = CriticalAlarmRed, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Xóa", color = CriticalAlarmRed, fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
             }

@@ -2,7 +2,12 @@ package com.example.ui.screens.map
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.location.Geocoder
 import android.os.Build
+import android.view.View
+import android.view.ViewGroup
+import android.webkit.JavascriptInterface
+import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -18,6 +23,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -36,10 +42,13 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Undo
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.AddLocationAlt
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.CropFree
+import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.DirectionsWalk
 import androidx.compose.material.icons.filled.DoorFront
 import androidx.compose.material.icons.filled.DoorSliding
@@ -47,15 +56,17 @@ import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.Explore
 import androidx.compose.material.icons.filled.FireExtinguisher
+import androidx.compose.material.icons.filled.GpsFixed
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.LocalFireDepartment
-import androidx.compose.material.icons.filled.Map
 import androidx.compose.material.icons.filled.MyLocation
 import androidx.compose.material.icons.filled.Navigation
+import androidx.compose.material.icons.filled.OpenWith
 import androidx.compose.material.icons.filled.Radar
-import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.Stairs
+import androidx.compose.material.icons.filled.TouchApp
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -66,6 +77,8 @@ import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -90,9 +103,11 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Fill
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
@@ -114,6 +129,8 @@ import com.example.domain.model.Point2D
 import com.example.domain.model.RoomSpace
 import com.example.domain.model.SmartFireNode
 import com.example.domain.model.UserPosition
+import com.example.domain.pathfinding.GeoLatLng
+import com.example.domain.pathfinding.GeoMapMath
 import com.example.domain.pathfinding.NavigationRoute
 import com.example.sensor.DeviceMovementTracker
 import com.example.ui.theme.CriticalAlarmBackground
@@ -139,7 +156,10 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 enum class EmergencyAutoPhase {
     IDLE,
@@ -148,19 +168,30 @@ enum class EmergencyAutoPhase {
 }
 
 enum class MapStage {
-    BLIND_ROOM_SIZING, // Bước 1: Khoanh vùng khu vực nhà trên Google Maps (Không tự chia phòng!)
-    SETUP_PLACEMENT,   // Bước 2: Setup Vị Trí Nhận Diện Lửa TRƯỚC làm mốc chuẩn (Anchor) + Đo khoảng cách bằng Tín hiệu RSSI & Cảm biến ĐT -> Sau đó setup Cửa Chính, Cửa đánh số (#1, #2...), Bình CC, Exit
-    READY_MAP          // Bước 3: Bản đồ hoàn chỉnh (2 chế độ hiển thị + Giả lập lửa lan theo bán kính tròn khi kêu lâu + Dẫn đường)
+    BLIND_ROOM_SIZING, // Bước 1: Khoanh vùng thực tế trên bản đồ (Đa giác bất kỳ / Kéo góc / Vẽ khung -> Cắt đúng hình dạng vừa khoanh!)
+    SETUP_PLACEMENT,   // Bước 2: Ghim Mốc Nhận Diện Lửa TRƯỚC làm chuẩn (0,0) + Đo khoảng cách RSSI & Cảm biến ĐT -> Ghim Cửa Chính, Cửa Đánh Số, Bình CC, Exit
+    READY_MAP          // Bước 3: Bản đồ hoàn chỉnh đúng hình dạng đã khoanh vùng + Lửa lan tròn theo thời gian + Dẫn đường
 }
 
 enum class MapVisualStyle {
-    TRANSLUCENT_GOOGLE_MAP, // Chế độ 1: Mờ mờ thấy bản đồ Google Maps bên dưới
-    CRISP_WHITE_HOUSE       // Chế độ 2: Trắng tinh để nhìn rõ nhà và vật dụng
+    TRANSLUCENT_GOOGLE_MAP, // Chế độ 1: Mờ mờ thấy bản đồ vệ tinh/đường phố bên dưới vùng khoanh
+    CRISP_WHITE_HOUSE       // Chế độ 2: Cắt trắng tinh vùng nhà đã khoanh, làm tối bên ngoài để nhìn rõ tuyệt đối
 }
 
 enum class SetupDrawerMode {
     ADD_FIRE_SENSOR, // Bước chuẩn hóa bắt buộc đầu tiên: Ghim Vị Trí Nhận Diện Lửa làm chuẩn + Đo khoảng cách Tín hiệu RSSI & Cảm biến ĐT
     ADD_OBJECT       // Bước tiếp theo: Ghim Cửa Chính, Cánh Cửa (đánh số #1, #2...), Bình chữa cháy, Cầu thang, Cửa Exit
+}
+
+enum class RegionDrawToolMode {
+    DRAW_POLYGON_POINTS, // Chạm trực tiếp trên Google Maps hoặc kéo đỉnh Đ1..Đn khớp mái nhà
+    PAN_ZOOM_MAP         // Chỉ kéo & phóng to Google Maps (dùng tâm chữ thập 🎯 như Grab để ghim chính xác)
+}
+
+enum class GoogleMapLayerType(val label: String, val lyrsCode: String) {
+    HYBRID("Vệ tinh + Đường", "y"),
+    SATELLITE("Vệ tinh", "s"),
+    ROADMAP("Đường phố", "m")
 }
 
 data class PlacedSensorPin(
@@ -176,6 +207,23 @@ data class PlacedSensorPin(
     val isReferenceAnchor: Boolean = false
 )
 
+enum class SelectedMapElementKind {
+    SENSOR,
+    MAIN_DOOR,
+    NUMBERED_DOOR,
+    EXTINGUISHER,
+    EXIT,
+    STAIRS
+}
+
+data class SelectedMapElement(
+    val kind: SelectedMapElementKind,
+    val index: Int,
+    val label: String,
+    val position: Point2D,
+    val deviceIdOrDbId: String? = null
+)
+
 @Composable
 fun IndoorMap2DScreen(
     floors: List<FloorPlan>,
@@ -185,6 +233,9 @@ fun IndoorMap2DScreen(
     mapObjects: List<MapNodeItem>,
     mapEdges: List<MapEdgeItem>,
     userLocation: UserPosition?,
+    gasThresholdAdc: Int = 1800,
+    stepStrideMeters: Float = 0.65f,
+    autoRouteOnAlarm: Boolean = true,
     initialInSetupMode: Boolean = false,
     navigationRequest: MapNavigationRequest? = null,
     onConsumeNavigationRequest: () -> Unit = {},
@@ -196,7 +247,12 @@ fun IndoorMap2DScreen(
         List<Point2D>, // exits
         List<Point2D>  // mainDoors (Cửa Chính)
     ) -> Unit,
+    onSaveBoundaryPolygon: (String, List<Point2D>, Float, Float) -> Unit = { _, _, _, _ -> },
     onBindSensorPosition: (String, Float, Float) -> Unit = { _, _, _ -> },
+    onDeleteExtinguisher: (String) -> Unit = {},
+    onUpdateExtinguisherPosition: (String, Float, Float) -> Unit = { _, _, _ -> },
+    onDeleteMapObject: (String) -> Unit = {},
+    onUpdateMapObjectPosition: (String, Float, Float) -> Unit = { _, _, _ -> },
     onUpdateFloorDimensions: (String, Float, Float) -> Unit = { _, _, _ -> },
     onClearAllMapConfig: (String) -> Unit = {},
     onSetUserPosition: (String, Float, Float) -> Unit,
@@ -238,14 +294,18 @@ fun IndoorMap2DScreen(
     val compassHeading by movementTracker.compassHeading.collectAsState()
     val isWalking by movementTracker.isWalking.collectAsState()
     val gpsLocation by movementTracker.lastGpsLocation.collectAsState()
+    val gpsAccuracyMeters by movementTracker.gpsAccuracyMeters.collectAsState()
+    val hasRealGpsFix by movementTracker.hasRealGpsFix.collectAsState()
     val gpsDeltaMeters by movementTracker.gpsDeltaMeters.collectAsState()
 
-    val hasSavedObjects = extinguishers.isNotEmpty() || mapObjects.isNotEmpty() || (currentFloor != null && currentFloor.widthMeters > 0f)
+    // Check if there is a saved boundary polygon in rooms
+    val savedBoundaryRoom = rooms.firstOrNull { it.type == "MAIN_BOUNDARY" && it.polygon.size >= 3 }
+    val hasSavedObjects = savedBoundaryRoom != null || extinguishers.isNotEmpty() || mapObjects.isNotEmpty() || (currentFloor != null && currentFloor.widthMeters > 0f)
 
     var mapStage by remember(initialInSetupMode) {
         mutableStateOf(
             when {
-                initialInSetupMode -> MapStage.SETUP_PLACEMENT
+                initialInSetupMode -> MapStage.BLIND_ROOM_SIZING
                 hasSavedObjects -> MapStage.READY_MAP
                 else -> MapStage.BLIND_ROOM_SIZING
             }
@@ -259,32 +319,125 @@ fun IndoorMap2DScreen(
         }
     }
 
-    // House physical dimensions in meters (calculated from Google Maps Khoanh Vùng polygon)
+    // House physical dimensions in meters (computed directly from real Google Maps GeoLatLng vertices!)
     var houseWidthMeters by remember(currentFloor?.widthMeters) {
-        mutableFloatStateOf(if ((currentFloor?.widthMeters ?: 0f) > 0f) currentFloor!!.widthMeters else 12f)
+        mutableFloatStateOf(if ((currentFloor?.widthMeters ?: 0f) > 0f) currentFloor!!.widthMeters else 14f)
     }
     var houseLengthMeters by remember(currentFloor?.lengthMeters) {
-        mutableFloatStateOf(if ((currentFloor?.lengthMeters ?: 0f) > 0f) currentFloor!!.lengthMeters else 16f)
+        mutableFloatStateOf(if ((currentFloor?.lengthMeters ?: 0f) > 0f) currentFloor!!.lengthMeters else 18f)
     }
 
-    // Interactive Google Maps Khoanh Vùng (Polygon points tapped by user on the map)
+    // Normalized polygon for 2D Stage 2/3 rendering & DB persistence
     val regionPolygonPoints = remember {
-        mutableStateListOf(
-            Point2D(0.18f, 0.16f),
-            Point2D(0.82f, 0.16f),
-            Point2D(0.82f, 0.84f),
-            Point2D(0.18f, 0.84f)
-        )
-    }
-    var useLiveGoogleMapWebView by remember { mutableStateOf(true) }
-    var gpsCalibratedNote by remember {
-        mutableStateOf("Chạm lên bản đồ Google Maps để khoanh vùng 4 góc nhà (Không tự ý chia phòng).")
+        mutableStateListOf<Point2D>().apply {
+            if (savedBoundaryRoom != null) {
+                addAll(savedBoundaryRoom.polygon)
+            }
+        }
     }
 
-    // Visual mode when Map is Ready (Mode 1: Translucent Map vs Mode 2: Crisp White)
+    // True Geo-Anchored Roof Corners (lat, lng) pinned directly onto Google Maps in Stage 1
+    val defaultCenterLatLng = GeoLatLng(
+        lat = gpsLocation?.latitude ?: 10.776889,
+        lng = gpsLocation?.longitude ?: 106.700806
+    )
+    var mapCenterLatLng by remember { mutableStateOf(defaultCenterLatLng) }
+    var googleMapLayer by remember { mutableStateOf(GoogleMapLayerType.HYBRID) }
+    var searchAddressQuery by remember { mutableStateOf("") }
+    var isSearchingAddress by remember { mutableStateOf(false) }
+    var addressSearchNotice by remember { mutableStateOf<String?>(null) }
+    var flyToTrigger by remember { mutableIntStateOf(0) }
+    var flyToTarget by remember { mutableStateOf(defaultCenterLatLng) }
+    var flyToZoom by remember { mutableFloatStateOf(20f) }
+
+    val geoPolygonPoints = remember {
+        mutableStateListOf<GeoLatLng>().apply {
+            if (savedBoundaryRoom != null && savedBoundaryRoom.polygon.size >= 3) {
+                addAll(
+                    GeoMapMath.normalizedPointsToGeoPolygon(
+                        normPoints = savedBoundaryRoom.polygon,
+                        center = defaultCenterLatLng,
+                        widthMeters = houseWidthMeters,
+                        lengthMeters = houseLengthMeters
+                    )
+                )
+            }
+        }
+    }
+
+    // Sync savedBoundaryRoom when DB finishes loading
+    LaunchedEffect(savedBoundaryRoom) {
+        if (regionPolygonPoints.isEmpty() && savedBoundaryRoom != null && !userManuallyClearedToBlindRoom) {
+            regionPolygonPoints.addAll(savedBoundaryRoom.polygon)
+            if (geoPolygonPoints.isEmpty()) {
+                geoPolygonPoints.addAll(
+                    GeoMapMath.normalizedPointsToGeoPolygon(
+                        normPoints = savedBoundaryRoom.polygon,
+                        center = mapCenterLatLng,
+                        widthMeters = houseWidthMeters,
+                        lengthMeters = houseLengthMeters
+                    )
+                )
+            }
+        }
+    }
+
+    var regionDrawToolMode by remember { mutableStateOf(RegionDrawToolMode.DRAW_POLYGON_POINTS) }
+
+    fun syncNormalizedFromGeoPolygon() {
+        if (geoPolygonPoints.size >= 3) {
+            val metrics = GeoMapMath.calculateGeoPolygonMetrics(geoPolygonPoints.toList())
+            houseWidthMeters = metrics.widthMeters
+            houseLengthMeters = metrics.lengthMeters
+            regionPolygonPoints.clear()
+            regionPolygonPoints.addAll(GeoMapMath.projectGeoPolygonToNormalized(geoPolygonPoints.toList()))
+        } else {
+            regionPolygonPoints.clear()
+        }
+    }
+
+    val geoMetrics = remember(geoPolygonPoints.toList()) {
+        if (geoPolygonPoints.size >= 2) {
+            GeoMapMath.calculateGeoPolygonMetrics(geoPolygonPoints.toList())
+        } else null
+    }
+
+    val calcWidthM = geoMetrics?.widthMeters ?: houseWidthMeters
+    val calcLengthM = geoMetrics?.lengthMeters ?: houseLengthMeters
+    val calcPolygonAreaM2 = geoMetrics?.areaM2 ?: 0f
+
+    // Normalized floorplan polygon aligned strictly North-Up from pinned Google Maps vertices
+    val activeFloorplanPolygon: List<Point2D> = remember(regionPolygonPoints.toList(), geoPolygonPoints.toList()) {
+        if (geoPolygonPoints.size >= 3) {
+            GeoMapMath.projectGeoPolygonToNormalized(geoPolygonPoints.toList())
+        } else if (regionPolygonPoints.size >= 3) {
+            val minX = regionPolygonPoints.minOf { it.x }
+            val maxX = regionPolygonPoints.maxOf { it.x }
+            val minY = regionPolygonPoints.minOf { it.y }
+            val maxY = regionPolygonPoints.maxOf { it.y }
+            val spanX = (maxX - minX).coerceAtLeast(0.08f)
+            val spanY = (maxY - minY).coerceAtLeast(0.08f)
+            val maxSpan = max(spanX, spanY)
+            val scaleFactor = 0.78f / maxSpan
+            val centerPolyX = (minX + maxX) / 2f
+            val centerPolyY = (minY + maxY) / 2f
+            regionPolygonPoints.map { pt ->
+                Point2D(
+                    x = (0.50f + (pt.x - centerPolyX) * scaleFactor).coerceIn(0.06f, 0.94f),
+                    y = (0.50f + (pt.y - centerPolyY) * scaleFactor).coerceIn(0.06f, 0.94f)
+                )
+            }
+        } else {
+            listOf(
+                Point2D(0.10f, 0.10f),
+                Point2D(0.90f, 0.10f),
+                Point2D(0.90f, 0.90f),
+                Point2D(0.10f, 0.90f)
+            )
+        }
+    }
+
     var visualStyle by remember { mutableStateOf(MapVisualStyle.TRANSLUCENT_GOOGLE_MAP) }
-
-    // Active sub-drawer in Stage 2 (Always starts with ADD_FIRE_SENSOR first as Reference Anchor!)
     var setupDrawer by remember { mutableStateOf(SetupDrawerMode.ADD_FIRE_SENSOR) }
     var selectedSavedNodeId by remember(nodes) {
         mutableStateOf(nodes.firstOrNull()?.deviceId ?: "smartfire-node-01")
@@ -338,10 +491,10 @@ fun IndoorMap2DScreen(
     }
 
     // Sync live alarm state, multi-parameter fire probability, RSSI & alarmStartedAtMs from nodes into placedSensorPins
-    LaunchedEffect(nodes, hasSavedObjects) {
+    LaunchedEffect(nodes, hasSavedObjects, gasThresholdAdc) {
         if (placedSensorPins.isEmpty() && hasSavedObjects) {
             nodes.forEachIndexed { idx, n ->
-                val prob = n.telemetry.calculateFireProbability().totalProbabilityPercent
+                val prob = n.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent
                 val isAlm = n.lastKnownAlarm || n.firmwareState == FirmwareState.ALARM || prob >= 75f
                 placedSensorPins.add(
                     PlacedSensorPin(
@@ -362,7 +515,7 @@ fun IndoorMap2DScreen(
             placedSensorPins.removeAll { pin -> nodes.none { it.deviceId == pin.deviceId } }
             nodes.forEachIndexed { idx, n ->
                 val existingIdx = placedSensorPins.indexOfFirst { it.deviceId == n.deviceId }
-                val prob = n.telemetry.calculateFireProbability().totalProbabilityPercent
+                val prob = n.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent
                 val isAlm = n.lastKnownAlarm || n.firmwareState == FirmwareState.ALARM || prob >= 75f
                 if (existingIdx >= 0) {
                     val prevStart = placedSensorPins[existingIdx].alarmStartedAtMs
@@ -391,7 +544,7 @@ fun IndoorMap2DScreen(
     var currentClockMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
     val hazardNodes = nodes.filter {
         it.lastKnownAlarm || it.firmwareState == FirmwareState.ALARM ||
-            it.telemetry.calculateFireProbability().totalProbabilityPercent >= 75f
+            it.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent >= 75f
     }
     val isFireActive = hazardNodes.isNotEmpty()
 
@@ -402,12 +555,11 @@ fun IndoorMap2DScreen(
         }
     }
 
-    // Dynamic User Standing Position (updated via steps/compass, RSSI+IMU fusion, or tap)
     var currentUserPos by remember {
-        mutableStateOf(userLocation?.position ?: Point2D(0.50f, 0.78f))
+        mutableStateOf(userLocation?.position ?: Point2D(0.50f, 0.72f))
     }
 
-    // Calculate Signal RSSI + Phone Sensor Fused Distance from the Reference Fire Sensor Anchor
+    // Tri-Sensor Indoor Fusion (Phone IMU Steps + Phone Compass/Gyro + ESP32 RSSI -> 0% GPS drift indoors)
     val anchorSensorPin = placedSensorPins.firstOrNull()
     val selectedNodeObj = nodes.find { it.deviceId == selectedSavedNodeId } ?: nodes.firstOrNull()
     val liveRssiDbm = selectedNodeObj?.telemetry?.rssiDbm ?: -52
@@ -418,19 +570,58 @@ fun IndoorMap2DScreen(
         val dyM = (currentUserPos.y - anchorSensorPin.position.y) * houseLengthMeters
         hypot(dxM.toDouble(), dyM.toDouble()).toFloat()
     } else {
-        (stepCount * 0.65f).coerceAtLeast(1.2f)
+        (stepCount * stepStrideMeters).coerceAtLeast(1.2f)
     }
 
-    // Kalman / Complementary Fusion between Signal RSSI Distance (45%) & Phone IMU/Step/GPS Sensor Distance (55%)
-    val fusedDistanceMeters = (0.45f * rssiDistanceMeters + 0.55f * imuPhoneDistanceMeters).coerceIn(0.3f, 40f)
-    val distanceDiscrepancy = abs(rssiDistanceMeters - imuPhoneDistanceMeters)
-    val fusedAccuracyPercent = (98.5f - (distanceDiscrepancy * 3.2f)).coerceIn(82.0f, 99.2f)
+    val triFusionSnapshot = remember(
+        currentUserPos,
+        compassHeading,
+        houseWidthMeters,
+        houseLengthMeters,
+        anchorSensorPin,
+        rssiDistanceMeters,
+        liveRssiDbm
+    ) {
+        DeviceMovementTracker.fuseIndoorPosition(
+            currentPos = currentUserPos,
+            stepsDelta = 0,
+            stepStrideMeters = stepStrideMeters,
+            compassHeadingDeg = compassHeading,
+            houseWidthMeters = houseWidthMeters,
+            houseLengthMeters = houseLengthMeters,
+            anchorPos = anchorSensorPin?.position,
+            rssiDistanceMeters = rssiDistanceMeters,
+            rssiDbm = liveRssiDbm,
+            activePath = null
+        )
+    }
 
-    // Active Navigation Route & Emergency Phase
+    val fusedDistanceMeters = triFusionSnapshot.fusedDistanceToAnchorMeters
+    val fusedAccuracyPercent = triFusionSnapshot.accuracyPercent
+    val fusedErrorMeters = triFusionSnapshot.estimatedErrorMeters
+
     var activeRoute by remember { mutableStateOf<NavigationRoute?>(null) }
     var emergencyPhase by remember { mutableStateOf(EmergencyAutoPhase.IDLE) }
+    var selectedMapElement by remember { mutableStateOf<SelectedMapElement?>(null) }
 
-    // Helper function to build door-aware route (passing through numbered doors or main door)
+    // Helper to check distance from a point to a line segment in meters
+    fun pointToSegmentDistanceMeters(pt: Point2D, a: Point2D, b: Point2D): Float {
+        val px = pt.x * houseWidthMeters
+        val py = pt.y * houseLengthMeters
+        val ax = a.x * houseWidthMeters
+        val ay = a.y * houseLengthMeters
+        val bx = b.x * houseWidthMeters
+        val by = b.y * houseLengthMeters
+        val dx = bx - ax
+        val dy = by - ay
+        val lenSq = dx * dx + dy * dy
+        if (lenSq < 0.0001f) return hypot((px - ax).toDouble(), (py - ay).toDouble()).toFloat()
+        val t = (((px - ax) * dx + (py - ay) * dy) / lenSq).coerceIn(0f, 1f)
+        val projX = ax + t * dx
+        val projY = ay + t * dy
+        return hypot((px - projX).toDouble(), (py - projY).toDouble()).toFloat()
+    }
+
     fun buildDoorAwareRoute(
         start: Point2D,
         target: Point2D,
@@ -441,9 +632,35 @@ fun IndoorMap2DScreen(
         val waypoints = mutableListOf<Point2D>()
         waypoints.add(start)
 
+        val alarmingPins = placedSensorPins.filter { it.isAlarm }
+        val activeHazardRadiusM = if (isFireActive) {
+            (1.2f + ((currentClockMs - (alarmingPins.minOfOrNull { it.alarmStartedAtMs.takeIf { t -> t > 0L } ?: currentClockMs } ?: currentClockMs)) / 1000L).coerceAtLeast(1L) * 0.18f)
+                .coerceAtMost(max(houseWidthMeters, houseLengthMeters) * 0.45f)
+        } else 0f
+
+        var avoidedHazard = false
         val allPassableDoors = tempDoors + tempMainDoors
+
+        // Check if direct line cuts through an active fire spread zone (when not intentionally attacking that exact fire point)
+        val blockingFirePin = if (targetType != "FIRE_SENSOR" && alarmingPins.isNotEmpty()) {
+            alarmingPins.firstOrNull { pin ->
+                val distToTarget = hypot(((pin.position.x - target.x) * houseWidthMeters).toDouble(), ((pin.position.y - target.y) * houseLengthMeters).toDouble()).toFloat()
+                distToTarget > 1.0f && pointToSegmentDistanceMeters(pin.position, start, target) < (activeHazardRadiusM + 0.6f)
+            }
+        } else null
+
         if (allPassableDoors.isNotEmpty()) {
-            val intermediateDoor = allPassableDoors.minByOrNull { door ->
+            // Prefer doors that stay clear of active fire hazard zones when routing to Extinguisher or Exit
+            val safeDoors = if (blockingFirePin != null) {
+                allPassableDoors.filter { door ->
+                    val dM = hypot(((door.x - blockingFirePin.position.x) * houseWidthMeters).toDouble(), ((door.y - blockingFirePin.position.y) * houseLengthMeters).toDouble()).toFloat()
+                    dM >= activeHazardRadiusM
+                }.ifEmpty { allPassableDoors }
+            } else {
+                allPassableDoors
+            }
+
+            val intermediateDoor = safeDoors.minByOrNull { door ->
                 hypot((door.x - start.x).toDouble(), (door.y - start.y).toDouble()) +
                     hypot((target.x - door.x).toDouble(), (target.y - door.y).toDouble())
             }
@@ -452,9 +669,28 @@ fun IndoorMap2DScreen(
                 val doorDist = hypot((intermediateDoor.x - start.x).toDouble(), (intermediateDoor.y - start.y).toDouble())
                 if (doorDist > 0.04 && directDist > 0.12) {
                     waypoints.add(intermediateDoor)
+                    if (blockingFirePin != null) avoidedHazard = true
                 }
             }
+        } else if (blockingFirePin != null) {
+            // Compute a safe perimeter detour waypoint around the circular fire spread zone
+            val midX = (start.x + target.x) / 2f
+            val midY = (start.y + target.y) / 2f
+            val vx = midX - blockingFirePin.position.x
+            val vy = midY - blockingFirePin.position.y
+            val norm = hypot(vx.toDouble(), vy.toDouble()).toFloat().coerceAtLeast(0.01f)
+            val safeRadiusNorm = ((activeHazardRadiusM + 1.2f) / min(houseWidthMeters, houseLengthMeters).coerceAtLeast(6f)).coerceIn(0.14f, 0.35f)
+            val detourCandidate = clampPointIntoPolygonBounds(
+                Point2D(
+                    x = blockingFirePin.position.x + (vx / norm) * safeRadiusNorm,
+                    y = blockingFirePin.position.y + (vy / norm) * safeRadiusNorm
+                ),
+                activeFloorplanPolygon
+            )
+            waypoints.add(detourCandidate)
+            avoidedHazard = true
         }
+
         waypoints.add(target)
 
         var totalMeters = 0f
@@ -469,81 +705,19 @@ fun IndoorMap2DScreen(
             totalDistanceMeters = totalMeters.coerceAtLeast(0.5f),
             targetName = targetLabel,
             targetType = targetType,
-            crossesHazardRoom = isFireActive,
+            crossesHazardRoom = isFireActive && !avoidedHazard,
             isEuclideanOnly = allPassableDoors.isEmpty(),
-            notes = notes
+            notes = if (avoidedHazard) "$notes · Đã né vùng lửa lan" else notes,
+            avoidsFireZone = avoidedHazard
         )
     }
 
-    // Advance user position by 1 step (either along active route or along compass heading)
-    fun advanceUserStep(steps: Int = 1) {
-        val currentRoute = activeRoute
-        val nextPos = if (currentRoute != null && currentRoute.pathPoints.size >= 2) {
-            movementTracker.advancePositionAlongPath(
-                currentUserPos,
-                currentRoute.pathPoints,
-                (0.70f / houseLengthMeters.coerceAtLeast(8f)) * steps
-            )
-        } else {
-            val rad = Math.toRadians((compassHeading - 90f).toDouble())
-            val stepNormX = (0.65f / houseWidthMeters.coerceAtLeast(5f)) * steps
-            val stepNormY = (0.65f / houseLengthMeters.coerceAtLeast(5f)) * steps
-            Point2D(
-                x = (currentUserPos.x + cos(rad).toFloat() * stepNormX).coerceIn(0.08f, 0.92f),
-                y = (currentUserPos.y + sin(rad).toFloat() * stepNormY).coerceIn(0.08f, 0.92f)
-            )
-        }
-        currentUserPos = nextPos
-        onSetUserPosition(floorId, nextPos.x, nextPos.y)
-
-        if (currentRoute != null && currentRoute.pathPoints.isNotEmpty()) {
-            val finalTarget = currentRoute.pathPoints.last()
-            activeRoute = buildDoorAwareRoute(
-                start = nextPos,
-                target = finalTarget,
-                targetLabel = currentRoute.targetName,
-                targetType = currentRoute.targetType,
-                notes = currentRoute.notes
-            )
-        }
-    }
-
-    var lastProcessedStep by remember { mutableIntStateOf(0) }
-    LaunchedEffect(stepCount) {
-        if (stepCount > lastProcessedStep) {
-            val deltaSteps = stepCount - lastProcessedStep
-            lastProcessedStep = stepCount
-            advanceUserStep(deltaSteps)
-        }
-    }
-
-    LaunchedEffect(gpsDeltaMeters) {
-        if (hypot(gpsDeltaMeters.x.toDouble(), gpsDeltaMeters.y.toDouble()) > 0.35) {
-            val normX = (0.50f + (gpsDeltaMeters.x / houseWidthMeters.coerceAtLeast(8f))).coerceIn(0.10f, 0.90f)
-            val normY = (0.78f - (gpsDeltaMeters.y / houseLengthMeters.coerceAtLeast(8f))).coerceIn(0.10f, 0.90f)
-            currentUserPos = Point2D(normX, normY)
-            onSetUserPosition(floorId, normX, normY)
-        }
-    }
-
-    var scale by remember { mutableFloatStateOf(1.0f) }
-    var panOffset by remember { mutableStateOf(Offset.Zero) }
-
-    val infiniteTransition = rememberInfiniteTransition(label = "map_pulse")
-    val pulseRadius by infiniteTransition.animateFloat(
-        initialValue = 16f,
-        targetValue = 42f,
-        animationSpec = infiniteRepeatable(animation = tween(900), repeatMode = RepeatMode.Restart),
-        label = "alarm_pulse"
-    )
-
-    // Route DIRECTLY to Fire Sensor (prioritizes specificDeviceId -> NEAREST alarming fire sensor -> nearest fire sensor)
-    fun routeToFireSensor(specificDeviceId: String? = null) {
-        val allCandidatePins = if (placedSensorPins.isNotEmpty()) {
+    fun getCandidateSensorPins(): List<PlacedSensorPin> {
+        return if (placedSensorPins.isNotEmpty()) {
             placedSensorPins.toList()
         } else {
             nodes.mapIndexed { idx, n ->
-                val prob = n.telemetry.calculateFireProbability().totalProbabilityPercent
+                val prob = n.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent
                 val isAlm = n.lastKnownAlarm || n.firmwareState == FirmwareState.ALARM || prob >= 75f
                 PlacedSensorPin(
                     deviceId = n.deviceId,
@@ -559,7 +733,10 @@ fun IndoorMap2DScreen(
                 )
             }
         }
+    }
 
+    fun routeToFireSensor(specificDeviceId: String? = null) {
+        val allCandidatePins = getCandidateSensorPins()
         val specificPin = specificDeviceId?.let { id -> allCandidatePins.find { it.deviceId == id } }
         val nearestAlarmingPin = allCandidatePins
             .filter { it.isAlarm }
@@ -571,7 +748,7 @@ fun IndoorMap2DScreen(
         }
 
         val chosenPin = specificPin ?: nearestAlarmingPin ?: nearestAnyPin
-        val firePos = chosenPin?.position ?: Point2D(0.35f, 0.32f)
+        val firePos = chosenPin?.position ?: Point2D(0.45f, 0.35f)
         val fireName = chosenPin?.displayName ?: "Vị trí Báo Cháy"
         val tempStr = chosenPin?.let { String.format(Locale.US, "%.1f°C · P=%.0f%%", it.temperatureCelsius, it.fireProbabilityPercent) } ?: ""
 
@@ -592,7 +769,7 @@ fun IndoorMap2DScreen(
     fun routeToExtinguisher() {
         val targetExt = tempExtinguishers.minByOrNull { ext ->
             hypot((ext.x - currentUserPos.x).toDouble(), (ext.y - currentUserPos.y).toDouble())
-        } ?: Point2D(0.25f, 0.68f)
+        } ?: Point2D(0.35f, 0.65f)
 
         emergencyPhase = EmergencyAutoPhase.FETCH_EXTINGUISHER_FIRST
         activeRoute = buildDoorAwareRoute(
@@ -604,11 +781,61 @@ fun IndoorMap2DScreen(
         )
     }
 
+    fun routeTwoStageExtinguisherToFire(specificDeviceId: String? = null) {
+        val targetExt = tempExtinguishers.minByOrNull { ext ->
+            hypot((ext.x - currentUserPos.x).toDouble(), (ext.y - currentUserPos.y).toDouble())
+        } ?: Point2D(0.35f, 0.65f)
+
+        val allCandidatePins = getCandidateSensorPins()
+        val specificPin = specificDeviceId?.let { id -> allCandidatePins.find { it.deviceId == id } }
+        val nearestAlarmingPin = allCandidatePins.filter { it.isAlarm }.minByOrNull { pin ->
+            hypot((pin.position.x - targetExt.x).toDouble(), (pin.position.y - targetExt.y).toDouble())
+        }
+        val chosenPin = specificPin ?: nearestAlarmingPin ?: allCandidatePins.firstOrNull()
+        val firePos = chosenPin?.position ?: Point2D(0.45f, 0.35f)
+        val fireName = chosenPin?.displayName ?: "Đám Cháy"
+
+        val stage1 = buildDoorAwareRoute(
+            start = currentUserPos,
+            target = targetExt,
+            targetLabel = "Chặng 1: Bình CC",
+            targetType = "EXTINGUISHER",
+            notes = "Lấy Bình CC"
+        )
+        val stage2 = buildDoorAwareRoute(
+            start = targetExt,
+            target = firePos,
+            targetLabel = "Chặng 2: $fireName",
+            targetType = "FIRE_SENSOR",
+            notes = "Tiến tới đám cháy"
+        )
+
+        val combinedPoints = mutableListOf<Point2D>()
+        combinedPoints.addAll(stage1.pathPoints)
+        if (stage2.pathPoints.size > 1) {
+            combinedPoints.addAll(stage2.pathPoints.drop(1))
+        }
+
+        emergencyPhase = EmergencyAutoPhase.FETCH_EXTINGUISHER_FIRST
+        activeRoute = NavigationRoute(
+            pathPoints = combinedPoints,
+            totalDistanceMeters = (stage1.totalDistanceMeters + stage2.totalDistanceMeters).coerceAtLeast(0.8f),
+            targetName = "2 Chặng: Bình CC ➔ $fireName",
+            targetType = "TWO_STAGE",
+            crossesHazardRoom = stage1.crossesHazardRoom,
+            isEuclideanOnly = stage1.isEuclideanOnly && stage2.isEuclideanOnly,
+            notes = "Chặng 1 (${String.format(Locale.US, "%.1fm", stage1.totalDistanceMeters)}): Lấy Bình CC · Chặng 2 (${String.format(Locale.US, "%.1fm", stage2.totalDistanceMeters)}): Dập lửa tại $fireName",
+            stage1Points = stage1.pathPoints,
+            stage2Points = stage2.pathPoints,
+            avoidsFireZone = stage1.avoidsFireZone
+        )
+    }
+
     fun routeToExitDoor() {
         val candidates = tempExits + tempMainDoors
         val targetExit = candidates.minByOrNull { ex ->
             hypot((ex.x - currentUserPos.x).toDouble(), (ex.y - currentUserPos.y).toDouble())
-        } ?: Point2D(0.50f, 0.90f)
+        } ?: Point2D(0.50f, 0.85f)
 
         emergencyPhase = EmergencyAutoPhase.IDLE
         activeRoute = buildDoorAwareRoute(
@@ -620,6 +847,92 @@ fun IndoorMap2DScreen(
         )
     }
 
+    fun advanceUserStep(steps: Int = 1) {
+        val currentRoute = activeRoute
+        val strideM = stepStrideMeters.coerceIn(0.45f, 0.95f)
+        val activeSubPath = if (currentRoute != null && currentRoute.pathPoints.size >= 2) {
+            if (currentRoute.targetType == "TWO_STAGE" && currentRoute.stage1Points.size >= 2) {
+                currentRoute.stage1Points
+            } else {
+                currentRoute.pathPoints
+            }
+        } else null
+
+        val fusionStepResult = DeviceMovementTracker.fuseIndoorPosition(
+            currentPos = currentUserPos,
+            stepsDelta = steps.coerceAtLeast(1),
+            stepStrideMeters = strideM,
+            compassHeadingDeg = compassHeading,
+            houseWidthMeters = houseWidthMeters,
+            houseLengthMeters = houseLengthMeters,
+            anchorPos = anchorSensorPin?.position,
+            rssiDistanceMeters = rssiDistanceMeters,
+            rssiDbm = liveRssiDbm,
+            activePath = activeSubPath
+        )
+
+        currentUserPos = clampPointIntoPolygonBounds(fusionStepResult.fusedPosition, activeFloorplanPolygon)
+        onSetUserPosition(floorId, currentUserPos.x, currentUserPos.y)
+
+        if (currentRoute != null && currentRoute.pathPoints.isNotEmpty()) {
+            // Check if in Stage 1 of 2-stage routing and user reached the extinguisher (within 1.2m)
+            if (currentRoute.targetType == "TWO_STAGE" && currentRoute.stage1Points.isNotEmpty()) {
+                val extTarget = currentRoute.stage1Points.last()
+                val distToExtMeters = hypot(
+                    ((currentUserPos.x - extTarget.x) * houseWidthMeters).toDouble(),
+                    ((currentUserPos.y - extTarget.y) * houseLengthMeters).toDouble()
+                ).toFloat()
+                if (distToExtMeters <= 1.2f) {
+                    // Automatically transition from Stage 1 (Extinguisher) to Stage 2 (Attack Fire Source)!
+                    routeToFireSensor(null)
+                } else {
+                    routeTwoStageExtinguisherToFire(null)
+                }
+            } else {
+                val finalTarget = currentRoute.pathPoints.last()
+                activeRoute = buildDoorAwareRoute(
+                    start = currentUserPos,
+                    target = finalTarget,
+                    targetLabel = currentRoute.targetName,
+                    targetType = currentRoute.targetType,
+                    notes = currentRoute.notes
+                )
+            }
+        }
+    }
+
+    var lastProcessedStep by remember { mutableIntStateOf(0) }
+    LaunchedEffect(stepCount) {
+        if (stepCount > lastProcessedStep) {
+            val deltaSteps = stepCount - lastProcessedStep
+            lastProcessedStep = stepCount
+            advanceUserStep(deltaSteps)
+        }
+    }
+
+    // Strict Indoor GPS Isolation: GPS is only used before indoor sensors take over AND only if accuracy <= 4.5m outdoor fix.
+    // Once indoors (anchor pinned, steps > 0, or accuracy > 4.5m), GPS drift carries 0% weight so position relies cleanly on IMU + Compass + ESP32 RSSI.
+    LaunchedEffect(gpsDeltaMeters, gpsAccuracyMeters, hasRealGpsFix) {
+        val isIndoorFusionActive = anchorSensorPin != null || stepCount > 0 || !hasRealGpsFix || gpsAccuracyMeters > 4.5f
+        if (!isIndoorFusionActive && hypot(gpsDeltaMeters.x.toDouble(), gpsDeltaMeters.y.toDouble()) > 0.65) {
+            val normX = (0.50f + (gpsDeltaMeters.x / houseWidthMeters.coerceAtLeast(8f))).coerceIn(0.10f, 0.90f)
+            val normY = (0.72f - (gpsDeltaMeters.y / houseLengthMeters.coerceAtLeast(8f))).coerceIn(0.10f, 0.90f)
+            currentUserPos = clampPointIntoPolygonBounds(Point2D(normX, normY), activeFloorplanPolygon)
+            onSetUserPosition(floorId, currentUserPos.x, currentUserPos.y)
+        }
+    }
+
+    var scale by remember { mutableFloatStateOf(1.0f) }
+    var panOffset by remember { mutableStateOf(Offset.Zero) }
+
+    val infiniteTransition = rememberInfiniteTransition(label = "map_pulse")
+    val pulseRadius by infiniteTransition.animateFloat(
+        initialValue = 16f,
+        targetValue = 42f,
+        animationSpec = infiniteRepeatable(animation = tween(900), repeatMode = RepeatMode.Restart),
+        label = "alarm_pulse"
+    )
+
     LaunchedEffect(navigationRequest) {
         if (navigationRequest != null) {
             userManuallyClearedToBlindRoom = false
@@ -629,24 +942,31 @@ fun IndoorMap2DScreen(
                 MapNavigationTargetType.SPECIFIC_FIRE_SENSOR -> routeToFireSensor(navigationRequest.targetDeviceId)
                 MapNavigationTargetType.NEAREST_EXTINGUISHER -> routeToExtinguisher()
                 MapNavigationTargetType.NEAREST_EXIT -> routeToExitDoor()
+                MapNavigationTargetType.TWO_STAGE_EXTINGUISHER_TO_FIRE -> routeTwoStageExtinguisherToFire(navigationRequest.targetDeviceId)
             }
             onConsumeNavigationRequest()
         }
     }
 
-    LaunchedEffect(isFireActive, hazardNodes.size) {
-        if (isFireActive) {
-            if (mapStage != MapStage.SETUP_PLACEMENT) {
+    LaunchedEffect(isFireActive, hazardNodes.size, autoRouteOnAlarm) {
+        if (isFireActive && autoRouteOnAlarm) {
+            if (mapStage != MapStage.SETUP_PLACEMENT && mapStage != MapStage.BLIND_ROOM_SIZING) {
                 mapStage = MapStage.READY_MAP
             }
-            if (activeRoute == null || activeRoute?.targetType != "EXTINGUISHER") {
-                routeToFireSensor(null)
+            if (activeRoute == null) {
+                if (tempExtinguishers.isNotEmpty()) {
+                    routeTwoStageExtinguisherToFire(null)
+                } else {
+                    routeToFireSensor(null)
+                }
             }
         }
     }
 
     fun clearAllConfigurationToBlindRoom() {
         userManuallyClearedToBlindRoom = true
+        geoPolygonPoints.clear()
+        regionPolygonPoints.clear()
         placedSensorPins.clear()
         tempMainDoors.clear()
         tempDoors.clear()
@@ -660,7 +980,6 @@ fun IndoorMap2DScreen(
         mapStage = MapStage.BLIND_ROOM_SIZING
     }
 
-    // Calculate max fire spread radius & area across all alarming pins
     val maxFireSpreadSeconds = if (isFireActive) {
         val earliestStart = placedSensorPins.filter { it.isAlarm && it.alarmStartedAtMs > 0L }
             .minOfOrNull { it.alarmStartedAtMs }
@@ -669,7 +988,6 @@ fun IndoorMap2DScreen(
         ((currentClockMs - earliestStart) / 1000L).coerceAtLeast(1L)
     } else 0L
 
-    // Radius grows: starts at 1.0m, expands +0.18m per second of continuous alarm
     val currentFireSpreadRadiusMeters = if (isFireActive) {
         (1.0f + maxFireSpreadSeconds * 0.18f).coerceAtMost(max(houseWidthMeters, houseLengthMeters) * 0.75f)
     } else 0f
@@ -741,17 +1059,17 @@ fun IndoorMap2DScreen(
                         Column {
                             Text(
                                 text = when {
-                                    mapStage == MapStage.BLIND_ROOM_SIZING -> "BƯỚC 1: KHOANH VÙNG NHÀ TRÊN GOOGLE MAPS"
+                                    mapStage == MapStage.BLIND_ROOM_SIZING -> "BƯỚC 1: CĂN GOOGLE MAPS TỪ TRÊN CAO & GHIM GÓC NHÀ"
                                     mapStage == MapStage.SETUP_PLACEMENT -> {
                                         if (placedSensorPins.isEmpty()) {
-                                            "BƯỚC 2A: GHIM VỊ TRÍ NHẬN DIỆN LỬA LÀM MỐC CHUẨN TRƯỚC"
+                                            "BƯỚC 2A: GHIM MỐC NHẬN DIỆN LỬA (#1) TRƯỚC"
                                         } else {
-                                            "BƯỚC 2B: GHIM CỬA CHÍNH, CỬA ĐÁNH SỐ & BÌNH CỨU HỎA"
+                                            "BƯỚC 2B: GHIM CỬA CHÍNH, CỬA ĐÁNH SỐ & BÌNH CC"
                                         }
                                     }
                                     activeRoute != null -> "ĐANG DẪN TỚI: ${activeRoute!!.targetName.uppercase()}"
                                     isFireActive -> "CẢNH BÁO LỬA ĐANG LAN RỘNG THEO THỜI GIAN!"
-                                    else -> "BẢN ĐỒ 2D · STEM CỦA SOV LABS."
+                                    else -> "BẢN ĐỒ 2D (${activeFloorplanPolygon.size} GÓC CHUẨN BẮC-NAM)"
                                 },
                                 color = when {
                                     isFireActive -> CriticalAlarmRed
@@ -763,33 +1081,46 @@ fun IndoorMap2DScreen(
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
-                            val stepsRemaining = ((activeRoute?.totalDistanceMeters ?: 0f) / 0.65f).roundToInt()
+                            val stepsRemaining = ((activeRoute?.totalDistanceMeters ?: 0f) / stepStrideMeters.coerceAtLeast(0.45f)).roundToInt()
                             Text(
                                 text = when {
                                     isFireActive -> String.format(
                                         Locale.US,
-                                        "🔥 Bán kính lửa lan: R=%.2fm (Diện tích: %.1fm²) · Đã cháy %ds · Cách đích: %.1fm",
+                                        "🔥 Bán kính lửa lan: R=%.2fm (S=%.1fm²) · %ds · Acc %.1f%%",
                                         currentFireSpreadRadiusMeters,
                                         currentFireSpreadAreaM2,
                                         maxFireSpreadSeconds,
-                                        activeRoute?.totalDistanceMeters ?: 0f
+                                        fusedAccuracyPercent
                                     )
                                     activeRoute != null -> String.format(
                                         Locale.US,
-                                        "Khoảng cách: %.1f m (~%d bước) · Tín hiệu+ĐT Acc: %.1f%% · Góc: %d°",
+                                        "K/c: %.1fm (~%d bước) · Acc %.1f%% (±%.2fm · GPS 0%%) · %d°",
                                         activeRoute!!.totalDistanceMeters,
                                         stepsRemaining,
                                         fusedAccuracyPercent,
+                                        fusedErrorMeters,
                                         compassHeading.roundToInt()
                                     )
-                                    mapStage == MapStage.BLIND_ROOM_SIZING -> "Chạm khoanh vùng 4 góc khu vực trên Google Maps (Không tự chia phòng)"
+                                    mapStage == MapStage.BLIND_ROOM_SIZING -> {
+                                        if (geoPolygonPoints.size < 3) {
+                                            "Đã ghim ${geoPolygonPoints.size} góc · Kéo bản đồ vệ tinh tới nóc nhà & ghim ít nhất 3 góc!"
+                                        } else {
+                                            String.format(
+                                                Locale.US,
+                                                "Đã neo %d góc thật · Rộng %.1fm × Dài %.1fm · Diện tích: %.1f m²",
+                                                geoPolygonPoints.size,
+                                                calcWidthM,
+                                                calcLengthM,
+                                                calcPolygonAreaM2
+                                            )
+                                        }
+                                    }
                                     else -> String.format(
                                         Locale.US,
-                                        "Khung: %.0fm×%.0fm · K/c chuẩn (RSSI+ĐT): %.2fm (Acc %.1f%%)",
-                                        houseWidthMeters,
-                                        houseLengthMeters,
+                                        "IMU+La bàn+RSSI: %.2fm (Acc %.1f%% · ±%.2fm) · GPS: 0%% nhiễu",
                                         fusedDistanceMeters,
-                                        fusedAccuracyPercent
+                                        fusedAccuracyPercent,
+                                        fusedErrorMeters
                                     )
                                 },
                                 color = if (isFireActive) CriticalAlarmRed else TextSecondary,
@@ -799,7 +1130,26 @@ fun IndoorMap2DScreen(
                         }
                     }
 
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                        if (mapStage != MapStage.BLIND_ROOM_SIZING) {
+                            // Button to re-edit Khoanh Vùng Polygon directly
+                            IconButton(
+                                onClick = { mapStage = MapStage.BLIND_ROOM_SIZING },
+                                modifier = Modifier
+                                    .size(34.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(PrimaryBlueLight)
+                                    .testTag("btn_re_khoanh_vung")
+                            ) {
+                                Icon(
+                                    Icons.Default.CropFree,
+                                    contentDescription = "Khoanh vùng lại hình dạng nhà",
+                                    tint = PrimaryBlue,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                        }
+
                         if (mapStage == MapStage.READY_MAP) {
                             IconButton(
                                 onClick = { mapStage = MapStage.SETUP_PLACEMENT },
@@ -811,7 +1161,7 @@ fun IndoorMap2DScreen(
                             ) {
                                 Icon(
                                     Icons.Default.Edit,
-                                    contentDescription = "Chỉnh sửa bản đồ",
+                                    contentDescription = "Chỉnh sửa vật dụng bản đồ",
                                     tint = PrimaryBlue,
                                     modifier = Modifier.size(18.dp)
                                 )
@@ -842,7 +1192,8 @@ fun IndoorMap2DScreen(
         Spacer(modifier = Modifier.height(8.dp))
 
         // =========================================================================
-        // STAGE 1: GOOGLE MAPS AREA POLYGON / REGION SELECTOR (KHOANH VÙNG BẢN ĐỒ THẬT)
+        // STAGE 1: GOOGLE MAPS TOP-DOWN ALIGNMENT + GRAB-STYLE CROSSHAIR CORNER PINNING
+        // Căn chỉnh trực tiếp trên Google Maps Vệ tinh từ trên cao xuống, khóa tọa độ GPS từng góc mái nhà!
         // =========================================================================
         if (mapStage == MapStage.BLIND_ROOM_SIZING) {
             Card(
@@ -857,282 +1208,469 @@ fun IndoorMap2DScreen(
                 Column(
                     modifier = Modifier
                         .fillMaxSize()
-                        .padding(14.dp),
+                        .padding(10.dp),
                     verticalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Column(modifier = Modifier.weight(1f)) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(Icons.Default.CropFree, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(20.dp))
-                                Spacer(modifier = Modifier.width(6.dp))
+                    // 1. Address / Coordinates Search Bar + Fly-to-GPS Button (Grab / Maps style)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        OutlinedTextField(
+                            value = searchAddressQuery,
+                            onValueChange = {
+                                searchAddressQuery = it
+                                addressSearchNotice = null
+                            },
+                            placeholder = {
                                 Text(
-                                    text = "Khoanh Vùng Khu Vực Trên Google Maps",
-                                    color = TextPrimary,
-                                    fontSize = 14.sp,
-                                    fontWeight = FontWeight.Bold
+                                    "Tìm địa chỉ, tên đường hoặc lat, lng...",
+                                    fontSize = 11.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
                                 )
-                            }
-
-                            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                                FilterChip(
-                                    selected = useLiveGoogleMapWebView,
-                                    onClick = { useLiveGoogleMapWebView = !useLiveGoogleMapWebView },
-                                    label = {
-                                        Text(
-                                            if (useLiveGoogleMapWebView) "Bản Đồ Thật: BẬT" else "Chế Độ Vệ Tinh",
-                                            fontSize = 10.sp,
-                                            fontWeight = FontWeight.Bold
-                                        )
+                            },
+                            singleLine = true,
+                            textStyle = androidx.compose.ui.text.TextStyle(fontSize = 12.sp, color = TextPrimary),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(46.dp)
+                                .testTag("input_map_address_search"),
+                            shape = RoundedCornerShape(10.dp),
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedBorderColor = PrimaryBlue,
+                                unfocusedBorderColor = LightBorder,
+                                focusedContainerColor = Color.White,
+                                unfocusedContainerColor = LightSurfaceVariant.copy(alpha = 0.45f)
+                            ),
+                            trailingIcon = {
+                                IconButton(
+                                    onClick = {
+                                        val q = searchAddressQuery.trim()
+                                        if (q.isNotEmpty() && !isSearchingAddress) {
+                                            isSearchingAddress = true
+                                            addressSearchNotice = null
+                                            scope.launch {
+                                                val parsedCoord = GeoMapMath.parseCoordinatesOrNull(q)
+                                                val foundGeo = parsedCoord ?: withContext(Dispatchers.IO) {
+                                                    try {
+                                                        @Suppress("DEPRECATION")
+                                                        val list = Geocoder(context, Locale("vi", "VN")).getFromLocationName(q, 1)
+                                                        list?.firstOrNull()?.let { addr ->
+                                                            GeoLatLng(addr.latitude, addr.longitude)
+                                                        }
+                                                    } catch (_: Exception) {
+                                                        null
+                                                    }
+                                                }
+                                                isSearchingAddress = false
+                                                if (foundGeo != null) {
+                                                    mapCenterLatLng = foundGeo
+                                                    flyToTarget = foundGeo
+                                                    flyToZoom = 20f
+                                                    flyToTrigger += 1
+                                                    addressSearchNotice = String.format(
+                                                        Locale.US,
+                                                        "Đã tới: %.5f, %.5f",
+                                                        foundGeo.lat,
+                                                        foundGeo.lng
+                                                    )
+                                                } else {
+                                                    addressSearchNotice = "Không tìm thấy địa chỉ. Thử nhập rõ hơn hoặc tọa độ lat, lng."
+                                                }
+                                            }
+                                        }
                                     },
-                                    colors = FilterChipDefaults.filterChipColors(
-                                        selectedContainerColor = PrimaryBlueLight,
-                                        selectedLabelColor = PrimaryBlue
-                                    ),
-                                    modifier = Modifier.height(28.dp)
-                                )
+                                    modifier = Modifier.testTag("btn_search_map_address")
+                                ) {
+                                    Icon(
+                                        Icons.Default.Search,
+                                        contentDescription = "Tìm địa điểm trên Google Maps",
+                                        tint = PrimaryBlue,
+                                        modifier = Modifier.size(18.dp)
+                                    )
+                                }
                             }
-                        }
-
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = "Chạm 4 điểm trên bản đồ Google Maps bên dưới để khoanh vùng ranh giới tòa nhà. Mặt bằng mới vào sẽ để trống hoàn toàn (KHÔNG tự ý chia phòng).",
-                            color = TextSecondary,
-                            fontSize = 11.sp
                         )
 
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        // Interactive Google Maps + Polygon Region Drawing Overlay
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f)
-                                .clip(RoundedCornerShape(14.dp))
-                                .background(Color(0xFFE2E8F0))
-                                .border(1.5.dp, PrimaryBlue, RoundedCornerShape(14.dp))
-                        ) {
-                            val currentLat = gpsLocation?.latitude ?: 10.7769
-                            val currentLng = gpsLocation?.longitude ?: 106.7009
-
-                            // Layer 1: Embedded Google Maps / Leaflet Satellite + Street Map View
-                            if (useLiveGoogleMapWebView) {
-                                GoogleMapsTileWebView(
-                                    latitude = currentLat,
-                                    longitude = currentLng,
-                                    modifier = Modifier.fillMaxSize()
-                                )
-                            }
-
-                            // Layer 2: Interactive Polygon Region Selector Canvas ("Khoanh vùng khu vực")
-                            Canvas(
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .pointerInput(Unit) {
-                                        detectTapGestures { tap ->
-                                            val nx = (tap.x / size.width).coerceIn(0.06f, 0.94f)
-                                            val ny = (tap.y / size.height).coerceIn(0.06f, 0.94f)
-                                            if (regionPolygonPoints.size >= 4) {
-                                                // Replace nearest corner or start new 4-corner polygon
-                                                val nearestIdx = regionPolygonPoints.indices.minByOrNull { idx ->
-                                                    val p = regionPolygonPoints[idx]
-                                                    hypot((p.x - nx).toDouble(), (p.y - ny).toDouble())
-                                                } ?: 0
-                                                regionPolygonPoints[nearestIdx] = Point2D(nx, ny)
-                                            } else {
-                                                regionPolygonPoints.add(Point2D(nx, ny))
-                                            }
-
-                                            // Automatically calculate width & length in meters from polygon bounding box
-                                            if (regionPolygonPoints.size >= 2) {
-                                                val minX = regionPolygonPoints.minOf { it.x }
-                                                val maxX = regionPolygonPoints.maxOf { it.x }
-                                                val minY = regionPolygonPoints.minOf { it.y }
-                                                val maxY = regionPolygonPoints.maxOf { it.y }
-                                                // Full viewport corresponds to ~25m x 32m real-world parcel around GPS
-                                                val calcW = ((maxX - minX) * 24f).coerceIn(6f, 45f)
-                                                val calcL = ((maxY - minY) * 30f).coerceIn(8f, 60f)
-                                                houseWidthMeters = (calcW * 10f).roundToInt() / 10f
-                                                houseLengthMeters = (calcL * 10f).roundToInt() / 10f
-                                                onUpdateFloorDimensions(floorId, houseWidthMeters, houseLengthMeters)
-                                                gpsCalibratedNote = String.format(
-                                                    Locale.US,
-                                                    "Đã khoanh vùng %d góc trên Google Maps ➔ Rộng %.1fm × Dài %.1fm (%.0f m²)",
-                                                    regionPolygonPoints.size,
-                                                    houseWidthMeters,
-                                                    houseLengthMeters,
-                                                    houseWidthMeters * houseLengthMeters
-                                                )
-                                            }
-                                        }
-                                    }
-                            ) {
-                                if (!useLiveGoogleMapWebView) {
-                                    drawGoogleMapsUnderlay(
-                                        alphaMultiplier = 0.92f,
-                                        houseWidthMeters = houseWidthMeters,
-                                        houseLengthMeters = houseLengthMeters,
-                                        gpsLat = currentLat,
-                                        gpsLng = currentLng
-                                    )
-                                }
-
-                                // Draw Polygon Region ("Vùng Khoanh Khu Vực Nhà")
-                                if (regionPolygonPoints.isNotEmpty()) {
-                                    val polyPath = Path()
-                                    val firstPt = Offset(
-                                        regionPolygonPoints.first().x * size.width,
-                                        regionPolygonPoints.first().y * size.height
-                                    )
-                                    polyPath.moveTo(firstPt.x, firstPt.y)
-                                    for (i in 1 until regionPolygonPoints.size) {
-                                        val pt = Offset(
-                                            regionPolygonPoints[i].x * size.width,
-                                            regionPolygonPoints[i].y * size.height
-                                        )
-                                        polyPath.lineTo(pt.x, pt.y)
-                                    }
-                                    if (regionPolygonPoints.size >= 3) {
-                                        polyPath.close()
-                                        drawPath(
-                                            path = polyPath,
-                                            color = Color(0xFF2563EB).copy(alpha = 0.24f),
-                                            style = Fill
-                                        )
-                                    }
-                                    drawPath(
-                                        path = polyPath,
-                                        color = Color(0xFF2563EB),
-                                        style = Stroke(
-                                            width = 5f,
-                                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(18f, 10f), 0f)
-                                        )
-                                    )
-
-                                    // Draw numbered corner handles (Góc 1, Góc 2, Góc 3, Góc 4)
-                                    regionPolygonPoints.forEachIndexed { idx, pt ->
-                                        val c = Offset(pt.x * size.width, pt.y * size.height)
-                                        drawCircle(color = Color.White, radius = 18f, center = c)
-                                        drawCircle(color = PrimaryBlue, radius = 14f, center = c)
-                                        val numPaint = android.graphics.Paint().apply {
-                                            color = android.graphics.Color.WHITE
-                                            textSize = 18f
-                                            isFakeBoldText = true
-                                            textAlign = android.graphics.Paint.Align.CENTER
-                                            isAntiAlias = true
-                                        }
-                                        drawContext.canvas.nativeCanvas.drawText(
-                                            "G${idx + 1}",
-                                            c.x,
-                                            c.y + 6f,
-                                            numPaint
-                                        )
-                                    }
-
-                                    // Center measurement stamp inside khoanh vùng polygon
-                                    val avgX = regionPolygonPoints.map { it.x }.average().toFloat() * size.width
-                                    val avgY = regionPolygonPoints.map { it.y }.average().toFloat() * size.height
-                                    drawLabelPill(
-                                        center = Offset(avgX, avgY),
-                                        text = String.format(
-                                            Locale.US,
-                                            "VÙNG KHOANH: %.1fm × %.1fm (%.0fm²)",
-                                            houseWidthMeters,
-                                            houseLengthMeters,
-                                            houseWidthMeters * houseLengthMeters
-                                        ),
-                                        bgColor = Color(0xFF0F172A)
-                                    )
-                                }
-                            }
-
-                            // Top-left Reset Polygon Button
-                            Row(
-                                modifier = Modifier
-                                    .align(Alignment.TopStart)
-                                    .padding(8.dp)
-                                    .clip(RoundedCornerShape(8.dp))
-                                    .background(Color.White.copy(alpha = 0.92f))
-                                    .border(1.dp, LightBorder, RoundedCornerShape(8.dp))
-                                    .clickable {
-                                        regionPolygonPoints.clear()
-                                        gpsCalibratedNote = "Đã xóa khung khoanh vùng. Hãy chạm 4 góc mới trên bản đồ Google Maps."
-                                    }
-                                    .padding(horizontal = 8.dp, vertical = 5.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Icon(Icons.Default.Refresh, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(14.dp))
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text("Khoanh Lại 4 Góc", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = PrimaryBlue)
-                            }
-                        }
-
-                        Spacer(modifier = Modifier.height(8.dp))
-
-                        // GPS Auto-Boundary Button
-                        Button(
+                        IconButton(
                             onClick = {
-                                userManuallyClearedToBlindRoom = false
-                                movementTracker.forceRecognizeMapLocation()
-                                val lat = gpsLocation?.latitude ?: 10.7769
-                                val lng = gpsLocation?.longitude ?: 106.7009
-                                regionPolygonPoints.clear()
-                                regionPolygonPoints.addAll(
-                                    listOf(
-                                        Point2D(0.16f, 0.14f),
-                                        Point2D(0.84f, 0.14f),
-                                        Point2D(0.84f, 0.86f),
-                                        Point2D(0.16f, 0.86f)
-                                    )
+                                movementTracker.refreshGpsLocationNow()
+                                val gpsLatLng = GeoLatLng(
+                                    gpsLocation?.latitude ?: 10.776889,
+                                    gpsLocation?.longitude ?: 106.700806
                                 )
-                                houseWidthMeters = 12f
-                                houseLengthMeters = 16f
-                                onUpdateFloorDimensions(floorId, houseWidthMeters, houseLengthMeters)
-                                gpsCalibratedNote = String.format(
-                                    Locale.US,
-                                    "Đã khoanh vùng GPS (%.5f, %.5f) ➔ Mặt bằng trống 12m × 16m",
-                                    lat,
-                                    lng
-                                )
-                                // Transition to Step 2 where user sets up Fire Sensor Reference Anchor first!
-                                mapStage = MapStage.SETUP_PLACEMENT
-                                setupDrawer = SetupDrawerMode.ADD_FIRE_SENSOR
+                                mapCenterLatLng = gpsLatLng
+                                flyToTarget = gpsLatLng
+                                flyToZoom = 20f
+                                flyToTrigger += 1
+                                addressSearchNotice = "Đã đưa tâm bản đồ về GPS hiện tại"
                             },
                             modifier = Modifier
-                                .fillMaxWidth()
-                                .height(42.dp)
-                                .testTag("btn_gps_quick_size"),
-                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
-                            shape = RoundedCornerShape(10.dp)
+                                .size(46.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(PrimaryBlueLight)
+                                .border(1.dp, PrimaryBlue.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+                                .testTag("btn_recenter_gps")
                         ) {
-                            Icon(Icons.Default.MyLocation, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                "Khoanh Vùng Nhanh Theo Tọa Độ Google Maps GPS Hiện Tại",
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.Bold
+                            Icon(
+                                Icons.Default.GpsFixed,
+                                contentDescription = "Về vị trí GPS hiện tại",
+                                tint = PrimaryBlue,
+                                modifier = Modifier.size(20.dp)
+                            )
+                        }
+                    }
+
+                    if (addressSearchNotice != null) {
+                        Text(
+                            text = addressSearchNotice!!,
+                            color = PrimaryBlue,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.padding(top = 3.dp, start = 2.dp)
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(5.dp))
+
+                    // 2. Top-Down Google Map Layer Switcher + Tool Mode Switch
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        GoogleMapLayerType.entries.forEach { layer ->
+                            val isSelected = googleMapLayer == layer
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = { googleMapLayer = layer },
+                                label = {
+                                    Text(
+                                        text = layer.label,
+                                        fontSize = 10.sp,
+                                        fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.Medium,
+                                        maxLines = 1
+                                    )
+                                },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = Color(0xFF0F172A),
+                                    selectedLabelColor = Color.White,
+                                    containerColor = LightSurfaceVariant,
+                                    labelColor = TextPrimary
+                                ),
+                                modifier = Modifier
+                                    .height(30.dp)
+                                    .testTag("chip_map_layer_${layer.lyrsCode}")
                             )
                         }
 
-                        Spacer(modifier = Modifier.height(4.dp))
-                        Text(
-                            text = gpsCalibratedNote,
-                            color = NormalGreen,
-                            fontSize = 10.sp,
-                            fontWeight = FontWeight.SemiBold
+                        Spacer(modifier = Modifier.weight(1f))
+
+                        // Tap-map mode vs Pure Pan mode (crosshair still works in both!)
+                        FilterChip(
+                            selected = regionDrawToolMode == RegionDrawToolMode.DRAW_POLYGON_POINTS,
+                            onClick = {
+                                regionDrawToolMode = if (regionDrawToolMode == RegionDrawToolMode.DRAW_POLYGON_POINTS) {
+                                    RegionDrawToolMode.PAN_ZOOM_MAP
+                                } else {
+                                    RegionDrawToolMode.DRAW_POLYGON_POINTS
+                                }
+                            },
+                            label = {
+                                Text(
+                                    text = if (regionDrawToolMode == RegionDrawToolMode.DRAW_POLYGON_POINTS) "Chạm Map: Bật" else "Chạm Map: Khóa",
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            },
+                            colors = FilterChipDefaults.filterChipColors(
+                                selectedContainerColor = PrimaryBlue,
+                                selectedLabelColor = Color.White,
+                                containerColor = LightSurfaceVariant,
+                                labelColor = TextPrimary
+                            ),
+                            modifier = Modifier.height(30.dp)
                         )
                     }
 
                     Spacer(modifier = Modifier.height(6.dp))
 
-                    // Proceed to Step 2: Setup Fire Detection Anchor First
+                    // 3. Real Top-Down Google Maps View with Geo-Locked Polygon Vertices & Grab-Style Center Crosshair
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f)
+                            .clip(RoundedCornerShape(14.dp))
+                            .background(Color(0xFFCBD5E1))
+                            .border(
+                                2.dp,
+                                if (geoPolygonPoints.size >= 3) NormalGreen else PrimaryBlue,
+                                RoundedCornerShape(14.dp)
+                            )
+                    ) {
+                        val gpsLat = gpsLocation?.latitude ?: 10.776889
+                        val gpsLng = gpsLocation?.longitude ?: 106.700806
+
+                        GoogleMapsAlignWebView(
+                            initialLat = flyToTarget.lat,
+                            initialLng = flyToTarget.lng,
+                            flyToTrigger = flyToTrigger,
+                            flyToLat = flyToTarget.lat,
+                            flyToLng = flyToTarget.lng,
+                            flyToZoom = flyToZoom,
+                            gpsLat = gpsLat,
+                            gpsLng = gpsLng,
+                            layerType = googleMapLayer,
+                            tapToPinEnabled = (regionDrawToolMode == RegionDrawToolMode.DRAW_POLYGON_POINTS),
+                            geoPoints = geoPolygonPoints.toList(),
+                            onCenterMoved = { cLat, cLng ->
+                                mapCenterLatLng = GeoLatLng(cLat, cLng)
+                            },
+                            onMapTappedAddPoint = { pLat, pLng ->
+                                geoPolygonPoints.add(GeoLatLng(pLat, pLng))
+                                syncNormalizedFromGeoPolygon()
+                            },
+                            onPointDragged = { idx, nLat, nLng ->
+                                if (idx in geoPolygonPoints.indices) {
+                                    geoPolygonPoints[idx] = GeoLatLng(nLat, nLng)
+                                    syncNormalizedFromGeoPolygon()
+                                }
+                            },
+                            modifier = Modifier.fillMaxSize()
+                        )
+
+                        // Grab / Ride-hailing Fixed Center Crosshair Target (Non-blocking so user smoothly pans map beneath!)
+                        Box(
+                            modifier = Modifier.align(Alignment.Center),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Canvas(modifier = Modifier.size(54.dp)) {
+                                val cx = size.width / 2f
+                                val cy = size.height / 2f
+                                drawCircle(
+                                    color = Color.White.copy(alpha = 0.85f),
+                                    radius = 18f,
+                                    center = Offset(cx, cy),
+                                    style = Stroke(width = 4.5f)
+                                )
+                                drawCircle(
+                                    color = Color(0xFFDC2626),
+                                    radius = 18f,
+                                    center = Offset(cx, cy),
+                                    style = Stroke(width = 2.4f)
+                                )
+                                drawLine(
+                                    color = Color(0xFFDC2626),
+                                    start = Offset(cx - 25f, cy),
+                                    end = Offset(cx - 7f, cy),
+                                    strokeWidth = 2.5f
+                                )
+                                drawLine(
+                                    color = Color(0xFFDC2626),
+                                    start = Offset(cx + 7f, cy),
+                                    end = Offset(cx + 25f, cy),
+                                    strokeWidth = 2.5f
+                                )
+                                drawLine(
+                                    color = Color(0xFFDC2626),
+                                    start = Offset(cx, cy - 25f),
+                                    end = Offset(cx, cy - 7f),
+                                    strokeWidth = 2.5f
+                                )
+                                drawLine(
+                                    color = Color(0xFFDC2626),
+                                    start = Offset(cx, cy + 7f),
+                                    end = Offset(cx, cy + 25f),
+                                    strokeWidth = 2.5f
+                                )
+                                drawCircle(color = Color(0xFFDC2626), radius = 4f, center = Offset(cx, cy))
+                            }
+                        }
+
+                        // Live Center Coordinates + True North Pill at Top-Left
+                        Row(
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(8.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFF0F172A).copy(alpha = 0.84f))
+                                .padding(horizontal = 8.dp, vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = String.format(
+                                    Locale.US,
+                                    "↑ Bắc · Tâm: %.5f, %.5f",
+                                    mapCenterLatLng.lat,
+                                    mapCenterLatLng.lng
+                                ),
+                                color = Color.White,
+                                fontSize = 10.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+
+                        // Real-time Geo-Area Summary Pill at Bottom-Start
+                        if (geoPolygonPoints.size >= 3) {
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.BottomStart)
+                                    .padding(8.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0xFF059669).copy(alpha = 0.92f))
+                                    .padding(horizontal = 9.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = String.format(
+                                        Locale.US,
+                                        "%d góc · %.1fm × %.1fm (%.1f m²)",
+                                        geoPolygonPoints.size,
+                                        calcWidthM,
+                                        calcLengthM,
+                                        calcPolygonAreaM2
+                                    ),
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.ExtraBold
+                                )
+                            }
+                        } else {
+                            Row(
+                                modifier = Modifier
+                                    .align(Alignment.BottomStart)
+                                    .padding(8.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0xFF0F172A).copy(alpha = 0.85f))
+                                    .padding(horizontal = 9.dp, vertical = 4.dp)
+                            ) {
+                                Text(
+                                    text = "Kéo bản đồ đặt dấu chữ thập (+) lên từng góc mái nhà rồi bấm Ghim Góc!",
+                                    color = Color(0xFF38BDF8),
+                                    fontSize = 9.5.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(7.dp))
+
+                    // 4. Grab-Style Precision Pin Button + Undo + Clear Row
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Button(
+                            onClick = {
+                                geoPolygonPoints.add(mapCenterLatLng)
+                                syncNormalizedFromGeoPolygon()
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(42.dp)
+                                .testTag("btn_pin_center_crosshair"),
+                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.AddLocationAlt, contentDescription = null, modifier = Modifier.size(17.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "Ghim Góc Tại Tâm (+) [Đ${geoPolygonPoints.size + 1}]",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+
+                        IconButton(
+                            onClick = {
+                                if (geoPolygonPoints.isNotEmpty()) {
+                                    geoPolygonPoints.removeAt(geoPolygonPoints.lastIndex)
+                                    syncNormalizedFromGeoPolygon()
+                                }
+                            },
+                            modifier = Modifier
+                                .size(42.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(LightSurfaceVariant)
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.Undo, contentDescription = "Hoàn tác 1 góc", tint = TextPrimary, modifier = Modifier.size(18.dp))
+                        }
+
+                        IconButton(
+                            onClick = {
+                                geoPolygonPoints.clear()
+                                regionPolygonPoints.clear()
+                            },
+                            modifier = Modifier
+                                .size(42.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(Color(0xFFFEE2E2))
+                        ) {
+                            Icon(Icons.Default.DeleteSweep, contentDescription = "Xóa làm lại", tint = CriticalAlarmRed, modifier = Modifier.size(18.dp))
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    // 5. Quick Geo-Templates Centered at Map Crosshair
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                userManuallyClearedToBlindRoom = false
+                                movementTracker.forceRecognizeMapLocation()
+                                geoPolygonPoints.clear()
+                                geoPolygonPoints.addAll(GeoMapMath.createGeoTemplateRect(mapCenterLatLng, 10.0, 16.0))
+                                syncNormalizedFromGeoPolygon()
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp)
+                                .testTag("btn_gps_quick_size"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.MyLocation, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text("Khung 10×16m Tại Tâm", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = PrimaryBlue)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                userManuallyClearedToBlindRoom = false
+                                geoPolygonPoints.clear()
+                                geoPolygonPoints.addAll(GeoMapMath.createGeoTemplateLShape(mapCenterLatLng, 14.0, 16.0))
+                                syncNormalizedFromGeoPolygon()
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text("Mẫu Chữ L Tại Tâm (6 Đỉnh)", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    // 6. Confirm Geo-Anchored Polygon -> Cut North-Up Floorplan for Stage 2 & 3!
                     Button(
                         onClick = {
                             userManuallyClearedToBlindRoom = false
-                            onUpdateFloorDimensions(floorId, houseWidthMeters, houseLengthMeters)
+                            if (geoPolygonPoints.size < 3) {
+                                geoPolygonPoints.clear()
+                                geoPolygonPoints.addAll(GeoMapMath.createGeoTemplateRect(mapCenterLatLng, 10.0, 16.0))
+                            }
+                            syncNormalizedFromGeoPolygon()
+                            onSaveBoundaryPolygon(floorId, regionPolygonPoints.toList(), houseWidthMeters, houseLengthMeters)
+                            currentUserPos = clampPointIntoPolygonBounds(currentUserPos, activeFloorplanPolygon)
                             mapStage = MapStage.SETUP_PLACEMENT
                             setupDrawer = SetupDrawerMode.ADD_FIRE_SENSOR
                         },
@@ -1140,13 +1678,24 @@ fun IndoorMap2DScreen(
                             .fillMaxWidth()
                             .height(48.dp)
                             .testTag("btn_enter_mode_2_setup"),
-                        colors = ButtonDefaults.buttonColors(containerColor = NormalGreen),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (geoPolygonPoints.size >= 3) NormalGreen else PrimaryBlue
+                        ),
                         shape = RoundedCornerShape(12.dp)
                     ) {
                         Icon(Icons.Default.Check, contentDescription = null, modifier = Modifier.size(18.dp))
                         Spacer(modifier = Modifier.width(6.dp))
                         Text(
-                            "XÁC NHẬN VÙNG KHOANH ➔ BƯỚC 2: SETUP MỐC BÁO CHÁY TRƯỚC",
+                            text = if (geoPolygonPoints.size >= 3) {
+                                String.format(
+                                    Locale.US,
+                                    "KHÓA %d GÓC GOOGLE MAPS (%.0fm²) ➔ BƯỚC 2",
+                                    geoPolygonPoints.size,
+                                    calcPolygonAreaM2
+                                )
+                            } else {
+                                "GHIM ÍT NHẤT 3 GÓC MÁI NHÀ (HOẶC LẤY KHUNG MẪU)"
+                            },
                             fontSize = 11.sp,
                             fontWeight = FontWeight.ExtraBold
                         )
@@ -1157,7 +1706,7 @@ fun IndoorMap2DScreen(
         }
 
         // =========================================================================
-        // STAGE 2 & STAGE 3: INTERACTIVE 2D MAP CANVAS (UNPARTITIONED BY DEFAULT)
+        // STAGE 2 & STAGE 3: INTERACTIVE 2D MAP CANVAS SHAPED BY THE EXACT KHOANH VÙNG POLYGON!
         // =========================================================================
         if (mapStage == MapStage.READY_MAP) {
             Row(
@@ -1180,7 +1729,7 @@ fun IndoorMap2DScreen(
                 ) {
                     Icon(Icons.Default.Layers, contentDescription = null, modifier = Modifier.size(15.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("1. Mờ Thấy Google Maps", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text("1. Mờ Thấy Bản Đồ", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
 
                 Button(
@@ -1197,24 +1746,18 @@ fun IndoorMap2DScreen(
                 ) {
                     Icon(Icons.Default.Visibility, contentDescription = null, modifier = Modifier.size(15.dp))
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text("2. Trắng Rõ Mặt Bằng", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+                    Text("2. Trắng Rõ Vùng Khoanh", fontSize = 11.sp, fontWeight = FontWeight.Bold)
                 }
             }
         }
 
-        // 2D Interactive Canvas
+        // 2D Interactive Canvas shaped by activeFloorplanPolygon
         Box(
             modifier = Modifier
                 .fillMaxWidth()
                 .weight(1f)
                 .clip(RoundedCornerShape(18.dp))
-                .background(
-                    if (visualStyle == MapVisualStyle.CRISP_WHITE_HOUSE && mapStage == MapStage.READY_MAP) {
-                        Color.White
-                    } else {
-                        Color(0xFFEFF6FF)
-                    }
-                )
+                .background(Color(0xFFCBD5E1))
                 .border(1.5.dp, if (isFireActive) CriticalAlarmRed else LightBorder, RoundedCornerShape(18.dp))
                 .pointerInput(Unit) {
                     detectTransformGestures { _, pan, zoom, _ ->
@@ -1225,21 +1768,123 @@ fun IndoorMap2DScreen(
                         )
                     }
                 }
-                .pointerInput(mapStage, setupDrawer) {
+                .pointerInput(mapStage, setupDrawer, activeFloorplanPolygon) {
                     detectTapGestures { tapOffset ->
-                        val normX = ((tapOffset.x - panOffset.x) / (size.width * scale)).coerceIn(0.08f, 0.92f)
-                        val normY = ((tapOffset.y - panOffset.y) / (size.height * scale)).coerceIn(0.08f, 0.92f)
-                        currentUserPos = Point2D(normX, normY)
-                        onSetUserPosition(floorId, normX, normY)
-                        activeRoute?.let { curRoute ->
-                            if (curRoute.pathPoints.isNotEmpty()) {
-                                activeRoute = buildDoorAwareRoute(
-                                    start = currentUserPos,
-                                    target = curRoute.pathPoints.last(),
-                                    targetLabel = curRoute.targetName,
-                                    targetType = curRoute.targetType,
-                                    notes = curRoute.notes
+                        val normX = ((tapOffset.x - panOffset.x) / (size.width * scale)).coerceIn(0.05f, 0.95f)
+                        val normY = ((tapOffset.y - panOffset.y) / (size.height * scale)).coerceIn(0.05f, 0.95f)
+                        val tapPt = Point2D(normX, normY)
+
+                        // Check if user tapped on an existing Map Object or Sensor Pin (hit radius ~0.065f)
+                        val hitRadius = 0.065f
+                        var hitItem: SelectedMapElement? = null
+
+                        // 1. Check Sensors
+                        placedSensorPins.forEachIndexed { idx, pin ->
+                            if (hypot((pin.position.x - tapPt.x).toDouble(), (pin.position.y - tapPt.y).toDouble()) < hitRadius) {
+                                hitItem = SelectedMapElement(
+                                    kind = SelectedMapElementKind.SENSOR,
+                                    index = idx,
+                                    label = pin.displayName,
+                                    position = pin.position,
+                                    deviceIdOrDbId = pin.deviceId
                                 )
+                            }
+                        }
+                        // 2. Check Extinguishers
+                        if (hitItem == null) {
+                            tempExtinguishers.forEachIndexed { idx, pt ->
+                                if (hypot((pt.x - tapPt.x).toDouble(), (pt.y - tapPt.y).toDouble()) < hitRadius) {
+                                    val dbId = extinguishers.getOrNull(idx)?.id
+                                    hitItem = SelectedMapElement(
+                                        kind = SelectedMapElementKind.EXTINGUISHER,
+                                        index = idx,
+                                        label = "Bình CC #${idx + 1}",
+                                        position = pt,
+                                        deviceIdOrDbId = dbId
+                                    )
+                                }
+                            }
+                        }
+                        // 3. Check Numbered Doors
+                        if (hitItem == null) {
+                            val doorObjs = mapObjects.filter { it.type == MapObjectType.DOOR }
+                            tempDoors.forEachIndexed { idx, pt ->
+                                if (hypot((pt.x - tapPt.x).toDouble(), (pt.y - tapPt.y).toDouble()) < hitRadius) {
+                                    hitItem = SelectedMapElement(
+                                        kind = SelectedMapElementKind.NUMBERED_DOOR,
+                                        index = idx,
+                                        label = "Cửa Số #${idx + 1}",
+                                        position = pt,
+                                        deviceIdOrDbId = doorObjs.getOrNull(idx)?.id
+                                    )
+                                }
+                            }
+                        }
+                        // 4. Check Main Doors
+                        if (hitItem == null) {
+                            val mainDoorObjs = mapObjects.filter { it.type == MapObjectType.MAIN_DOOR }
+                            tempMainDoors.forEachIndexed { idx, pt ->
+                                if (hypot((pt.x - tapPt.x).toDouble(), (pt.y - tapPt.y).toDouble()) < hitRadius) {
+                                    hitItem = SelectedMapElement(
+                                        kind = SelectedMapElementKind.MAIN_DOOR,
+                                        index = idx,
+                                        label = "Cửa Chính #${idx + 1}",
+                                        position = pt,
+                                        deviceIdOrDbId = mainDoorObjs.getOrNull(idx)?.id
+                                    )
+                                }
+                            }
+                        }
+                        // 5. Check Exits
+                        if (hitItem == null) {
+                            val exitObjs = mapObjects.filter { it.type == MapObjectType.EXIT }
+                            tempExits.forEachIndexed { idx, pt ->
+                                if (hypot((pt.x - tapPt.x).toDouble(), (pt.y - tapPt.y).toDouble()) < hitRadius) {
+                                    hitItem = SelectedMapElement(
+                                        kind = SelectedMapElementKind.EXIT,
+                                        index = idx,
+                                        label = "Cửa Exit #${idx + 1}",
+                                        position = pt,
+                                        deviceIdOrDbId = exitObjs.getOrNull(idx)?.id
+                                    )
+                                }
+                            }
+                        }
+                        // 6. Check Stairs
+                        if (hitItem == null) {
+                            val stairObjs = mapObjects.filter { it.type == MapObjectType.STAIRS }
+                            tempStairs.forEachIndexed { idx, pt ->
+                                if (hypot((pt.x - tapPt.x).toDouble(), (pt.y - tapPt.y).toDouble()) < hitRadius) {
+                                    hitItem = SelectedMapElement(
+                                        kind = SelectedMapElementKind.STAIRS,
+                                        index = idx,
+                                        label = "Cầu Thang #${idx + 1}",
+                                        position = pt,
+                                        deviceIdOrDbId = stairObjs.getOrNull(idx)?.id
+                                    )
+                                }
+                            }
+                        }
+
+                        if (hitItem != null) {
+                            selectedMapElement = hitItem
+                        } else {
+                            selectedMapElement = null
+                            val clampedPt = clampPointIntoPolygonBounds(tapPt, activeFloorplanPolygon)
+                            currentUserPos = clampedPt
+                            onSetUserPosition(floorId, clampedPt.x, clampedPt.y)
+                            activeRoute?.let { curRoute ->
+                                if (curRoute.targetType == "TWO_STAGE") {
+                                    routeTwoStageExtinguisherToFire(null)
+                                } else if (curRoute.pathPoints.isNotEmpty()) {
+                                    activeRoute = buildDoorAwareRoute(
+                                        start = currentUserPos,
+                                        target = curRoute.pathPoints.last(),
+                                        targetLabel = curRoute.targetName,
+                                        targetType = curRoute.targetType,
+                                        notes = curRoute.notes
+                                    )
+                                }
                             }
                         }
                     }
@@ -1256,30 +1901,65 @@ fun IndoorMap2DScreen(
                     )
                 }
 
-                // 1. Background Layer: Either Translucent Google Map (Mode 1) or Crisp Pure White (Mode 2)
+                // 1. Build the exact Path of the User's Khoanh Vùng Polygon!
+                val housePolygonPath = Path()
+                if (activeFloorplanPolygon.isNotEmpty()) {
+                    val firstScreen = toScreen(activeFloorplanPolygon.first())
+                    housePolygonPath.moveTo(firstScreen.x, firstScreen.y)
+                    for (i in 1 until activeFloorplanPolygon.size) {
+                        val ptScreen = toScreen(activeFloorplanPolygon[i])
+                        housePolygonPath.lineTo(ptScreen.x, ptScreen.y)
+                    }
+                    housePolygonPath.close()
+                }
+
+                // 2. Outside Background Layer
                 if (mapStage == MapStage.SETUP_PLACEMENT || visualStyle == MapVisualStyle.TRANSLUCENT_GOOGLE_MAP) {
                     drawGoogleMapsUnderlay(
-                        alphaMultiplier = if (mapStage == MapStage.SETUP_PLACEMENT) 0.55f else 0.50f,
+                        alphaMultiplier = 0.65f,
                         houseWidthMeters = houseWidthMeters,
                         houseLengthMeters = houseLengthMeters,
                         gpsLat = gpsLocation?.latitude ?: 10.7769,
                         gpsLng = gpsLocation?.longitude ?: 106.7009
                     )
+                    // Dim outside the khoanh vùng polygon so the cut-out house polygon stands out sharply
+                    drawRect(color = Color(0xFF0F172A).copy(alpha = 0.18f), size = size)
                 } else {
-                    drawRect(color = Color.White, size = size)
-                    val stepX = w / 10f
-                    val stepY = h / 12f
-                    for (i in 1..9) {
+                    // Mode 2: Outside is slate-gray mask so the white polygon house pops 100%
+                    drawRect(color = Color(0xFFCBD5E1), size = size)
+                }
+
+                // 3. Inside of the User's Khoanh Vùng Polygon (Clipped strictly to housePolygonPath!)
+                drawPath(
+                    path = housePolygonPath,
+                    color = if (visualStyle == MapVisualStyle.CRISP_WHITE_HOUSE && mapStage == MapStage.READY_MAP) {
+                        Color.White
+                    } else {
+                        Color.White.copy(alpha = 0.84f)
+                    },
+                    style = Fill
+                )
+
+                clipPath(housePolygonPath) {
+                    // Draw 1-meter architectural grid strictly INSIDE the user's khoanh vùng polygon
+                    val stepX = w / 12f
+                    val stepY = h / 14f
+                    val gridLineColor = if (visualStyle == MapVisualStyle.CRISP_WHITE_HOUSE && mapStage == MapStage.READY_MAP) {
+                        Color(0xFFE2E8F0)
+                    } else {
+                        Color(0xFFCBD5E1).copy(alpha = 0.55f)
+                    }
+                    for (i in 1..11) {
                         drawLine(
-                            color = Color(0xFFF1F5F9),
+                            color = gridLineColor,
                             start = Offset(i * stepX, 0f),
                             end = Offset(i * stepX, h),
                             strokeWidth = 1.5f
                         )
                     }
-                    for (j in 1..11) {
+                    for (j in 1..13) {
                         drawLine(
-                            color = Color(0xFFF1F5F9),
+                            color = gridLineColor,
                             start = Offset(0f, j * stepY),
                             end = Offset(w, j * stepY),
                             strokeWidth = 1.5f
@@ -1287,47 +1967,36 @@ fun IndoorMap2DScreen(
                     }
                 }
 
-                // 2. House Outer Boundary Wall (Open Unpartitioned Floorplan - KHÔNG TỰ CHIA PHÒNG!)
-                val houseTopLeft = toScreen(Point2D(0.08f, 0.08f))
-                val houseBotRight = toScreen(Point2D(0.92f, 0.92f))
-                val houseRectSize = Size(houseBotRight.x - houseTopLeft.x, houseBotRight.y - houseTopLeft.y)
-
-                drawRoundRect(
-                    color = if (visualStyle == MapVisualStyle.CRISP_WHITE_HOUSE && mapStage == MapStage.READY_MAP) {
-                        Color.White
-                    } else {
-                        Color.White.copy(alpha = 0.76f)
-                    },
-                    topLeft = houseTopLeft,
-                    size = houseRectSize,
-                    cornerRadius = CornerRadius(18f, 18f),
-                    style = Fill
-                )
-
-                drawRoundRect(
+                // 4. Draw Thick Architectural Outer Wall along the User's Exact Khoanh Vùng Polygon!
+                drawPath(
+                    path = housePolygonPath,
                     color = Color(0xFF0F172A),
-                    topLeft = houseTopLeft,
-                    size = houseRectSize,
-                    cornerRadius = CornerRadius(18f, 18f),
-                    style = Stroke(width = 6f)
+                    style = Stroke(width = 7f, cap = StrokeCap.Round, join = StrokeJoin.Round)
                 )
 
-                // Dimension label along top wall
-                val dimPaint = android.graphics.Paint().apply {
-                    color = android.graphics.Color.parseColor("#1E293B")
-                    textSize = 22f
-                    isFakeBoldText = true
-                    textAlign = android.graphics.Paint.Align.CENTER
-                    isAntiAlias = true
+                // Draw Wall Segment Lengths (m) & Corner Badges (G1, G2...) along the Polygon Perimeter
+                for (i in activeFloorplanPolygon.indices) {
+                    val p1 = activeFloorplanPolygon[i]
+                    val p2 = activeFloorplanPolygon[(i + 1) % activeFloorplanPolygon.size]
+                    val s1 = toScreen(p1)
+                    val s2 = toScreen(p2)
+                    val dxM = (p2.x - p1.x) * houseWidthMeters / 0.78f
+                    val dyM = (p2.y - p1.y) * houseLengthMeters / 0.78f
+                    val segMeters = hypot(dxM.toDouble(), dyM.toDouble()).toFloat().coerceAtLeast(1.0f)
+
+                    val midWall = Offset((s1.x + s2.x) / 2f, (s1.y + s2.y) / 2f)
+                    drawLabelPill(
+                        center = midWall,
+                        text = String.format(Locale.US, "%.1fm", segMeters),
+                        bgColor = Color(0xFF334155)
+                    )
+
+                    // Corner vertex dot
+                    drawCircle(color = Color.White, radius = 9f, center = s1)
+                    drawCircle(color = PrimaryBlue, radius = 6f, center = s1)
                 }
-                drawContext.canvas.nativeCanvas.drawText(
-                    "VÙNG KHOANH: ${houseWidthMeters}m × ${houseLengthMeters}m (Mặt bằng mở - Không tự chia phòng)",
-                    (houseTopLeft.x + houseBotRight.x) / 2f,
-                    houseTopLeft.y - 12f,
-                    dimPaint
-                )
 
-                // 3. Draw Signal + IMU Distance Calibration Line from Reference Fire Sensor Anchor (#1) to User
+                // 5. Draw Signal + IMU Distance Calibration Line from Reference Fire Sensor Anchor (#1) to User
                 if (anchorSensorPin != null && mapStage == MapStage.SETUP_PLACEMENT) {
                     val anchorScreen = toScreen(anchorSensorPin.position)
                     val userScreen = toScreen(currentUserPos)
@@ -1351,9 +2020,46 @@ fun IndoorMap2DScreen(
                     )
                 }
 
-                // 4. Draw Active Navigation Path
+                // 6. Draw Active Navigation Path (Supports Single-Stage & 2-Stage Extinguisher -> Fire)
                 activeRoute?.let { route ->
-                    if (route.pathPoints.size >= 2) {
+                    if (route.targetType == "TWO_STAGE" && route.stage1Points.size >= 2 && route.stage2Points.size >= 2) {
+                        // Stage 1: User -> Nearest Extinguisher (Blue)
+                        val s1Path = Path()
+                        val s1First = toScreen(route.stage1Points.first())
+                        s1Path.moveTo(s1First.x, s1First.y)
+                        for (i in 1 until route.stage1Points.size) {
+                            val pt = toScreen(route.stage1Points[i])
+                            s1Path.lineTo(pt.x, pt.y)
+                        }
+                        drawPath(s1Path, color = PrimaryBlue.copy(alpha = 0.25f), style = Stroke(width = 24f, cap = StrokeCap.Round))
+                        drawPath(
+                            s1Path,
+                            color = PrimaryBlue,
+                            style = Stroke(width = 8f, cap = StrokeCap.Round, pathEffect = PathEffect.dashPathEffect(floatArrayOf(22f, 12f), 0f))
+                        )
+
+                        // Stage 2: Extinguisher -> Fire Source (Orange-Red)
+                        val s2Path = Path()
+                        val s2First = toScreen(route.stage2Points.first())
+                        s2Path.moveTo(s2First.x, s2First.y)
+                        for (i in 1 until route.stage2Points.size) {
+                            val pt = toScreen(route.stage2Points[i])
+                            s2Path.lineTo(pt.x, pt.y)
+                        }
+                        drawPath(s2Path, color = Color(0xFFEA580C).copy(alpha = 0.25f), style = Stroke(width = 24f, cap = StrokeCap.Round))
+                        drawPath(
+                            s2Path,
+                            color = Color(0xFFEA580C),
+                            style = Stroke(width = 8f, cap = StrokeCap.Round, pathEffect = PathEffect.dashPathEffect(floatArrayOf(20f, 10f), 0f))
+                        )
+
+                        val extPivot = toScreen(route.stage1Points.last())
+                        drawLabelPill(
+                            center = Offset(extPivot.x, extPivot.y - 42f),
+                            text = "CHẶNG 1: LẤY BÌNH CC TẠI ĐÂY ➔ CHẶNG 2: DẬP LỬA",
+                            bgColor = Color(0xFF7C3AED)
+                        )
+                    } else if (route.pathPoints.size >= 2) {
                         val pathColor = when (route.targetType) {
                             "EXTINGUISHER" -> PrimaryBlue
                             "EXIT" -> NormalGreen
@@ -1392,37 +2098,53 @@ fun IndoorMap2DScreen(
                     }
                 }
 
-                // 5. Draw Main Doors (CỬA CHÍNH)
+                // Highlight ring around currently selected map element (if any)
+                selectedMapElement?.let { sel ->
+                    val selScreen = toScreen(sel.position)
+                    drawCircle(
+                        color = Color(0xFF7C3AED).copy(alpha = 0.28f),
+                        radius = 44f,
+                        center = selScreen
+                    )
+                    drawCircle(
+                        color = Color(0xFF7C3AED),
+                        radius = 44f,
+                        center = selScreen,
+                        style = Stroke(width = 4f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 8f), 0f))
+                    )
+                }
+
+                // 7. Draw Main Doors (CỬA CHÍNH)
                 tempMainDoors.forEachIndexed { idx, pt ->
                     drawMainDoorSymbol(toScreen(pt), idx + 1)
                 }
 
-                // 6. Draw Numbered Doors (CỬA ĐÁNH SỐ #1, #2, #3...)
+                // 8. Draw Numbered Doors (CỬA ĐÁNH SỐ #1, #2, #3...)
                 tempDoors.forEachIndexed { idx, pt ->
                     drawNumberedDoorSymbol(toScreen(pt), idx + 1)
                 }
 
-                // 7. Draw Stairs
+                // 9. Draw Stairs
                 tempStairs.forEachIndexed { idx, pt ->
                     drawLargeStairsSymbol(toScreen(pt), "CẦU THANG ${idx + 1}")
                 }
 
-                // 8. Draw Exits (Cửa Exit)
+                // 10. Draw Exits (Cửa Exit)
                 tempExits.forEachIndexed { idx, pt ->
                     drawLargeExitSymbol(toScreen(pt), "CỬA EXIT ${idx + 1}")
                 }
 
-                // 9. Draw Fire Extinguishers (Bình Chữa Cháy)
+                // 11. Draw Fire Extinguishers (Bình Chữa Cháy)
                 tempExtinguishers.forEachIndexed { idx, pt ->
                     drawLargeExtinguisherSymbol(toScreen(pt), "BÌNH CC ${idx + 1}")
                 }
 
-                // 10. Draw Pinned Fire Sensors + CIRCULAR EXPANDING FIRE SPREAD ZONE WHEN ALARM RINGS LONGER
+                // 12. Draw Pinned Fire Sensors + CIRCULAR EXPANDING FIRE SPREAD ZONE WHEN ALARM RINGS LONGER
                 val sensorsToRender = if (placedSensorPins.isNotEmpty()) {
                     placedSensorPins
                 } else {
                     nodes.mapIndexed { idx, n ->
-                        val prob = n.telemetry.calculateFireProbability().totalProbabilityPercent
+                        val prob = n.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent
                         val isAlm = n.lastKnownAlarm || n.firmwareState == FirmwareState.ALARM || prob >= 75f
                         PlacedSensorPin(
                             deviceId = n.deviceId,
@@ -1446,12 +2168,11 @@ fun IndoorMap2DScreen(
                         ((currentClockMs - startMs) / 1000L).coerceAtLeast(1L)
                     } else 0L
 
-                    // Radius in meters grows as alarm keeps ringing (+0.18m per second)
                     val spreadRadiusMeters = if (pin.isAlarm) {
                         (1.0f + elapsedSec * 0.18f).coerceAtMost(max(houseWidthMeters, houseLengthMeters) * 0.75f)
                     } else 0f
 
-                    val pixelsPerMeter = (houseRectSize.width / houseWidthMeters.coerceAtLeast(5f)).coerceAtLeast(10f)
+                    val pixelsPerMeter = ((w * 0.78f * scale) / houseWidthMeters.coerceAtLeast(5f)).coerceAtLeast(10f)
                     val spreadRadiusPx = spreadRadiusMeters * pixelsPerMeter
 
                     if (pin.isAlarm && spreadRadiusPx > 10f) {
@@ -1479,7 +2200,7 @@ fun IndoorMap2DScreen(
                     )
                 }
 
-                // 11. Draw Current Standing User Position
+                // 13. Draw Current Standing User Position
                 drawUserStandingBeacon(
                     center = toScreen(currentUserPos),
                     headingDeg = compassHeading,
@@ -1511,11 +2232,12 @@ fun IndoorMap2DScreen(
                     } else {
                         String.format(
                             Locale.US,
-                            "RSSI %ddBm (%.1fm) + ĐT (%.1fm) ➔ Chuẩn: %.2fm",
-                            liveRssiDbm,
-                            rssiDistanceMeters,
-                            imuPhoneDistanceMeters,
-                            fusedDistanceMeters
+                            "IMU %d%% + La bàn %d%% + RSSI %d%% (GPS 0%%) · Acc %.1f%% (±%.2fm)",
+                            triFusionSnapshot.imuWeightPct,
+                            triFusionSnapshot.compassWeightPct,
+                            triFusionSnapshot.rssiWeightPct,
+                            fusedAccuracyPercent,
+                            fusedErrorMeters
                         )
                     },
                     color = TextPrimary,
@@ -1550,14 +2272,177 @@ fun IndoorMap2DScreen(
                     fontWeight = FontWeight.ExtraBold
                 )
             }
+
+            // Contextual Individual Map Element Inspector / Editor Bar (Move / Route / Delete single item)
+            selectedMapElement?.let { sel ->
+                Card(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .padding(10.dp)
+                        .clip(RoundedCornerShape(14.dp))
+                        .border(1.5.dp, Color(0xFF7C3AED), RoundedCornerShape(14.dp))
+                        .testTag("selected_map_element_bar"),
+                    colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = 0.97f)),
+                    elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+                ) {
+                    Column(modifier = Modifier.padding(10.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Đang chọn: ${sel.label}",
+                                color = Color(0xFF5B21B6),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                            IconButton(
+                                onClick = { selectedMapElement = null },
+                                modifier = Modifier.size(24.dp)
+                            ) {
+                                Icon(Icons.Default.Close, contentDescription = "Đóng", tint = TextSecondary, modifier = Modifier.size(16.dp))
+                            }
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Button(
+                                onClick = {
+                                    activeRoute = buildDoorAwareRoute(
+                                        start = currentUserPos,
+                                        target = sel.position,
+                                        targetLabel = sel.label,
+                                        targetType = if (sel.kind == SelectedMapElementKind.EXIT || sel.kind == SelectedMapElementKind.MAIN_DOOR) "EXIT" else "EXTINGUISHER",
+                                        notes = "Đang chỉ đường tới ${sel.label}"
+                                    )
+                                    selectedMapElement = null
+                                },
+                                colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(34.dp)
+                                    .testTag("btn_selected_element_route")
+                            ) {
+                                Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(13.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Dẫn Tới Đây", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            OutlinedButton(
+                                onClick = {
+                                    val newPos = currentUserPos
+                                    when (sel.kind) {
+                                        SelectedMapElementKind.SENSOR -> {
+                                            if (sel.index in placedSensorPins.indices) {
+                                                val pin = placedSensorPins[sel.index]
+                                                placedSensorPins[sel.index] = pin.copy(position = newPos)
+                                                onBindSensorPosition(pin.deviceId, newPos.x, newPos.y)
+                                            }
+                                        }
+                                        SelectedMapElementKind.EXTINGUISHER -> {
+                                            if (sel.index in tempExtinguishers.indices) {
+                                                tempExtinguishers[sel.index] = newPos
+                                                sel.deviceIdOrDbId?.let { onUpdateExtinguisherPosition(it, newPos.x, newPos.y) }
+                                            }
+                                        }
+                                        SelectedMapElementKind.NUMBERED_DOOR -> {
+                                            if (sel.index in tempDoors.indices) {
+                                                tempDoors[sel.index] = newPos
+                                                sel.deviceIdOrDbId?.let { onUpdateMapObjectPosition(it, newPos.x, newPos.y) }
+                                            }
+                                        }
+                                        SelectedMapElementKind.MAIN_DOOR -> {
+                                            if (sel.index in tempMainDoors.indices) {
+                                                tempMainDoors[sel.index] = newPos
+                                                sel.deviceIdOrDbId?.let { onUpdateMapObjectPosition(it, newPos.x, newPos.y) }
+                                            }
+                                        }
+                                        SelectedMapElementKind.EXIT -> {
+                                            if (sel.index in tempExits.indices) {
+                                                tempExits[sel.index] = newPos
+                                                sel.deviceIdOrDbId?.let { onUpdateMapObjectPosition(it, newPos.x, newPos.y) }
+                                            }
+                                        }
+                                        SelectedMapElementKind.STAIRS -> {
+                                            if (sel.index in tempStairs.indices) {
+                                                tempStairs[sel.index] = newPos
+                                                sel.deviceIdOrDbId?.let { onUpdateMapObjectPosition(it, newPos.x, newPos.y) }
+                                            }
+                                        }
+                                    }
+                                    selectedMapElement = sel.copy(position = newPos)
+                                },
+                                shape = RoundedCornerShape(8.dp),
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                modifier = Modifier
+                                    .weight(1.1f)
+                                    .height(34.dp)
+                                    .testTag("btn_selected_element_move_here")
+                            ) {
+                                Icon(Icons.Default.MyLocation, contentDescription = null, tint = Color(0xFF7C3AED), modifier = Modifier.size(13.dp))
+                                Spacer(modifier = Modifier.width(4.dp))
+                                Text("Dời Tới Điểm Đứng", color = Color(0xFF7C3AED), fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                            }
+
+                            if (sel.kind != SelectedMapElementKind.SENSOR) {
+                                Button(
+                                    onClick = {
+                                        when (sel.kind) {
+                                            SelectedMapElementKind.EXTINGUISHER -> {
+                                                if (sel.index in tempExtinguishers.indices) tempExtinguishers.removeAt(sel.index)
+                                                sel.deviceIdOrDbId?.let { onDeleteExtinguisher(it) }
+                                            }
+                                            SelectedMapElementKind.NUMBERED_DOOR -> {
+                                                if (sel.index in tempDoors.indices) tempDoors.removeAt(sel.index)
+                                                sel.deviceIdOrDbId?.let { onDeleteMapObject(it) }
+                                            }
+                                            SelectedMapElementKind.MAIN_DOOR -> {
+                                                if (sel.index in tempMainDoors.indices) tempMainDoors.removeAt(sel.index)
+                                                sel.deviceIdOrDbId?.let { onDeleteMapObject(it) }
+                                            }
+                                            SelectedMapElementKind.EXIT -> {
+                                                if (sel.index in tempExits.indices) tempExits.removeAt(sel.index)
+                                                sel.deviceIdOrDbId?.let { onDeleteMapObject(it) }
+                                            }
+                                            SelectedMapElementKind.STAIRS -> {
+                                                if (sel.index in tempStairs.indices) tempStairs.removeAt(sel.index)
+                                                sel.deviceIdOrDbId?.let { onDeleteMapObject(it) }
+                                            }
+                                            SelectedMapElementKind.SENSOR -> {}
+                                        }
+                                        selectedMapElement = null
+                                    },
+                                    colors = ButtonDefaults.buttonColors(containerColor = CriticalAlarmRed),
+                                    shape = RoundedCornerShape(8.dp),
+                                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                                    modifier = Modifier
+                                        .weight(0.75f)
+                                        .height(34.dp)
+                                        .testTag("btn_selected_element_delete")
+                                ) {
+                                    Icon(Icons.Default.DeleteSweep, contentDescription = null, modifier = Modifier.size(13.dp))
+                                    Spacer(modifier = Modifier.width(3.dp))
+                                    Text("Xóa", fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Spacer(modifier = Modifier.height(8.dp))
 
         // =========================================================================
         // STAGE 2 BOTTOM CONTROLS:
-        // BƯỚC 1 TRONG SETUP: GHIM VỊ TRÍ NHẬN DIỆN LỬA TRƯỚC LÀM MỐC CHUẨN + ĐO KHOẢNG CÁCH BẰNG TÍN HIỆU & CẢM BIẾN ĐT
-        // BƯỚC 2 TRONG SETUP: GHIM CỬA CHÍNH, CÁC CÁNH CỬA (ĐÁNH SỐ #1, #2...), BÌNH CỨU HỎA, CỬA EXIT
+        // 1. GHIM VỊ TRÍ NHẬN DIỆN LỬA TRƯỚC LÀM MỐC CHUẨN + ĐO KHOẢNG CÁCH BẰNG TÍN HIỆU & CẢM BIẾN ĐT
+        // 2. GHIM CỬA CHÍNH, CÁC CÁNH CỬA (ĐÁNH SỐ #1, #2...), BÌNH CỨU HỎA, CỬA EXIT
         // =========================================================================
         if (mapStage == MapStage.SETUP_PLACEMENT) {
             Card(
@@ -1569,7 +2454,6 @@ fun IndoorMap2DScreen(
                 elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    // Two ordered step tabs: Step 1 (Fire Sensor Reference Anchor) -> Step 2 (Numbered Doors / Main Door / Extinguisher / Exit)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -1634,7 +2518,7 @@ fun IndoorMap2DScreen(
                             Text(
                                 text = String.format(
                                     Locale.US,
-                                    "📡 Tín hiệu RSSI: %d dBm (~%.2fm) + 📲 Cảm biến ĐT (%d bước, %d°): ~%.2fm",
+                                    "📡 ESP32 RSSI %ddBm (~%.2fm) + 📲 IMU (%d bước, %d°): ~%.2fm",
                                     liveRssiDbm,
                                     rssiDistanceMeters,
                                     stepCount,
@@ -1648,9 +2532,10 @@ fun IndoorMap2DScreen(
                             Text(
                                 text = String.format(
                                     Locale.US,
-                                    "🎯 Khoảng cách kết hợp chuẩn hóa: %.2f m · Độ chính xác tăng cường Acc = %.1f%%",
+                                    "🎯 Kết hợp 3 cảm biến: %.2fm · Acc = %.1f%% (±%.2fm) · GPS: 0%% nhiễu",
                                     fusedDistanceMeters,
-                                    fusedAccuracyPercent
+                                    fusedAccuracyPercent,
+                                    fusedErrorMeters
                                 ),
                                 color = TextPrimary,
                                 fontSize = 10.sp,
@@ -1661,21 +2546,21 @@ fun IndoorMap2DScreen(
                         if (anchorSensorPin != null) {
                             OutlinedButton(
                                 onClick = {
-                                    // Position user at exact fused distance & compass heading from the Fire Sensor Reference Anchor
                                     val rad = Math.toRadians((compassHeading - 90f).toDouble())
                                     val dxNorm = (cos(rad).toFloat() * fusedDistanceMeters) / houseWidthMeters.coerceAtLeast(5f)
                                     val dyNorm = (sin(rad).toFloat() * fusedDistanceMeters) / houseLengthMeters.coerceAtLeast(5f)
-                                    val calibratedPos = Point2D(
+                                    val rawPos = Point2D(
                                         x = (anchorSensorPin.position.x + dxNorm).coerceIn(0.10f, 0.90f),
                                         y = (anchorSensorPin.position.y + dyNorm).coerceIn(0.10f, 0.90f)
                                     )
+                                    val calibratedPos = clampPointIntoPolygonBounds(rawPos, activeFloorplanPolygon)
                                     currentUserPos = calibratedPos
                                     onSetUserPosition(floorId, calibratedPos.x, calibratedPos.y)
                                 },
                                 shape = RoundedCornerShape(8.dp),
                                 modifier = Modifier.height(32.dp)
                             ) {
-                                Text("Chuẩn Hóa Vị Trí", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Color(0xFF5B21B6))
+                                Text("Đo Chuẩn", fontSize = 9.sp, fontWeight = FontWeight.Bold, color = Color(0xFF5B21B6))
                             }
                         }
                     }
@@ -1700,7 +2585,7 @@ fun IndoorMap2DScreen(
                             LazyRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 items(nodes) { node ->
                                     val isSelected = node.deviceId == selectedSavedNodeId
-                                    val prob = node.telemetry.calculateFireProbability().totalProbabilityPercent
+                                    val prob = node.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent
                                     FilterChip(
                                         selected = isSelected,
                                         onClick = { selectedSavedNodeId = node.deviceId },
@@ -1736,7 +2621,7 @@ fun IndoorMap2DScreen(
                                     val chosenNode = nodes.find { it.deviceId == selectedSavedNodeId } ?: nodes.firstOrNull()
                                     val devId = chosenNode?.deviceId ?: "smartfire-node-${placedSensorPins.size + 1}"
                                     val devName = chosenNode?.displayName ?: "Báo cháy #${placedSensorPins.size + 1}"
-                                    val prob = chosenNode?.telemetry?.calculateFireProbability()?.totalProbabilityPercent ?: 5.0f
+                                    val prob = chosenNode?.telemetry?.calculateFireProbability(gasThresholdAdc)?.totalProbabilityPercent ?: 5.0f
                                     val isAlm = chosenNode?.let { it.lastKnownAlarm || it.firmwareState == FirmwareState.ALARM || prob >= 75f } ?: false
                                     val tempC = chosenNode?.telemetry?.temperatureCelsius ?: 28.5f
                                     val rssi = chosenNode?.telemetry?.rssiDbm ?: -52
@@ -1810,7 +2695,6 @@ fun IndoorMap2DScreen(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                // 1. Add Main Door (Cửa Chính)
                                 OutlinedButton(
                                     onClick = { tempMainDoors.add(currentUserPos) },
                                     modifier = Modifier
@@ -1829,7 +2713,6 @@ fun IndoorMap2DScreen(
                                     )
                                 }
 
-                                // 2. Add Numbered Door (Cánh cửa đánh số #1, #2...)
                                 OutlinedButton(
                                     onClick = { tempDoors.add(currentUserPos) },
                                     modifier = Modifier
@@ -1855,7 +2738,6 @@ fun IndoorMap2DScreen(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(6.dp)
                             ) {
-                                // 3. Add Fire Extinguisher
                                 OutlinedButton(
                                     onClick = { tempExtinguishers.add(currentUserPos) },
                                     modifier = Modifier
@@ -1869,7 +2751,6 @@ fun IndoorMap2DScreen(
                                     Text("+ Bình CC (${tempExtinguishers.size})", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = TextPrimary)
                                 }
 
-                                // 4. Add Cửa Exit
                                 OutlinedButton(
                                     onClick = { tempExits.add(currentUserPos) },
                                     modifier = Modifier
@@ -1883,7 +2764,6 @@ fun IndoorMap2DScreen(
                                     Text("+ Cửa Exit (${tempExits.size})", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = NormalGreen)
                                 }
 
-                                // 5. Add Stairs
                                 OutlinedButton(
                                     onClick = { tempStairs.add(currentUserPos) },
                                     modifier = Modifier
@@ -1902,25 +2782,32 @@ fun IndoorMap2DScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Save All & Finish Map Button
                     Button(
                         onClick = {
                             userManuallyClearedToBlindRoom = false
                             if (placedSensorPins.isEmpty() && nodes.isNotEmpty()) {
                                 val firstNode = nodes.first()
+                                val defaultAnchorPos = clampPointIntoPolygonBounds(Point2D(0.45f, 0.35f), activeFloorplanPolygon)
                                 placedSensorPins.add(
                                     PlacedSensorPin(
                                         deviceId = firstNode.deviceId,
                                         displayName = firstNode.displayName,
-                                        position = Point2D(0.35f, 0.32f),
+                                        position = defaultAnchorPos,
                                         isAlarm = firstNode.lastKnownAlarm,
                                         temperatureCelsius = firstNode.telemetry.temperatureCelsius,
-                                        fireProbabilityPercent = firstNode.telemetry.calculateFireProbability().totalProbabilityPercent,
+                                        fireProbabilityPercent = firstNode.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent,
                                         rssiDbm = firstNode.telemetry.rssiDbm,
                                         isReferenceAnchor = true
                                     )
                                 )
-                                onBindSensorPosition(firstNode.deviceId, 0.35f, 0.32f)
+                                onBindSensorPosition(firstNode.deviceId, defaultAnchorPos.x, defaultAnchorPos.y)
+                            }
+                            // Persist all pinned sensor positions to Room DB
+                            placedSensorPins.forEach { pin ->
+                                onBindSensorPosition(pin.deviceId, pin.position.x, pin.position.y)
+                            }
+                            if (regionPolygonPoints.size >= 3) {
+                                onSaveBoundaryPolygon(floorId, regionPolygonPoints.toList(), houseWidthMeters, houseLengthMeters)
                             }
                             onSaveScannedSetup(
                                 placedSensorPins.map { it.position },
@@ -2034,26 +2921,54 @@ fun IndoorMap2DScreen(
                     }
                 }
 
-                OutlinedButton(
-                    onClick = { routeToExitDoor() },
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(36.dp)
-                        .testTag("btn_route_exit_door"),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        containerColor = NormalGreenBackground,
-                        contentColor = NormalGreen
-                    )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Icon(Icons.Default.ExitToApp, contentDescription = null, tint = NormalGreen, modifier = Modifier.size(16.dp))
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        text = "DẪN TỚI CỬA CHÍNH / CỬA EXIT THOÁT HIỂM (${tempMainDoors.size} Cửa Chính · ${tempExits.size} Exit)",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        color = NormalGreen
-                    )
+                    Button(
+                        onClick = { routeTwoStageExtinguisherToFire(null) },
+                        modifier = Modifier
+                            .weight(1.1f)
+                            .height(38.dp)
+                            .testTag("btn_route_two_stage_ext_to_fire"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED))
+                    ) {
+                        Icon(Icons.Default.FireExtinguisher, contentDescription = null, tint = Color.White, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "2 Chặng: Bình CC ➔ Lửa",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = Color.White,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = { routeToExitDoor() },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(38.dp)
+                            .testTag("btn_route_exit_door"),
+                        shape = RoundedCornerShape(12.dp),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = NormalGreenBackground,
+                            contentColor = NormalGreen
+                        )
+                    ) {
+                        Icon(Icons.Default.ExitToApp, contentDescription = null, tint = NormalGreen, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Thoát Hiểm (${tempMainDoors.size + tempExits.size} Cửa)",
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.ExtraBold,
+                            color = NormalGreen,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
         }
@@ -2061,55 +2976,423 @@ fun IndoorMap2DScreen(
 }
 
 /**
- * Interactive Google Maps / Satellite & Street Map WebView for Step 1 Region Selection (Khoanh vùng khu vực).
+ * Ray-casting point-in-polygon check + projection to keep points inside the user's khoanh vùng polygon.
  */
-@SuppressLint("SetJavaScriptEnabled")
+private fun isPointInPolygon(pt: Point2D, polygon: List<Point2D>): Boolean {
+    if (polygon.size < 3) return true
+    var inside = false
+    var j = polygon.lastIndex
+    for (i in polygon.indices) {
+        val xi = polygon[i].x
+        val yi = polygon[i].y
+        val xj = polygon[j].x
+        val yj = polygon[j].y
+        val intersect = ((yi > pt.y) != (yj > pt.y)) &&
+            (pt.x < (xj - xi) * (pt.y - yi) / ((yj - yi).takeIf { abs(it) > 0.00001f } ?: 0.00001f) + xi)
+        if (intersect) inside = !inside
+        j = i
+    }
+    return inside
+}
+
+private fun clampPointIntoPolygonBounds(pt: Point2D, polygon: List<Point2D>): Point2D {
+    if (polygon.size < 3 || isPointInPolygon(pt, polygon)) {
+        return Point2D(pt.x.coerceIn(0.06f, 0.94f), pt.y.coerceIn(0.06f, 0.94f))
+    }
+    // Pull point slightly toward the polygon centroid until inside
+    val cx = polygon.map { it.x }.average().toFloat()
+    val cy = polygon.map { it.y }.average().toFloat()
+    for (step in 1..10) {
+        val t = step / 10f
+        val candidate = Point2D(
+            x = pt.x + (cx - pt.x) * t,
+            y = pt.y + (cy - pt.y) * t
+        )
+        if (isPointInPolygon(candidate, polygon)) {
+            return candidate
+        }
+    }
+    return Point2D(cx, cy)
+}
+
+/**
+ * Interactive Top-Down Google Maps (Hybrid Satellite + Labels / Satellite / Roadmap) Alignment WebView.
+ * Pins polygon corners as true geographic GeoLatLng points directly inside Leaflet so vertices stay
+ * locked onto the exact roof corners while panning/zooming, with automatic Esri/OSM fallback and
+ * renderer crash protection (software layer + onRenderProcessGone).
+ */
+@SuppressLint("SetJavaScriptEnabled", "JavascriptInterface")
 @Composable
-private fun GoogleMapsTileWebView(
-    latitude: Double,
-    longitude: Double,
+private fun GoogleMapsAlignWebView(
+    initialLat: Double,
+    initialLng: Double,
+    flyToTrigger: Int,
+    flyToLat: Double,
+    flyToLng: Double,
+    flyToZoom: Float,
+    gpsLat: Double,
+    gpsLng: Double,
+    layerType: GoogleMapLayerType,
+    tapToPinEnabled: Boolean,
+    geoPoints: List<GeoLatLng>,
+    onCenterMoved: (Double, Double) -> Unit,
+    onMapTappedAddPoint: (Double, Double) -> Unit,
+    onPointDragged: (Int, Double, Double) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    val htmlContent = remember(latitude, longitude) {
+    var renderProcessCrashed by remember { mutableStateOf(false) }
+    var webViewInstance by remember { mutableStateOf<WebView?>(null) }
+    var lastFlyTrigger by remember { mutableIntStateOf(flyToTrigger) }
+    var lastLayerCode by remember { mutableStateOf(layerType.lyrsCode) }
+    var lastPointsSignature by remember { mutableStateOf("") }
+    var lastTapEnabled by remember { mutableStateOf(tapToPinEnabled) }
+    val uiScope = rememberCoroutineScope()
+
+    val bridge = remember {
+        object {
+            @JavascriptInterface
+            fun onCenterChanged(lat: Double, lng: Double) {
+                uiScope.launch { onCenterMoved(lat, lng) }
+            }
+
+            @JavascriptInterface
+            fun onMapClicked(lat: Double, lng: Double) {
+                uiScope.launch { onMapTappedAddPoint(lat, lng) }
+            }
+
+            @JavascriptInterface
+            fun onVertexDragged(index: Int, lat: Double, lng: Double) {
+                uiScope.launch { onPointDragged(index, lat, lng) }
+            }
+        }
+    }
+
+    val initialHtmlContent = remember {
         """
         <!DOCTYPE html>
         <html>
         <head>
             <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+            <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+            <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
             <style>
-                html, body, #map { margin: 0; padding: 0; width: 100%; height: 100%; background: #e2e8f0; font-family: sans-serif; }
-                .badge {
-                    position: absolute; bottom: 6px; left: 8px; z-index: 999;
-                    background: rgba(15, 23, 42, 0.82); color: #fff; padding: 4px 8px;
-                    border-radius: 6px; font-size: 11px; font-weight: bold; pointer-events: none;
+                html, body, #map { margin: 0; padding: 0; width: 100%; height: 100%; background: #cbd5e1; font-family: sans-serif; }
+                .vertex-pin {
+                    width: 26px; height: 26px; border-radius: 50%;
+                    background: #2563eb; border: 2.5px solid #ffffff;
+                    color: #ffffff; font-size: 10px; font-weight: 800;
+                    display: flex; align-items: center; justify-content: center;
+                    box-shadow: 0 2px 6px rgba(0,0,0,0.45);
+                }
+                .vertex-pin.first { background: #dc2626; }
+                .edge-label {
+                    background: rgba(15, 23, 42, 0.88); color: #ffffff;
+                    border: none; border-radius: 4px; padding: 1px 5px;
+                    font-size: 10px; font-weight: bold; box-shadow: none;
                 }
             </style>
         </head>
         <body>
-            <div class="badge">Google Maps GPS: ${String.format(Locale.US, "%.5f, %.5f", latitude, longitude)}</div>
-            <iframe
-                width="100%"
-                height="100%"
-                frameborder="0"
-                style="border:0; pointer-events:none;"
-                src="https://maps.google.com/maps?q=$latitude,$longitude&t=k&z=19&ie=UTF8&iwloc=&output=embed">
-            </iframe>
+            <div id="map"></div>
+            <script>
+                window.__smartFireMap = null;
+                window.__smartFireTileLayer = null;
+                window.__smartFireFallbackAdded = false;
+                window.__smartFireGpsMarker = null;
+                window.__smartFirePolygon = null;
+                window.__smartFireMarkers = [];
+                window.__smartFireEdgeLabels = [];
+                window.__tapToPinEnabled = ${if (tapToPinEnabled) "true" else "false"};
+
+                function __googleTileUrl(lyrs) {
+                    return 'https://mt1.google.com/vt/lyrs=' + lyrs + '&hl=vi&x={x}&y={y}&z={z}';
+                }
+
+                window.__setMapLayer = function(lyrs) {
+                    if (!window.__smartFireMap || typeof L === 'undefined') return;
+                    if (window.__smartFireTileLayer) {
+                        window.__smartFireMap.removeLayer(window.__smartFireTileLayer);
+                    }
+                    var tileLayer = L.tileLayer(__googleTileUrl(lyrs), {
+                        maxNativeZoom: 21,
+                        maxZoom: 22,
+                        updateWhenIdle: true,
+                        keepBuffer: 1
+                    });
+                    tileLayer.on('tileerror', function() {
+                        if (!window.__smartFireFallbackAdded && window.__smartFireMap) {
+                            window.__smartFireFallbackAdded = true;
+                            L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+                                maxNativeZoom: 18, maxZoom: 21, updateWhenIdle: true, keepBuffer: 1
+                            }).addTo(window.__smartFireMap);
+                        }
+                    });
+                    tileLayer.addTo(window.__smartFireMap);
+                    window.__smartFireTileLayer = tileLayer;
+                };
+
+                function __haversineM(a, b) {
+                    var R = 6371000;
+                    var dLat = (b[0] - a[0]) * Math.PI / 180;
+                    var dLng = (b[1] - a[1]) * Math.PI / 180;
+                    var s1 = Math.sin(dLat / 2), s2 = Math.sin(dLng / 2);
+                    var h = s1 * s1 + Math.cos(a[0] * Math.PI / 180) * Math.cos(b[0] * Math.PI / 180) * s2 * s2;
+                    return 2 * R * Math.atan2(Math.sqrt(h), Math.sqrt(Math.max(0, 1 - h)));
+                }
+
+                window.__syncPolygon = function(pts) {
+                    if (!window.__smartFireMap || typeof L === 'undefined') return;
+                    var map = window.__smartFireMap;
+
+                    for (var i = 0; i < window.__smartFireMarkers.length; i++) {
+                        map.removeLayer(window.__smartFireMarkers[i]);
+                    }
+                    window.__smartFireMarkers = [];
+
+                    for (var k = 0; k < window.__smartFireEdgeLabels.length; k++) {
+                        map.removeLayer(window.__smartFireEdgeLabels[k]);
+                    }
+                    window.__smartFireEdgeLabels = [];
+
+                    if (window.__smartFirePolygon) {
+                        map.removeLayer(window.__smartFirePolygon);
+                        window.__smartFirePolygon = null;
+                    }
+
+                    if (!pts || pts.length === 0) return;
+
+                    if (pts.length >= 3) {
+                        window.__smartFirePolygon = L.polygon(pts, {
+                            color: '#059669',
+                            weight: 3.5,
+                            fillColor: '#10b981',
+                            fillOpacity: 0.28
+                        }).addTo(map);
+                    } else if (pts.length === 2) {
+                        window.__smartFirePolygon = L.polyline(pts, {
+                            color: '#2563eb',
+                            weight: 3.5
+                        }).addTo(map);
+                    }
+
+                    var edgeCount = pts.length >= 3 ? pts.length : pts.length - 1;
+                    for (var e = 0; e < edgeCount; e++) {
+                        var p1 = pts[e];
+                        var p2 = pts[(e + 1) % pts.length];
+                        var mid = [(p1[0] + p2[0]) / 2, (p1[1] + p2[1]) / 2];
+                        var distM = __haversineM(p1, p2);
+                        var lbl = L.tooltip({
+                            permanent: true,
+                            direction: 'center',
+                            className: 'edge-label'
+                        }).setLatLng(mid).setContent(distM.toFixed(1) + 'm').addTo(map);
+                        window.__smartFireEdgeLabels.push(lbl);
+                    }
+
+                    pts.forEach(function(pt, idx) {
+                        var icon = L.divIcon({
+                            className: '',
+                            html: '<div class="vertex-pin ' + (idx === 0 ? 'first' : '') + '">Đ' + (idx + 1) + '</div>',
+                            iconSize: [26, 26],
+                            iconAnchor: [13, 13]
+                        });
+                        var m = L.marker(pt, { icon: icon, draggable: true }).addTo(map);
+                        m.on('dragend', function(ev) {
+                            var pos = ev.target.getLatLng();
+                            if (window.AndroidMapBridge) {
+                                window.AndroidMapBridge.onVertexDragged(idx, pos.lat, pos.lng);
+                            }
+                        });
+                        window.__smartFireMarkers.push(m);
+                    });
+                };
+
+                try {
+                    if (typeof L !== 'undefined') {
+                        var map = L.map('map', {
+                            zoomControl: true,
+                            attributionControl: false,
+                            preferCanvas: true,
+                            fadeAnimation: false,
+                            zoomAnimation: false,
+                            markerZoomAnimation: false
+                        }).setView([$initialLat, $initialLng], 20);
+
+                        window.__smartFireMap = map;
+                        window.__setMapLayer('${layerType.lyrsCode}');
+
+                        window.__smartFireGpsMarker = L.circleMarker([$gpsLat, $gpsLng], {
+                            radius: 6,
+                            fillColor: '#2563eb',
+                            color: '#ffffff',
+                            weight: 2,
+                            fillOpacity: 0.9
+                        }).addTo(map);
+
+                        map.on('move', function() {
+                            var c = map.getCenter();
+                            if (window.AndroidMapBridge) {
+                                window.AndroidMapBridge.onCenterChanged(c.lat, c.lng);
+                            }
+                        });
+
+                        map.on('click', function(ev) {
+                            if (window.__tapToPinEnabled && window.AndroidMapBridge) {
+                                window.AndroidMapBridge.onMapClicked(ev.latlng.lat, ev.latlng.lng);
+                            }
+                        });
+                    }
+                } catch (e) {
+                    console.warn('GoogleMapsAlignWebView init error:', e);
+                }
+            </script>
         </body>
         </html>
         """.trimIndent()
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            webViewInstance?.let { wv ->
+                try {
+                    wv.stopLoading()
+                    wv.loadUrl("about:blank")
+                    wv.onPause()
+                    wv.removeAllViews()
+                    (wv.parent as? ViewGroup)?.removeView(wv)
+                    wv.destroy()
+                } catch (_: Throwable) {}
+            }
+            webViewInstance = null
+        }
+    }
+
+    if (renderProcessCrashed) {
+        Box(
+            modifier = modifier.background(Color(0xFFCBD5E1)),
+            contentAlignment = Alignment.BottomStart
+        ) {
+            Row(
+                modifier = Modifier
+                    .padding(8.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0xFF0F172A).copy(alpha = 0.88f))
+                    .clickable { renderProcessCrashed = false }
+                    .padding(horizontal = 10.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Bản đồ nền an toàn (Chạm tải lại Google Maps)",
+                    color = Color.White,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+        return
     }
 
     AndroidView(
         modifier = modifier,
         factory = { ctx ->
             WebView(ctx).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT
+                )
+                setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    setRendererPriorityPolicy(WebView.RENDERER_PRIORITY_BOUND, true)
+                }
                 settings.javaScriptEnabled = true
                 settings.domStorageEnabled = true
                 settings.cacheMode = WebSettings.LOAD_DEFAULT
-                webViewClient = WebViewClient()
-                isClickable = false
-                isFocusable = false
-                loadDataWithBaseURL("https://maps.google.com", htmlContent, "text/html", "UTF-8", null)
+                settings.mixedContentMode = WebSettings.MIXED_CONTENT_COMPATIBILITY_MODE
+                addJavascriptInterface(bridge, "AndroidMapBridge")
+                webViewClient = object : WebViewClient() {
+                    override fun onPageFinished(view: WebView?, url: String?) {
+                        super.onPageFinished(view, url)
+                        val ptsJson = geoPoints.joinToString(
+                            prefix = "[",
+                            postfix = "]",
+                            separator = ","
+                        ) { pt -> String.format(Locale.US, "[%.7f,%.7f]", pt.lat, pt.lng) }
+                        view?.evaluateJavascript(
+                            "if(window.__syncPolygon){window.__syncPolygon($ptsJson);}",
+                            null
+                        )
+                    }
+
+                    override fun onRenderProcessGone(
+                        view: WebView?,
+                        detail: RenderProcessGoneDetail?
+                    ): Boolean {
+                        renderProcessCrashed = true
+                        try {
+                            view?.stopLoading()
+                            (view?.parent as? ViewGroup)?.removeView(view)
+                            view?.destroy()
+                        } catch (_: Throwable) {}
+                        webViewInstance = null
+                        return true
+                    }
+                }
+                loadDataWithBaseURL("https://unpkg.com", initialHtmlContent, "text/html", "UTF-8", null)
+                webViewInstance = this
+            }
+        },
+        update = { webView ->
+            if (lastTapEnabled != tapToPinEnabled) {
+                lastTapEnabled = tapToPinEnabled
+                webView.evaluateJavascript(
+                    "window.__tapToPinEnabled=${if (tapToPinEnabled) "true" else "false"};",
+                    null
+                )
+            }
+            if (lastLayerCode != layerType.lyrsCode) {
+                lastLayerCode = layerType.lyrsCode
+                webView.evaluateJavascript(
+                    "if(window.__setMapLayer){window.__setMapLayer('${layerType.lyrsCode}');}",
+                    null
+                )
+            }
+            if (lastFlyTrigger != flyToTrigger) {
+                lastFlyTrigger = flyToTrigger
+                val flyJs = String.format(
+                    Locale.US,
+                    "if(window.__smartFireMap){window.__smartFireMap.setView([%.7f,%.7f],%.1f,{animate:false});}",
+                    flyToLat,
+                    flyToLng,
+                    flyToZoom
+                )
+                webView.evaluateJavascript(flyJs, null)
+            }
+
+            val ptsJson = geoPoints.joinToString(
+                prefix = "[",
+                postfix = "]",
+                separator = ","
+            ) { pt -> String.format(Locale.US, "[%.7f,%.7f]", pt.lat, pt.lng) }
+            if (lastPointsSignature != ptsJson) {
+                lastPointsSignature = ptsJson
+                webView.evaluateJavascript(
+                    "if(window.__syncPolygon){window.__syncPolygon($ptsJson);}",
+                    null
+                )
+            }
+        },
+        onRelease = { webView ->
+            try {
+                webView.removeJavascriptInterface("AndroidMapBridge")
+                webView.stopLoading()
+                webView.loadUrl("about:blank")
+                webView.onPause()
+                webView.removeAllViews()
+                (webView.parent as? ViewGroup)?.removeView(webView)
+                webView.destroy()
+            } catch (_: Throwable) {}
+            if (webViewInstance === webView) {
+                webViewInstance = null
             }
         }
     )
@@ -2127,7 +3410,6 @@ private fun DrawScope.drawExpandingFireSpreadCircle(
 ) {
     val areaM2 = (PI * spreadRadiusMeters * spreadRadiusMeters).toFloat()
 
-    // Outer smoke & heat hazard halo
     drawCircle(
         color = Color(0xFFF97316).copy(alpha = 0.16f),
         radius = spreadRadiusPx * 1.22f,
@@ -2143,7 +3425,6 @@ private fun DrawScope.drawExpandingFireSpreadCircle(
         )
     )
 
-    // Main circular fire spread zone (grows as alarm rings longer)
     drawCircle(
         color = CriticalAlarmRed.copy(alpha = 0.25f),
         radius = spreadRadiusPx,
@@ -2156,14 +3437,12 @@ private fun DrawScope.drawExpandingFireSpreadCircle(
         style = Stroke(width = 4.5f)
     )
 
-    // Inner intense flame core ring
     drawCircle(
         color = Color(0xFFDC2626).copy(alpha = 0.35f),
         radius = spreadRadiusPx * 0.55f,
         center = center
     )
 
-    // Radial measurement line from fire center to perimeter
     val radiusEnd = Offset(center.x + spreadRadiusPx, center.y)
     drawLine(
         color = CriticalAlarmRed,
@@ -2174,7 +3453,6 @@ private fun DrawScope.drawExpandingFireSpreadCircle(
     )
     drawCircle(color = CriticalAlarmRed, radius = 6f, center = radiusEnd)
 
-    // Label showing exact Fire Spread Radius (m), Area (m2), and Elapsed Time (s)
     drawLabelPill(
         center = Offset(center.x, center.y + spreadRadiusPx + 22f),
         text = String.format(
@@ -2188,15 +3466,10 @@ private fun DrawScope.drawExpandingFireSpreadCircle(
     )
 }
 
-/**
- * Draws a Numbered Door Symbol with a prominent door number badge (#1, #2, #3...) right on the door.
- */
 private fun DrawScope.drawNumberedDoorSymbol(center: Offset, doorNumber: Int) {
-    // High-contrast circular door icon
     drawCircle(color = Color(0xFFFEF3C7), radius = 27f, center = center)
     drawCircle(color = Color(0xFFD97706), radius = 27f, center = center, style = Stroke(width = 3.8f))
 
-    // Door jamb posts
     drawRect(
         color = Color(0xFF92400E),
         topLeft = Offset(center.x - 15f, center.y - 4f),
@@ -2207,7 +3480,6 @@ private fun DrawScope.drawNumberedDoorSymbol(center: Offset, doorNumber: Int) {
         topLeft = Offset(center.x + 9f, center.y - 4f),
         size = Size(6f, 8f)
     )
-    // Open door leaf
     drawLine(
         color = Color(0xFFB45309),
         start = Offset(center.x - 10f, center.y + 2f),
@@ -2215,7 +3487,6 @@ private fun DrawScope.drawNumberedDoorSymbol(center: Offset, doorNumber: Int) {
         strokeWidth = 4.5f,
         cap = StrokeCap.Round
     )
-    // Swing arc
     drawArc(
         color = Color(0xFFD97706),
         startAngle = 290f,
@@ -2226,7 +3497,6 @@ private fun DrawScope.drawNumberedDoorSymbol(center: Offset, doorNumber: Int) {
         style = Stroke(width = 2.5f, pathEffect = PathEffect.dashPathEffect(floatArrayOf(5f, 4f), 0f))
     )
 
-    // Prominent Number Badge on top-right of the door symbol (#1, #2, #3...)
     val badgeCenter = Offset(center.x + 19f, center.y - 19f)
     drawCircle(color = Color.White, radius = 14f, center = badgeCenter)
     drawCircle(color = Color(0xFFB45309), radius = 12f, center = badgeCenter)
@@ -2251,9 +3521,6 @@ private fun DrawScope.drawNumberedDoorSymbol(center: Offset, doorNumber: Int) {
     )
 }
 
-/**
- * Draws a Main Entrance Door Symbol (CỬA CHÍNH #1) with double-leaf architectural swing.
- */
 private fun DrawScope.drawMainDoorSymbol(center: Offset, mainDoorNumber: Int) {
     drawRoundRect(
         color = Color(0xFFEDE9FE),
@@ -2269,7 +3536,6 @@ private fun DrawScope.drawMainDoorSymbol(center: Offset, mainDoorNumber: Int) {
         style = Stroke(width = 4f)
     )
 
-    // Double door leaves
     drawLine(
         color = Color(0xFF5B21B6),
         start = Offset(center.x - 20f, center.y + 6f),
@@ -2359,7 +3625,7 @@ private fun DrawScope.drawGoogleMapsUnderlay(
         isAntiAlias = true
     }
     drawContext.canvas.nativeCanvas.drawText(
-        String.format(Locale.US, "Google Maps GPS: %.5f, %.5f", gpsLat, gpsLng),
+        String.format(Locale.US, "GPS: %.5f, %.5f", gpsLat, gpsLng),
         size.width - 18f,
         size.height - 14f,
         gpsPaint

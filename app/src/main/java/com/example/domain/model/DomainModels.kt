@@ -45,6 +45,7 @@ enum class MapNavigationTargetType {
     NEAREST_FIRE_SENSOR,
     SPECIFIC_FIRE_SENSOR,
     NEAREST_EXTINGUISHER,
+    TWO_STAGE_EXTINGUISHER_TO_FIRE,
     NEAREST_EXIT
 }
 
@@ -52,6 +53,14 @@ data class MapNavigationRequest(
     val targetType: MapNavigationTargetType,
     val targetDeviceId: String? = null,
     val timestamp: Long = System.currentTimeMillis()
+)
+
+data class SensorSnapshotPoint(
+    val deviceId: String,
+    val timestamp: Long,
+    val gasRaw: Int,
+    val temperatureCelsius: Float,
+    val fireProbabilityPercent: Float
 )
 
 /**
@@ -98,16 +107,24 @@ data class SmartFireTelemetry(
 ) {
     /**
      * Tính toán xác suất cháy tổng hợp P(Fire) dựa trên mô hình kết hợp xác suất đa thông số
-     * (Weighted Logistic / Bayesian Multi-Parameter Sensor Fusion).
+     * (Weighted Logistic / Bayesian Multi-Parameter Sensor Fusion), đồng bộ với ngưỡng gasThresholdAdc.
      */
-    fun calculateFireProbability(): FireProbabilityBreakdown {
+    fun calculateFireProbability(gasThresholdAdc: Int = 1800): FireProbabilityBreakdown {
         // 1. Chuẩn hóa điểm Nhiệt độ & Tốc độ tăng nhiệt RoR [0..1]
         val tempNorm = ((temperatureCelsius - 26f) / 48f).coerceIn(0f, 1f)
         val rorNorm = (tempRateOfRiseCPerMin / 12f).coerceIn(0f, 1f)
         val thermalScore = (0.72f * tempNorm + 0.28f * rorNorm).coerceIn(0f, 1f)
 
-        // 2. Chuẩn hóa điểm Mật độ Khói & Gas MQ-2 [0..1]
-        val smokeScore = ((gasRaw - 650f) / 1850f).coerceIn(0f, 1f)
+        // 2. Chuẩn hóa điểm Mật độ Khói & Gas MQ-2 [0..1] theo ngưỡng cài đặt gasThresholdAdc
+        val effectiveThreshold = gasThresholdAdc.coerceIn(1000, 3200).toFloat()
+        val baselineGas = 550f
+        val span = (effectiveThreshold - baselineGas).coerceAtLeast(450f) * 1.25f
+        val rawSmokeNorm = ((gasRaw - baselineGas) / span).coerceIn(0f, 1f)
+        val smokeScore = if (gasRaw >= effectiveThreshold) {
+            maxOf(rawSmokeNorm, 0.78f)
+        } else {
+            rawSmokeNorm
+        }
 
         // 3. Chuẩn hóa điểm Nồng độ Khí CO (ppm) [0..1]
         val coScore = ((coPpm - 10f) / 160f).coerceIn(0f, 1f)
@@ -136,12 +153,14 @@ data class SmartFireTelemetry(
             humidityDropScore > 0.45f
         ).count { it }
 
+        val thresholdExceededBoost = if (gasRaw >= effectiveThreshold && (thermalScore > 0.35f || effectiveIr > 0.35f)) 0.12f else 0f
+
         val synergyBoost = when {
             highFactorCount >= 4 -> 0.22f
             highFactorCount == 3 -> 0.14f
             highFactorCount == 2 -> 0.07f
             else -> 0f
-        }
+        } + thresholdExceededBoost
 
         // Hàm Logistic Sigmoid chuyển đổi sang xác suất P(Cháy) %
         val z = ((weightedLinear + synergyBoost) - 0.42f) * 8.5f

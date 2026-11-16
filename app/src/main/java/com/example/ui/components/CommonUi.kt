@@ -86,31 +86,31 @@ fun FirmwareStateBadge(
     val (label, bgColor, borderColor, textColor, icon) = when {
         connectionState == DeviceConnectionState.OFFLINE -> {
             if (firmwareState == FirmwareState.ALARM) {
-                listOf("ALARM (MẤT KẾT NỐI)", CriticalAlarmBackground, CriticalAlarmBorder, CriticalAlarmRed, Icons.Default.Warning)
+                listOf("CHÁY (OFFLINE)", CriticalAlarmBackground, CriticalAlarmBorder, CriticalAlarmRed, Icons.Default.Warning)
             } else {
-                listOf("MẤT KẾT NỐI (OFFLINE)", OfflineBackground, LightBorder, OfflineGray, Icons.Default.Info)
+                listOf("OFFLINE", OfflineBackground, LightBorder, OfflineGray, Icons.Default.Info)
             }
         }
         connectionState == DeviceConnectionState.STALE -> {
-            listOf("CHẬM CẬP NHẬT", WarningBackground, WarningBorder, WarningAmber, Icons.Default.Info)
+            listOf("CHẬM", WarningBackground, WarningBorder, WarningAmber, Icons.Default.Info)
         }
         firmwareState == FirmwareState.ALARM -> {
-            listOf("BÁO ĐỘNG CHÁY!", CriticalAlarmBackground, CriticalAlarmBorder, CriticalAlarmRed, Icons.Default.Warning)
+            listOf("BÁO CHÁY!", CriticalAlarmBackground, CriticalAlarmBorder, CriticalAlarmRed, Icons.Default.Warning)
         }
         firmwareState == FirmwareState.SUSPECTED -> {
-            listOf("NGHI NGỜ NGUY HIỂM", WarningBackground, WarningBorder, WarningAmber, Icons.Default.Warning)
+            listOf("NGHI NGỜ", WarningBackground, WarningBorder, WarningAmber, Icons.Default.Warning)
         }
         firmwareState == FirmwareState.WARMING -> {
-            listOf("ĐANG SẤY NÓNG", WarmingPurpleLight, WarmingPurple.copy(alpha = 0.4f), WarmingPurple, Icons.Default.Sensors)
+            listOf("SẤY NÓNG", WarmingPurpleLight, WarmingPurple.copy(alpha = 0.4f), WarmingPurple, Icons.Default.Sensors)
         }
         firmwareState == FirmwareState.UNCONFIGURED -> {
             listOf("CHƯA CẤU HÌNH", OfflineBackground, LightBorder, OfflineGray, Icons.Default.Info)
         }
         firmwareState == FirmwareState.NORMAL -> {
-            listOf("AN TOÀN BÌNH THƯỜNG", NormalGreenBackground, NormalGreenBorder, NormalGreen, Icons.Default.CheckCircle)
+            listOf("AN TOÀN", NormalGreenBackground, NormalGreenBorder, NormalGreen, Icons.Default.CheckCircle)
         }
         else -> {
-            listOf("CHƯA XÁC MINH", OfflineBackground, LightBorder, OfflineGray, Icons.Default.Info)
+            listOf("CHỜ", OfflineBackground, LightBorder, OfflineGray, Icons.Default.Info)
         }
     }
 
@@ -119,20 +119,21 @@ fun FirmwareStateBadge(
             .clip(RoundedCornerShape(8.dp))
             .background(bgColor as Color)
             .border(1.dp, borderColor as Color, RoundedCornerShape(8.dp))
-            .padding(horizontal = 9.dp, vertical = 5.dp),
+            .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
         Icon(
             imageVector = icon as androidx.compose.ui.graphics.vector.ImageVector,
             contentDescription = null,
             tint = textColor as Color,
-            modifier = Modifier.size(13.dp)
+            modifier = Modifier.size(12.dp)
         )
-        Spacer(modifier = Modifier.width(5.dp))
+        Spacer(modifier = Modifier.width(4.dp))
         Text(
             text = label as String,
             color = textColor,
-            fontSize = 11.sp,
+            fontSize = 10.sp,
+            maxLines = 1,
             fontWeight = FontWeight.Bold
         )
     }

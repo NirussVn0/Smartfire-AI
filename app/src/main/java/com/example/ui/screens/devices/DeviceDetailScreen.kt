@@ -21,6 +21,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.NotificationsOff
 import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material.icons.filled.Warning
@@ -59,11 +60,13 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.repository.SmartFireRepository
+import com.example.domain.model.AiInsight
 import com.example.domain.model.CommandStatus
 import com.example.domain.model.DeviceConnectionState
 import com.example.domain.model.DeviceEvent
 import com.example.domain.model.FirmwareState
 import com.example.domain.model.RoomSpace
+import com.example.domain.model.SensorSnapshotPoint
 import com.example.domain.model.SmartFireNode
 import com.example.ui.components.ChartPoint
 import com.example.ui.components.FirmwareStateBadge
@@ -98,6 +101,12 @@ fun DeviceDetailScreen(
     val allDevices by repository.allDevices.collectAsState(initial = emptyList())
     val node = allDevices.find { it.deviceId == deviceId }
     val deviceEvents by repository.getEventsForDevice(deviceId).collectAsState(initial = emptyList())
+    val deviceSnapshots by repository.getDeviceSnapshots(deviceId).collectAsState(initial = emptyList())
+    val gasThresholdAdc by repository.gasThresholdAdc.collectAsState()
+    val allInsights by repository.allInsights.collectAsState(initial = emptyList())
+    val deviceInsights = remember(allInsights, deviceId) {
+        allInsights.filter { it.deviceId == deviceId || it.deviceId == null }.take(5)
+    }
 
     var selectedTabIndex by remember { mutableIntStateOf(0) }
     val tabTitles = listOf("Tổng quan", "Biểu đồ & Khí", "Báo động & Còi", "Lịch sử", "Cài đặt")
@@ -188,8 +197,13 @@ fun DeviceDetailScreen(
                 .padding(16.dp)
         ) {
             when (selectedTabIndex) {
-                0 -> OverviewTab(node)
-                1 -> SensorsTab(node)
+                0 -> OverviewTab(node, gasThresholdAdc)
+                1 -> SensorsTab(
+                    node = node,
+                    gasThresholdAdc = gasThresholdAdc,
+                    snapshots = deviceSnapshots,
+                    insights = deviceInsights
+                )
                 2 -> AlarmControlsTab(
                     node = node,
                     onAck = { scope.launch { repository.sendCommand(node.deviceId, "ack") } },
@@ -312,7 +326,8 @@ fun DeviceDetailScreen(
 }
 
 @Composable
-fun OverviewTab(node: SmartFireNode) {
+fun OverviewTab(node: SmartFireNode, gasThresholdAdc: Int = 1800) {
+    val prob = node.telemetry.calculateFireProbability(gasThresholdAdc)
     LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         item {
             Card(
@@ -327,7 +342,9 @@ fun OverviewTab(node: SmartFireNode) {
 
                     DetailRow("Gán nhãn / Tên", node.displayName)
                     DetailRow("Phân loại máy", if (node.isDemoSensor || node.displayName.contains("DEMO", ignoreCase = true)) "MÁY BÁO CHÁY DEMO [DEMO]" else "Cảm biến ESP32 Thực Tế")
+                    DetailRow("Xác suất cháy P(Cháy)", String.format(java.util.Locale.US, "%.1f%% (%s)", prob.totalProbabilityPercent, prob.riskLevelLabel))
                     DetailRow("Nhiệt độ hiện tại", String.format(java.util.Locale.US, "%.1f °C", node.telemetry.temperatureCelsius))
+                    DetailRow("Khói MQ-2 / Ngưỡng", "${node.telemetry.gasRaw} / $gasThresholdAdc ADC")
                     DetailRow("Device ID", node.deviceId)
                     DetailRow("Địa chỉ IP mạng LAN", node.ipAddress)
                     DetailRow("Thời gian hoạt động", "${node.telemetry.uptimeMs / 1000}s (${node.telemetry.uptimeMs} ms)")
@@ -349,7 +366,7 @@ fun OverviewTab(node: SmartFireNode) {
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
                         "• Cảm biến nhiệt độ môi trường: Đo nhiệt độ thực tế (°C), cảnh báo khi vượt ngưỡng 55°C.\n" +
-                                "• Cảm biến khí MQ-2: Đo giá trị analog ADC thô [0..4095].\n" +
+                                "• Cảm biến khí MQ-2: Đo giá trị analog ADC thô [0..4095], ngưỡng kích hoạt hiện tại: $gasThresholdAdc ADC.\n" +
                                 "• Cảm biến lửa: Đầu ra số (DO) quang học nhạy bức xạ hồng ngoại ngọn lửa.\n" +
                                 "• Còi 12V: Điều khiển qua MOSFET D4184 GPIO26.",
                         color = TextSecondary,
@@ -363,18 +380,30 @@ fun OverviewTab(node: SmartFireNode) {
 }
 
 @Composable
-fun SensorsTab(node: SmartFireNode) {
+fun SensorsTab(
+    node: SmartFireNode,
+    gasThresholdAdc: Int = 1800,
+    snapshots: List<SensorSnapshotPoint> = emptyList(),
+    insights: List<AiInsight> = emptyList()
+) {
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
             val now = System.currentTimeMillis()
-            val points = listOf(
-                ChartPoint(now - 60000, (node.telemetry.gasRaw * 0.90).toInt()),
-                ChartPoint(now - 45000, (node.telemetry.gasRaw * 0.94).toInt()),
-                ChartPoint(now - 30000, (node.telemetry.gasRaw * 0.97).toInt()),
-                ChartPoint(now - 15000, (node.telemetry.gasRaw * 1.01).toInt()),
-                ChartPoint(now, node.telemetry.gasRaw)
-            )
-            SensorChart(points = points, thresholdValue = 1800)
+            val points = remember(snapshots, node.telemetry.gasRaw) {
+                val sorted = snapshots.sortedBy { it.timestamp }.takeLast(16)
+                if (sorted.size >= 3) {
+                    sorted.map { ChartPoint(it.timestamp, it.gasRaw) }
+                } else {
+                    listOf(
+                        ChartPoint(now - 60000, (node.telemetry.gasRaw * 0.90).toInt()),
+                        ChartPoint(now - 45000, (node.telemetry.gasRaw * 0.94).toInt()),
+                        ChartPoint(now - 30000, (node.telemetry.gasRaw * 0.97).toInt()),
+                        ChartPoint(now - 15000, (node.telemetry.gasRaw * 1.01).toInt()),
+                        ChartPoint(now, node.telemetry.gasRaw)
+                    )
+                }
+            }
+            SensorChart(points = points, thresholdValue = gasThresholdAdc)
         }
 
         item {
@@ -388,12 +417,49 @@ fun SensorsTab(node: SmartFireNode) {
                     Text("Chi Tiết Đo Đạc Thời Gian Thực", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    DetailRow("Nhiệt độ đo được", String.format(java.util.Locale.US, "%.1f °C", node.telemetry.temperatureCelsius))
-                    DetailRow("Khí dễ cháy MQ-2", "${node.telemetry.gasRaw} ADC raw")
+                    DetailRow("Nhiệt độ đo được", String.format(java.util.Locale.US, "%.1f °C (+%.1f°C/p)", node.telemetry.temperatureCelsius, node.telemetry.tempRateOfRiseCPerMin))
+                    DetailRow("Khí dễ cháy MQ-2", "${node.telemetry.gasRaw} ADC (Ngưỡng: $gasThresholdAdc ADC)")
+                    DetailRow("Khí CO / Độ ẩm", "${node.telemetry.coPpm} ppm / ${node.telemetry.humidityPercent.toInt()}%")
                     DetailRow("Trạng thái làm nóng", if (node.telemetry.gasReady) "Sẵn sàng (gas_ready=true)" else "Đang sấy nóng")
                     DetailRow("Ngọn lửa quang học", if (node.telemetry.flame) "CÓ LỬA (DO=true)" else "Bình thường")
                     DetailRow("Lỗi cảm biến (gas_fault)", if (node.telemetry.gasFault) "PHÁT HIỆN LỖI" else "Không")
                     DetailRow("Commissioning EEPROM", if (node.telemetry.gasCommissioned) "Đã hoàn thành" else "Chưa commissioning")
+                    DetailRow("Số mẫu lịch sử trong DB", "${snapshots.size} bản ghi")
+                }
+            }
+        }
+
+        if (insights.isNotEmpty()) {
+            item {
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = LightCard),
+                    shape = RoundedCornerShape(14.dp),
+                    border = CardDefaults.outlinedCardBorder()
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text("Nhận Định Phân Tích Sớm (AI Insights)", color = PrimaryBlue, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(modifier = Modifier.height(8.dp))
+                        insights.forEach { ins ->
+                            val sevColor = when (ins.severity.uppercase()) {
+                                "CRITICAL" -> CriticalAlarmRed
+                                "WARNING" -> WarningAmber
+                                else -> PrimaryBlue
+                            }
+                            Column(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 4.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(LightSurfaceVariant)
+                                    .padding(10.dp)
+                            ) {
+                                Text(ins.title, color = sevColor, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                Text(ins.sourceMeasurements, color = TextPrimary, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
+                                Text(ins.recommendation, color = TextSecondary, fontSize = 11.sp)
+                            }
+                        }
+                    }
                 }
             }
         }

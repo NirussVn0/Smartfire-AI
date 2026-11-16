@@ -39,6 +39,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -110,29 +111,31 @@ fun AddDeviceWizardDialog(
     val bleDevices by bleManager.discoveredDevices.collectAsState()
     val bleConnectionState by bleManager.connectionState.collectAsState()
 
-    // Handle BLE Notification State Changes
-    when (val state = bleConnectionState) {
-        is BleConnectionState.ProvisioningStatus -> {
-            if (state.status == "CONNECTED") {
+    // Handle BLE Notification State Changes safely inside LaunchedEffect
+    LaunchedEffect(bleConnectionState) {
+        when (val state = bleConnectionState) {
+            is BleConnectionState.ProvisioningStatus -> {
+                if (state.status == "CONNECTED") {
+                    isSendingBleConfig = false
+                    state.ip?.let { targetIp = it }
+                    state.deviceId?.let { detectedDeviceId = it }
+                    state.token?.let { nodeToken = it }
+                    bleFeedbackMessage = "ESP32 đã kết nối Wi-Fi thành công! IP: ${state.ip ?: targetIp}"
+                } else if (state.status == "CONNECTING") {
+                    bleFeedbackMessage = "ESP32 đang kết nối vào Wi-Fi '${state.ssid ?: wifiSsid}'..."
+                }
+            }
+            is BleConnectionState.Error -> {
                 isSendingBleConfig = false
-                state.ip?.let { targetIp = it }
-                state.deviceId?.let { detectedDeviceId = it }
-                state.token?.let { nodeToken = it }
-                bleFeedbackMessage = "ESP32 đã kết nối Wi-Fi thành công! IP: ${state.ip ?: targetIp}"
-            } else if (state.status == "CONNECTING") {
-                bleFeedbackMessage = "ESP32 đang kết nối vào Wi-Fi '${state.ssid ?: wifiSsid}'..."
+                bleFeedbackMessage = state.message
             }
-        }
-        is BleConnectionState.Error -> {
-            isSendingBleConfig = false
-            bleFeedbackMessage = state.message
-        }
-        is BleConnectionState.ServicesDiscovered -> {
-            if (state.hasService) {
-                bleFeedbackMessage = "Đã kết nối BLE với ESP32! Sẵn sàng gửi Wi-Fi."
+            is BleConnectionState.ServicesDiscovered -> {
+                if (state.hasService) {
+                    bleFeedbackMessage = "Đã kết nối BLE với ESP32! Sẵn sàng gửi Wi-Fi."
+                }
             }
+            else -> {}
         }
-        else -> {}
     }
 
     Dialog(

@@ -12,10 +12,13 @@ data class NavigationRoute(
     val pathPoints: List<Point2D>,
     val totalDistanceMeters: Float,
     val targetName: String,
-    val targetType: String, // EXTINGUISHER, EXIT
+    val targetType: String, // EXTINGUISHER, EXIT, FIRE_SENSOR, TWO_STAGE
     val crossesHazardRoom: Boolean,
     val isEuclideanOnly: Boolean = false,
-    val notes: String = ""
+    val notes: String = "",
+    val stage1Points: List<Point2D> = emptyList(),
+    val stage2Points: List<Point2D> = emptyList(),
+    val avoidsFireZone: Boolean = false
 )
 
 object IndoorPathfinder {

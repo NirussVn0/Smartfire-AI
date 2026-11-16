@@ -134,6 +134,7 @@ fun FireEmergencyPopupDialog(
     soundEnabled: Boolean,
     onRouteToExtinguisher: () -> Unit,
     onRouteToNearestFireSensor: () -> Unit,
+    onRouteTwoStageExtinguisherToFire: () -> Unit = onRouteToExtinguisher,
     onSilenceAllAlarms: () -> Unit
 ) {
     val context = LocalContext.current
@@ -422,12 +423,46 @@ fun FireEmergencyPopupDialog(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
+                    // HUGE BUTTON 0: DẪN ĐƯỜNG 2 CHẶNG (LẤY BÌNH CC -> ĐÁM CHÁY)
+                    Button(
+                        onClick = onRouteTwoStageExtinguisherToFire,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(56.dp)
+                            .testTag("btn_popup_route_two_stage"),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED)),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.FireExtinguisher,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Column(horizontalAlignment = Alignment.Start) {
+                            Text(
+                                text = "LỘ TRÌNH 2 CHẶNG: LẤY BÌNH CC ➔ ĐÁM CHÁY",
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                            Text(
+                                text = "Tự động chỉ đường qua Bình CC gần nhất rồi tiến tới dập lửa",
+                                color = Color.White.copy(alpha = 0.9f),
+                                fontSize = 10.sp
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
                     // HUGE BUTTON 1: DẪN TỚI BÌNH CHỮA CHÁY (Stops siren & routes to extinguisher)
                     Button(
                         onClick = onRouteToExtinguisher,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(58.dp)
+                            .height(52.dp)
                             .testTag("btn_popup_route_extinguisher"),
                         colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
                         shape = RoundedCornerShape(14.dp)
@@ -436,14 +471,14 @@ fun FireEmergencyPopupDialog(
                             Icons.Default.FireExtinguisher,
                             contentDescription = null,
                             tint = Color.White,
-                            modifier = Modifier.size(24.dp)
+                            modifier = Modifier.size(22.dp)
                         )
                         Spacer(modifier = Modifier.width(10.dp))
                         Column(horizontalAlignment = Alignment.Start) {
                             Text(
-                                text = "DẪN TỚI BÌNH CHỮA CHÁY",
+                                text = "CHỈ DẪN TỚI BÌNH CHỮA CHÁY",
                                 color = Color.White,
-                                fontSize = 14.sp,
+                                fontSize = 13.sp,
                                 fontWeight = FontWeight.ExtraBold
                             )
                             Text(
@@ -454,14 +489,14 @@ fun FireEmergencyPopupDialog(
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     // HUGE BUTTON 2: DẪN TỚI BÁO CHÁY ĐANG CHÁY GẦN NHẤT
                     Button(
                         onClick = onRouteToNearestFireSensor,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .height(56.dp)
+                            .height(52.dp)
                             .testTag("btn_popup_route_fire_sensor"),
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEA580C)),
                         shape = RoundedCornerShape(14.dp)
@@ -470,7 +505,7 @@ fun FireEmergencyPopupDialog(
                             Icons.Default.LocalFireDepartment,
                             contentDescription = null,
                             tint = Color.White,
-                            modifier = Modifier.size(24.dp)
+                            modifier = Modifier.size(22.dp)
                         )
                         Spacer(modifier = Modifier.width(10.dp))
                         Column(horizontalAlignment = Alignment.Start) {
@@ -488,7 +523,7 @@ fun FireEmergencyPopupDialog(
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                    Spacer(modifier = Modifier.height(8.dp))
 
                     // HUGE BUTTON 3: TẮT BÁO CHÁY NGAY
                     Button(
