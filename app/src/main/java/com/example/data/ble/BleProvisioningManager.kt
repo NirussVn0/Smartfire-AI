@@ -19,6 +19,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelUuid
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -49,7 +50,6 @@ sealed interface BleConnectionState {
         val ip: String? = null,
         val deviceId: String? = null,
         val roomId: String? = null,
-        val token: String? = null,
         val ssid: String? = null
     ) : BleConnectionState
     data class Error(val message: String) : BleConnectionState
@@ -58,6 +58,7 @@ sealed interface BleConnectionState {
 class BleProvisioningManager(private val context: Context) {
 
     companion object {
+        private const val TAG = "BleProvisioningMgr"
         val SERVICE_UUID: UUID = UUID.fromString("4fafc201-1fb5-459e-8fcc-c5c9c331914b")
         val CONFIG_CHAR_UUID: UUID = UUID.fromString("beb5483e-36e1-4688-b7f5-ea07361b26a8")
         val STATUS_CHAR_UUID: UUID = UUID.fromString("1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e")
@@ -78,6 +79,7 @@ class BleProvisioningManager(private val context: Context) {
 
     private var activeGatt: BluetoothGatt? = null
     private val handler = Handler(Looper.getMainLooper())
+    private var isFallbackScanning = false
 
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
@@ -85,14 +87,14 @@ class BleProvisioningManager(private val context: Context) {
             val device = result.device ?: return
             val record = result.scanRecord
             val rawName = record?.deviceName ?: (try { device.name } catch (_: Exception) { null })
-            val name = if (!rawName.isNullOrBlank()) rawName else "ESP32 (${device.address.takeLast(5)})"
+            val name = if (!rawName.isNullOrBlank()) rawName else "SmartFire (${device.address.takeLast(5)})"
 
             val hasSmartFireService = record?.serviceUuids?.any { it.uuid == SERVICE_UUID } == true
-            val nameMatch = name.contains("SmartFire", ignoreCase = true) ||
-                    name.contains("ESP32", ignoreCase = true) ||
-                    name.contains("node", ignoreCase = true)
+            // Strict SmartFire filter: avoid matching unrelated audio devices like Bose
+            val isSmartFireName = name.startsWith("SmartFire", ignoreCase = true) ||
+                    name.contains("smartfire", ignoreCase = true)
 
-            if (hasSmartFireService || nameMatch) {
+            if (hasSmartFireService || isSmartFireName) {
                 val item = DiscoveredBleDevice(
                     name = name,
                     address = device.address,
@@ -111,6 +113,7 @@ class BleProvisioningManager(private val context: Context) {
         }
 
         override fun onScanFailed(errorCode: Int) {
+            Log.e(TAG, "Scan failed with error code: $errorCode")
             _scanState.value = BleScanState.Error("Quét BLE thất bại (Mã lỗi: $errorCode)")
         }
     }
@@ -131,6 +134,7 @@ class BleProvisioningManager(private val context: Context) {
 
         _discoveredDevices.value = emptyList()
         _scanState.value = BleScanState.Scanning
+        isFallbackScanning = false
 
         val settings = ScanSettings.Builder()
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
@@ -141,21 +145,41 @@ class BleProvisioningManager(private val context: Context) {
             .build()
 
         try {
-            // Scan with and without filter to maximize discovery rate on various Android OEM chips
+            // Stage 1: Filtered scan
             scanner.startScan(listOf(filter), settings, scanCallback)
+            Log.d(TAG, "Started filtered BLE scan for SERVICE_UUID: $SERVICE_UUID")
+
+            // Stage 2: Timed fallback after 3.5s if no devices matched the filter
+            handler.postDelayed({
+                if (_scanState.value is BleScanState.Scanning && _discoveredDevices.value.isEmpty()) {
+                    try {
+                        scanner.stopScan(scanCallback)
+                        isFallbackScanning = true
+                        Log.d(TAG, "No devices found with filter; starting unfiltered fallback scan")
+                        scanner.startScan(emptyList(), settings, scanCallback)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Fallback scan failed to start: ${e.message}")
+                    }
+                }
+            }, 3500L)
+
+            // Overall scan timeout
             handler.postDelayed({ stopScan() }, timeoutMs)
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            // Immediate fallback to unfiltered if startScan with filter throws
             try {
+                isFallbackScanning = true
                 scanner.startScan(emptyList(), settings, scanCallback)
                 handler.postDelayed({ stopScan() }, timeoutMs)
-            } catch (e: Exception) {
-                _scanState.value = BleScanState.Error("Lỗi bắt đầu quét: ${e.localizedMessage}")
+            } catch (ex: Exception) {
+                _scanState.value = BleScanState.Error("Lỗi bắt đầu quét: ${ex.localizedMessage}")
             }
         }
     }
 
     @SuppressLint("MissingPermission")
     fun stopScan() {
+        handler.removeCallbacksAndMessages(null)
         try {
             bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
         } catch (_: Exception) {}
@@ -176,10 +200,21 @@ class BleProvisioningManager(private val context: Context) {
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     _connectionState.value = BleConnectionState.Connected(deviceName)
-                    gatt.discoverServices()
+                    Log.d(TAG, "GATT connected to $deviceName, requesting MTU 512")
+                    // Negotiate MTU before service discovery for reliable payloads
+                    val requested = gatt.requestMtu(512)
+                    if (!requested) {
+                        gatt.discoverServices()
+                    }
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                    Log.d(TAG, "GATT disconnected from $deviceName")
                     _connectionState.value = BleConnectionState.Disconnected
                 }
+            }
+
+            override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                Log.d(TAG, "MTU changed to $mtu (status: $status). Discovering services...")
+                gatt.discoverServices()
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
@@ -187,6 +222,7 @@ class BleProvisioningManager(private val context: Context) {
                     val service = gatt.getService(SERVICE_UUID)
                     if (service != null) {
                         _connectionState.value = BleConnectionState.ServicesDiscovered(true)
+                        Log.d(TAG, "SmartFire GATT Service verified!")
                         // Subscribe to STATUS characteristic
                         val statusChar = service.getCharacteristic(STATUS_CHAR_UUID)
                         if (statusChar != null) {
@@ -196,16 +232,25 @@ class BleProvisioningManager(private val context: Context) {
                                 descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                                 gatt.writeDescriptor(descriptor)
                             }
-                            // Read current value
-                            handler.postDelayed({
-                                try { gatt.readCharacteristic(statusChar) } catch (_: Exception) {}
-                            }, 300)
                         }
                     } else {
-                        _connectionState.value = BleConnectionState.ServicesDiscovered(false)
+                        Log.w(TAG, "Connected device does NOT provide SmartFire SERVICE_UUID")
+                        _connectionState.value = BleConnectionState.Error("Thiết bị không chứa GATT Service của SmartFire")
+                        disconnect()
                     }
                 } else {
                     _connectionState.value = BleConnectionState.Error("Khám phá dịch vụ GATT thất bại (Status: $status)")
+                }
+            }
+
+            override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
+                if (status == BluetoothGatt.GATT_SUCCESS && descriptor.characteristic.uuid == STATUS_CHAR_UUID) {
+                    // Initial read after notification subscription is acknowledged
+                    try {
+                        gatt.readCharacteristic(descriptor.characteristic)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "Initial characteristic read error: ${e.message}")
+                    }
                 }
             }
 
@@ -258,7 +303,6 @@ class BleProvisioningManager(private val context: Context) {
             val ip = json.optString("ip", null)
             val deviceId = json.optString("device_id", null)
             val roomId = json.optString("room_id", null)
-            val token = json.optString("token", null)
             val ssid = json.optString("ssid", null)
 
             _connectionState.value = BleConnectionState.ProvisioningStatus(
@@ -266,7 +310,6 @@ class BleProvisioningManager(private val context: Context) {
                 ip = if (ip.isNullOrBlank()) null else ip,
                 deviceId = if (deviceId.isNullOrBlank()) null else deviceId,
                 roomId = if (roomId.isNullOrBlank()) null else roomId,
-                token = if (token.isNullOrBlank()) null else token,
                 ssid = if (ssid.isNullOrBlank()) null else ssid
             )
         } catch (_: Exception) {
@@ -286,6 +329,7 @@ class BleProvisioningManager(private val context: Context) {
         }.toString()
 
         val bytes = payload.toByteArray(Charsets.UTF_8)
+        Log.d(TAG, "Writing Wi-Fi config for SSID '${ssid.trim()}' (${bytes.size} bytes)")
 
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             gatt.writeCharacteristic(

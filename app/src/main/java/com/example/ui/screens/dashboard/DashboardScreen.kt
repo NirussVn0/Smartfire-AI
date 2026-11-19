@@ -164,10 +164,10 @@ fun DashboardScreen(
 
     val peakNode = nodes.maxByOrNull { it.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent }
     val maxProb = peakNode?.telemetry?.calculateFireProbability(gasThresholdAdc)?.totalProbabilityPercent ?: 3.5f
-    val maxTemp = nodes.maxOfOrNull { it.telemetry.temperatureCelsius } ?: 28.5f
+    val maxTemp = nodes.mapNotNull { it.telemetry.temperatureCelsius }.maxOrNull() ?: 28.5f
     val maxGas = nodes.maxOfOrNull { it.telemetry.gasRaw } ?: 920
-    val maxCo = nodes.maxOfOrNull { it.telemetry.coPpm } ?: 12
-    val avgHum = if (nodes.isNotEmpty()) nodes.map { it.telemetry.humidityPercent }.average().toFloat() else 60f
+    val maxCo = nodes.mapNotNull { it.telemetry.coPpm }.maxOrNull() ?: 12
+    val avgHum = if (nodes.any { it.telemetry.humidityPercent != null }) nodes.mapNotNull { it.telemetry.humidityPercent }.average().toFloat() else 60f
 
     val displayedNodes = when (activeSensorTab) {
         SensorListFilterTab.ALL -> nodes
@@ -1537,12 +1537,12 @@ fun FriendlySensorCard(
     val rssiDistanceM = node.telemetry.estimateDistanceFromRssiMeters()
 
     // Local slider state for testing multi-parameter probabilistic calculation
-    var simTemp by remember(node.telemetry.temperatureCelsius) { mutableFloatStateOf(node.telemetry.temperatureCelsius) }
-    var simRor by remember(node.telemetry.tempRateOfRiseCPerMin) { mutableFloatStateOf(node.telemetry.tempRateOfRiseCPerMin) }
+    var simTemp by remember(node.telemetry.temperatureCelsius) { mutableFloatStateOf(node.telemetry.temperatureCelsius ?: 28.5f) }
+    var simRor by remember(node.telemetry.tempRateOfRiseCPerMin) { mutableFloatStateOf(node.telemetry.tempRateOfRiseCPerMin ?: 0.4f) }
     var simGas by remember(node.telemetry.gasRaw) { mutableFloatStateOf(node.telemetry.gasRaw.toFloat()) }
-    var simCo by remember(node.telemetry.coPpm) { mutableFloatStateOf(node.telemetry.coPpm.toFloat()) }
-    var simHum by remember(node.telemetry.humidityPercent) { mutableFloatStateOf(node.telemetry.humidityPercent) }
-    var simIr by remember(node.telemetry.irFlameIntensity) { mutableFloatStateOf(node.telemetry.irFlameIntensity) }
+    var simCo by remember(node.telemetry.coPpm) { mutableFloatStateOf((node.telemetry.coPpm ?: 12).toFloat()) }
+    var simHum by remember(node.telemetry.humidityPercent) { mutableFloatStateOf(node.telemetry.humidityPercent ?: 60f) }
+    var simIr by remember(node.telemetry.irFlameIntensity) { mutableFloatStateOf(node.telemetry.irFlameIntensity ?: 0.02f) }
 
     Card(
         modifier = modifier
@@ -1700,8 +1700,8 @@ fun FriendlySensorCard(
                 ) {
                     Text("Nhiệt", color = TextSecondary, fontSize = 9.sp, maxLines = 1)
                     Text(
-                        text = String.format(Locale.US, "%.1f°C", node.telemetry.temperatureCelsius),
-                        color = if (node.telemetry.temperatureCelsius >= 50f) CriticalAlarmRed else TextPrimary,
+                        text = node.telemetry.temperatureCelsius?.let { String.format(Locale.US, "%.1f°C", it) } ?: "N/A",
+                        color = if ((node.telemetry.temperatureCelsius ?: 0f) >= 50f) CriticalAlarmRed else TextPrimary,
                         fontSize = 12.sp,
                         fontWeight = FontWeight.ExtraBold,
                         maxLines = 1
@@ -1737,9 +1737,14 @@ fun FriendlySensorCard(
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text("CO / Ẩm", color = TextSecondary, fontSize = 9.sp, maxLines = 1)
+                    val coStr = if (node.telemetry.coPpm != null && node.telemetry.humidityPercent != null) {
+                        String.format(Locale.US, "%d / %.0f%%", node.telemetry.coPpm, node.telemetry.humidityPercent)
+                    } else {
+                        "N/A"
+                    }
                     Text(
-                        text = String.format(Locale.US, "%d / %.0f%%", node.telemetry.coPpm, node.telemetry.humidityPercent),
-                        color = if (node.telemetry.coPpm > 80) CriticalAlarmRed else TextPrimary,
+                        text = coStr,
+                        color = if ((node.telemetry.coPpm ?: 0) > 80) CriticalAlarmRed else TextPrimary,
                         fontSize = 11.sp,
                         fontWeight = FontWeight.ExtraBold,
                         maxLines = 1

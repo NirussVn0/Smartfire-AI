@@ -199,7 +199,7 @@ data class PlacedSensorPin(
     val displayName: String,
     val position: Point2D,
     val isAlarm: Boolean = false,
-    val temperatureCelsius: Float = 28.5f,
+    val temperatureCelsius: Float? = null,
     val fireProbabilityPercent: Float = 5.0f,
     val rssiDbm: Int = -52,
     val alarmStartedAtMs: Long = 0L,
@@ -750,7 +750,10 @@ fun IndoorMap2DScreen(
         val chosenPin = specificPin ?: nearestAlarmingPin ?: nearestAnyPin
         val firePos = chosenPin?.position ?: Point2D(0.45f, 0.35f)
         val fireName = chosenPin?.displayName ?: "Vị trí Báo Cháy"
-        val tempStr = chosenPin?.let { String.format(Locale.US, "%.1f°C · P=%.0f%%", it.temperatureCelsius, it.fireProbabilityPercent) } ?: ""
+        val tempStr = chosenPin?.let { pin ->
+            pin.temperatureCelsius?.let { String.format(Locale.US, "%.1f°C · P=%.0f%%", it, pin.fireProbabilityPercent) }
+                ?: String.format(Locale.US, "P=%.0f%%", pin.fireProbabilityPercent)
+        } ?: ""
 
         emergencyPhase = EmergencyAutoPhase.ATTACK_FIRE_SOURCE
         activeRoute = buildDoorAwareRoute(
@@ -2185,12 +2188,16 @@ fun IndoorMap2DScreen(
                     }
 
                     val labelPrefix = if (idx == 0) "[MỐC CHUẨN #1] " else ""
-                    val tempAndProb = String.format(
-                        Locale.US,
-                        "%.1f°C · P=%.0f%%",
-                        pin.temperatureCelsius,
-                        pin.fireProbabilityPercent
-                    )
+                    val tempAndProb = if (pin.temperatureCelsius != null) {
+                        String.format(
+                            Locale.US,
+                            "%.1f°C · P=%.0f%%",
+                            pin.temperatureCelsius,
+                            pin.fireProbabilityPercent
+                        )
+                    } else {
+                        String.format(Locale.US, "P=%.0f%%", pin.fireProbabilityPercent)
+                    }
                     drawLargeFireSensorSymbol(
                         center = centerScreen,
                         label = "$labelPrefix${pin.displayName} ($tempAndProb)",

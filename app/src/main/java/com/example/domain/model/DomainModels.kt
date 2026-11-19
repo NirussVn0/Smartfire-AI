@@ -85,12 +85,12 @@ data class FireProbabilityBreakdown(
 data class SmartFireTelemetry(
     val uptimeMs: Long = 0L,
     val state: String = "NORMAL",
-    val gasRaw: Int = 920,
-    val temperatureCelsius: Float = 28.5f,
-    val tempRateOfRiseCPerMin: Float = 0.4f,
-    val coPpm: Int = 12,
-    val humidityPercent: Float = 62.0f,
-    val irFlameIntensity: Float = 0.02f, // 0.0 (no IR flame) .. 1.0 (strong IR flame)
+    val gasRaw: Int = 0,
+    val temperatureCelsius: Float? = null,
+    val tempRateOfRiseCPerMin: Float? = null,
+    val coPpm: Int? = null,
+    val humidityPercent: Float? = null,
+    val irFlameIntensity: Float? = null, // 0.0 (no IR flame) .. 1.0 (strong IR flame)
     val rssiDbm: Int = -54,              // Signal strength (dBm) for RSSI distance ranging
     val alarmStartedAtMs: Long = 0L,     // Timestamp when continuous alarm started (for circular fire spread calculation)
     val flame: Boolean = false,
@@ -105,15 +105,24 @@ data class SmartFireTelemetry(
     val gasCommissioned: Boolean = false,
     val receivedAt: Long = 0L
 ) {
+    val isTemperatureInstalled: Boolean get() = temperatureCelsius != null
+    val isCoInstalled: Boolean get() = coPpm != null
+    val isHumidityInstalled: Boolean get() = humidityPercent != null
+
     /**
      * Tính toán xác suất cháy tổng hợp P(Fire) dựa trên mô hình kết hợp xác suất đa thông số
      * (Weighted Logistic / Bayesian Multi-Parameter Sensor Fusion), đồng bộ với ngưỡng gasThresholdAdc.
+     * Khi các cảm biến phụ (Nhiệt, CO, Ẩm) chưa trang bị (null), tính toán dựa trên Cảm biến Khói/Gas + Lửa thực tế.
      */
     fun calculateFireProbability(gasThresholdAdc: Int = 1800): FireProbabilityBreakdown {
         // 1. Chuẩn hóa điểm Nhiệt độ & Tốc độ tăng nhiệt RoR [0..1]
-        val tempNorm = ((temperatureCelsius - 26f) / 48f).coerceIn(0f, 1f)
-        val rorNorm = (tempRateOfRiseCPerMin / 12f).coerceIn(0f, 1f)
-        val thermalScore = (0.72f * tempNorm + 0.28f * rorNorm).coerceIn(0f, 1f)
+        val thermalScore = if (temperatureCelsius != null) {
+            val tempNorm = ((temperatureCelsius - 26f) / 48f).coerceIn(0f, 1f)
+            val rorNorm = ((tempRateOfRiseCPerMin ?: 0.4f) / 12f).coerceIn(0f, 1f)
+            (0.72f * tempNorm + 0.28f * rorNorm).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
 
         // 2. Chuẩn hóa điểm Mật độ Khói & Gas MQ-2 [0..1] theo ngưỡng cài đặt gasThresholdAdc
         val effectiveThreshold = gasThresholdAdc.coerceIn(1000, 3200).toFloat()
@@ -127,22 +136,38 @@ data class SmartFireTelemetry(
         }
 
         // 3. Chuẩn hóa điểm Nồng độ Khí CO (ppm) [0..1]
-        val coScore = ((coPpm - 10f) / 160f).coerceIn(0f, 1f)
+        val coScore = if (coPpm != null) {
+            ((coPpm.toFloat() - 10f) / 160f).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
 
         // 4. Chuẩn hóa điểm Độ sụt giảm Độ ẩm (Khi cháy nhiệt tăng làm độ ẩm giảm mạnh từ ~65% xuống <25%) [0..1]
-        val humidityDropScore = ((65f - humidityPercent) / 42f).coerceIn(0f, 1f)
+        val humidityDropScore = if (humidityPercent != null) {
+            ((65f - humidityPercent) / 42f).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
 
         // 5. Điểm Bức xạ Hồng ngoại Ngọn lửa IR [0..1]
-        val effectiveIr = if (flame && irFlameIntensity < 0.75f) 0.88f else irFlameIntensity.coerceIn(0f, 1f)
+        val effectiveIr = if (flame) {
+            0.88f
+        } else {
+            (irFlameIntensity ?: 0f).coerceIn(0f, 1f)
+        }
 
-        // Trọng số kết hợp đa thông số:
-        // Nhiệt & RoR (28%), Khói MQ-2 (24%), Khí CO (18%), Bức xạ IR (20%), Sụt giảm độ ẩm (10%)
-        val weightedLinear =
+        // Điều chỉnh trọng số tùy theo cảm biến thực tế có sẵn:
+        val hasAuxSensors = temperatureCelsius != null || coPpm != null || humidityPercent != null
+        val weightedLinear = if (hasAuxSensors) {
             (0.28f * thermalScore) +
             (0.24f * smokeScore) +
             (0.18f * coScore) +
             (0.20f * effectiveIr) +
             (0.10f * humidityDropScore)
+        } else {
+            // Chỉ có Cảm biến Khói MQ-2 + Cảm biến Ngọn lửa Flame Sensor (phần cứng tiêu chuẩn)
+            (0.55f * smokeScore) + (0.45f * effectiveIr)
+        }
 
         // Hiệu ứng cộng hưởng xác suất (Synergy bonus khi nhiều thông số cùng tăng cao)
         val highFactorCount = listOf(
@@ -153,9 +178,10 @@ data class SmartFireTelemetry(
             humidityDropScore > 0.45f
         ).count { it }
 
-        val thresholdExceededBoost = if (gasRaw >= effectiveThreshold && (thermalScore > 0.35f || effectiveIr > 0.35f)) 0.12f else 0f
+        val thresholdExceededBoost = if (gasRaw >= effectiveThreshold && (thermalScore > 0.35f || effectiveIr > 0.35f || flame)) 0.15f else 0f
 
         val synergyBoost = when {
+            flame && gasRaw >= effectiveThreshold -> 0.30f
             highFactorCount >= 4 -> 0.22f
             highFactorCount == 3 -> 0.14f
             highFactorCount == 2 -> 0.07f
@@ -165,7 +191,13 @@ data class SmartFireTelemetry(
         // Hàm Logistic Sigmoid chuyển đổi sang xác suất P(Cháy) %
         val z = ((weightedLinear + synergyBoost) - 0.42f) * 8.5f
         val logisticProb = (1.0f / (1.0f + exp(-z))).coerceIn(0.01f, 0.999f)
-        val totalPercent = (logisticProb * 100f).coerceIn(1.2f, 99.8f)
+        val totalPercent = if (flame && gasRaw >= effectiveThreshold) {
+            99.5f
+        } else if (flame) {
+            maxOf(85.0f, (logisticProb * 100f).coerceIn(1.2f, 99.8f))
+        } else {
+            (logisticProb * 100f).coerceIn(1.2f, 99.8f)
+        }
 
         val riskLabel = when {
             totalPercent >= 75f -> "NGUY CƠ CHÁY CỰC CAO (BÁO ĐỘNG)"

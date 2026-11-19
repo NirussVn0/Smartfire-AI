@@ -394,7 +394,7 @@ fun FireEmergencyPopupDialog(
                                     modifier = Modifier.size(18.dp)
                                 )
                                 Text(
-                                    text = String.format(Locale.US, "%.1f°C", nearestAlarmNode.telemetry.temperatureCelsius),
+                                    text = nearestAlarmNode.telemetry.temperatureCelsius?.let { String.format(Locale.US, "%.1f°C", it) } ?: "N/A",
                                     color = CriticalAlarmRed,
                                     fontSize = 20.sp,
                                     fontWeight = FontWeight.ExtraBold

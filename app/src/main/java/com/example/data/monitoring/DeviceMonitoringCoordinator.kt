@@ -121,11 +121,11 @@ class DeviceMonitoringCoordinator(
 
                     val telemetry = SmartFireTelemetry(
                         uptimeMs = status.uptimeMs,
-                        temperatureCelsius = status.temperatureCelsius ?: (if (status.alarm) 68.0f else 28.5f),
-                        humidityPercent = status.humidityPercent ?: (if (status.alarm) 32.0f else 60.0f),
-                        coPpm = status.coPpm ?: (if (status.alarm) 140 else 12),
-                        tempRateOfRiseCPerMin = status.tempRateOfRise ?: (if (status.alarm) 8.5f else 0.2f),
-                        irFlameIntensity = if (status.flame) 0.95f else 0.02f,
+                        temperatureCelsius = status.temperatureCelsius,
+                        humidityPercent = status.humidityPercent,
+                        coPpm = status.coPpm,
+                        tempRateOfRiseCPerMin = status.tempRateOfRise,
+                        irFlameIntensity = if (status.flame) 0.88f else null,
                         alarmStartedAtMs = alarmStartMs,
                         gasRaw = status.gasRaw,
                         flame = status.flame,
