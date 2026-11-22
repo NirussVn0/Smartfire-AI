@@ -1,8 +1,9 @@
 # TÀI LIỆU ĐẶC TẢ KỸ THUẬT (TECHNICAL SPECIFICATION)
 ## Dự án: SmartFire AI — Native Android IoT Control Center
+**Phiên bản:** `v1.0.1` (Cập nhật: 11/2026)  
 **Nhóm phát triển:** Sản phẩm STEM Nhóm 2, Lớp 12D3  
 **Nền tảng:** Android Native (Kotlin · Jetpack Compose · Material 3 · Room SQLite · BLE GATT · HTTP REST · Gemini AI Logic)  
-**Kiến trúc cốt lõi:** Local-first Ownership · Clean Architecture + MVVM
+**Kiến trúc cốt lõi:** Local-first Ownership · Clean Architecture + MVVM · Hardware-First Safety Invariant
 
 ---
 
@@ -14,15 +15,19 @@
 1. **Tầng Phần cứng / Firmware (SmartFire ESP32 Node):**
    - Vi điều khiển ESP32-WROOM đọc trực tiếp cảm biến khí dễ cháy **MQ-2** (GPIO34, ADC raw `gas_raw`, không tự quy đổi sang ppm nếu chưa hiệu chuẩn) và cảm biến lửa **Flame Sensor** (GPIO27, Digital Output `flame`).
    - Điều khiển còi báo động 12V qua MOSFET D4184 (GPIO26), đèn trạng thái Status LED (GPIO25) và nút nhấn vật lý Test/Silence (GPIO18).
-   - **Không có cảm biến nhiệt độ/độ ẩm** trên firmware hiện tại (UI hiển thị rõ *"Chưa hỗ trợ phần cứng nhiệt độ"*, tuyệt đối không sinh nhiệt độ giả).
+   - **Không có cảm biến nhiệt độ/độ ẩm** trên firmware hiện tại (Telemetry trả về `"temperature_celsius": null`; UI hiển thị rõ *"Chưa hỗ trợ phần cứng nhiệt độ"*, tuyệt đối không sinh nhiệt độ giả).
    - Tự quyết định máy trạng thái (`WARMING`, `UNCONFIGURED`, `NORMAL`, `SUSPECTED`, `ALARM`) và chịu trách nhiệm kích hoạt còi tại chỗ ngay cả khi mất mạng Wi-Fi/LAN.
 
 2. **Tầng Ứng dụng Android (SmartFire AI Control Center):**
    - Kết nối trực tiếp tới các node ESP32 trong cùng mạng LAN qua giao thức HTTP REST (`Port 80`) với xác thực `Authorization: Bearer <NODE_TOKEN>`.
-   - Cung cấp giao thức thiết lập Wi-Fi lần đầu hoặc khi đổi vị trí qua **Bluetooth Low Energy (BLE GATT)**.
+   - Cung cấp giao thức thiết lập Wi-Fi lần đầu hoặc khi đổi vị trí qua **Bluetooth Low Energy (BLE GATT)** hoặc **SoftAP Web Portal**.
    - Lưu trữ bền vững toàn bộ hồ sơ công trình (Home, Floor, Room), thông tin định danh thiết bị (`device_id` tách biệt với tên hiển thị `displayName`), lịch sử sự kiện (`DeviceEventEntity`), chuỗi thời gian cảm biến (`DeviceSnapshotEntity`), bản đồ 2D trong nhà, vị trí bình chữa cháy và lối thoát hiểm trên **Room SQLite**.
    - Lưu trữ bảo mật Token của từng node thông qua `DeviceCredentialStore` (mã hóa Android Keystore / AES-GCM, không lưu plaintext trong SQLite hay xuất ra log).
    - Phân tích thống kê nội bộ (Local Analytics: Moving Average, EWMA Baseline, Rate of Change, Outlier Detection, Connectivity Anomaly) kết hợp **Gemini AI (`gemini-3.8-flash`, `gemini-4-argon`, `gemini-3.5-flash-lite`)** để giải thích nguyên nhân cảnh báo, quét nhãn phòng trên sơ đồ mặt bằng, và tra cứu vị trí trạm cứu hỏa/cơ sở PCCC gần công trình qua **Google Maps Grounding**.
+
+### 1.2. Cam kết bất biến dữ liệu thực (Real-Mode Data Integrity Invariant - v1.0.1)
+- **Tuyệt đối không pha trộn dữ liệu giả lập (Zero Synthetic Telemetry):** Trong chế độ vận hành mạng LAN thực tế, repository không inject bất kỳ dữ liệu jitter mô phỏng nào (như nhiệt độ ảo, CO ppm ảo) vào telemetry của node phần cứng.
+- **Không tự bịa thành công cục bộ khi mất kết nối (No Fabricated Success):** Khi người dùng gửi lệnh (`ACK`, `SILENCE`, `TEST`) tới một node không thể liên lạc được qua LAN, ứng dụng trả về `UNKNOWN_OUTCOME` kèm thông báo lỗi rõ ràng. Trạng thái còi và báo cháy của phần cứng được giữ nguyên vẹn, không tự ý giả lập hạ còi hay chuyển sang `NORMAL`.
 
 ---
 
@@ -33,10 +38,10 @@ com.example/
 ├── MainActivity.kt                      # Khởi tạo App Check, Edge-to-Edge, Notification Permission, App Shell
 ├── data/
 │   ├── ble/
-│   │   └── BleProvisioningManager.kt    # Quét BLE, GATT Connect, Subscribe STATUS, Ghi cấu hình Wi-Fi JSON
+│   │   └── BleProvisioningManager.kt    # Quét BLE, GATT Connect, MTU 512, Subscribe STATUS, Ghi cấu hình Wi-Fi JSON
 │   ├── local/
 │   │   ├── SmartFireDatabase.kt         # Room Database (12 bảng thực thể + DAO + Transaction Sync)
-│   │   ├── EntityModels.kt              # Home, Floor, Room, Device, Snapshot, Event,SyncCursor, Extinguisher, MapObject, MapEdge, UserLocation, AnalysisInsight
+│   │   ├── EntityModels.kt              # Home, Floor, Room, Device, Snapshot, Event, SyncCursor, Extinguisher, MapObject, MapEdge, UserLocation, AnalysisInsight
 │   │   ├── SmartFireDao.kt              # Các truy vấn Flow<T>, UPSERT/IGNORE sự kiện, quản lý retention
 │   │   └── SecureTokenStore.kt          # Lưu trữ Node Bearer Token bảo mật bằng Android Keystore AES/GCM
 │   ├── remote/
@@ -44,7 +49,7 @@ com.example/
 │   │   └── SmartFireHttpClient.kt       # OkHttp + Retrofit động theo từng IP node & Bearer Token
 │   └── repository/
 │       ├── SmartFireRepository.kt       # Nguồn dữ liệu hợp nhất (Real LAN Mode + STEM Demo Mode tách biệt)
-│       ├── DeviceMonitoringCoordinator.kt # Điều phối polling ~1s/node với SupervisorJob & tính toán Freshness
+│       ├── DeviceMonitoringCoordinator.kt # Điều phối polling ~1.2s/node với SupervisorJob & tính toán Freshness
 │       └── AiAnalysisEngine.kt          # 4 tầng: Alarm State -> Local Analytics -> Gemini AI / Maps Grounding -> AI Explanation
 ├── domain/
 │   ├── model/
@@ -93,7 +98,8 @@ com.example/
     "testing": false,
     "horn_requested": false,
     "horn_enabled": true,
-    "gas_commissioned": true
+    "gas_commissioned": true,
+    "temperature_celsius": null
   }
 }
 ```
@@ -125,10 +131,10 @@ com.example/
 
 ---
 
-### 3.2. Giao thức cấu hình Wi-Fi qua BLE GATT
+### 3.2. Giao thức cấu hình Wi-Fi qua BLE GATT (v1.0.1 Overhaul)
 - **Tên quảng bá chuẩn:** `SmartFire-Node-01` (hoặc tiền tố `SmartFire-`)
 - **Service UUID:** `4fafc201-1fb5-459e-8fcc-c5c9c331914b`
-- **CONFIG Characteristic (Write):** `beb5483e-36e1-4688-b7f5-ea07361b26a8`
+- **CONFIG Characteristic (Write / Write Without Response):** `beb5483e-36e1-4688-b7f5-ea07361b26a8`
   - Payload ưu tiên (JSON): `{"ssid":"<SSID_2.4GHz>","password":"<PASSWORD>"}`
   - Payload dự phòng (Text): `<SSID>\n<PASSWORD>`
 - **STATUS Characteristic (Read / Notify):** `1c95d5e3-d8f7-413a-bf3d-7a2e5d7be87e`
@@ -137,9 +143,18 @@ com.example/
     - `{"status":"CONNECTING","ssid":"..."}`
     - `{"status":"CONNECTED","ip":"192.168.1.15","device_id":"smartfire-node-01"}`
     - `{"status":"DISCONNECTED"}`
-- **Cơ chế Fallback & Bảo mật:**
-  - Nếu firmware thực tế trên mạch chưa bật dịch vụ BLE GATT hoặc điện thoại không tìm thấy UUID dịch vụ, Wizard tự động thông báo rõ và chuyển sang **Thiết lập IP LAN thủ công (Manual IP + Token Setup)**.
-  - Cảnh báo rõ cho người dùng rằng BLE provisioning truyền thông tin Wi-Fi tới thiết bị đang ở gần và bước xác thực cuối cùng luôn yêu cầu **Node Bearer Token** qua HTTP `/v1/status`.
+- **Quy trình kết nối tối ưu (GATT Lifecycle v1.0.1):**
+  1. `ScanFilter` lọc theo tên `SmartFire-` hoặc Service UUID trong gói ScanResponse.
+  2. Kết nối `BluetoothGatt` với cờ `autoConnect = false`.
+  3. Yêu cầu `requestMtu(512)` để tránh nghẽn gói tin phân mảnh.
+  4. `discoverServices()` $\rightarrow$ Kích hoạt Notification trên `STATUS` bằng cách ghi Descriptor `ENABLE_NOTIFICATION_VALUE`.
+  5. Ghi gói tin cấu hình Wi-Fi lên `CONFIG`.
+  6. Lắng nghe `STATUS == "CONNECTED"` và trích xuất địa chỉ IP.
+  7. Thực hiện gọi `disconnect()` và `close()` dọn dẹp tài nguyên BLE.
+- **Cơ chế Fallback (Dự phòng):**
+  - Nếu BLE không khả dụng, Wizard hỗ trợ chuyển sang:
+    - **SoftAP Recovery Portal:** Kết nối Wi-Fi `SmartFire-Setup-XXXX` và mở trang web `http://192.168.4.1/`.
+    - **Thiết lập IP LAN thủ công:** Nhập trực tiếp IP đã được cấp bởi router và Node Bearer Token.
 
 ---
 
@@ -158,41 +173,35 @@ com.example/
 | `map_objects` (`MapObjectEntity`) | `id` (PK), `floorId` (FK) | Lưu các điểm nút trên bản đồ: Cửa (`DOOR`), Giao lộ hành lang (`CORRIDOR_NODE`), Cầu thang (`STAIRS`), Lối thoát hiểm (`EXIT`), Điểm tập kết (`ASSEMBLY_POINT`). |
 | `map_edges` (`MapEdgeEntity`) | `id` (PK), `floorId` (FK) | Lưu đồ thị đường đi (`fromNodeId`, `toNodeId`, `distanceMeters`) phục vụ thuật toán tìm đường ngắn nhất Dijkstra. |
 | `user_locations` (`UserLocationEntity`) | `homeId` (PK) | Lưu vị trí hiện tại của người dùng trên bản đồ (chọn phòng thủ công, chạm điểm trên bản đồ, hoặc quét mã QR định vị cấp phòng). |
-| `analysis_insights` (`AnalysisInsightEntity`) | `id` (PK), Index `(deviceId, createdAt)` | Lưu kết quả phân tích thống kê nội bộ và nhận định từ Gemini AI. |
 
 ---
 
-## 5. HỆ THỐNG BẢN ĐỒ TRONG NHÀ 2D & TÌM BÌNH CHỮA CHÁY / LỐI THOÁT
+## 5. THUẬT TOÁN ĐỊNH TUYẾN THOÁT HIỂM & TÌM BÌNH CỨU HỎA (INDOOR PATHFINDING)
 
-1. **Hệ tọa độ chuẩn hóa (Normalized Map-Space `[0.0 .. 1.0]`):**
-   - Mọi đa giác phòng, vị trí cảm biến, bình chữa cháy, lối thoát và nút hành lang được lưu dưới dạng tọa độ chuẩn hóa $(x_{\text{norm}}, y_{\text{norm}}) \in [0, 1]^2$, độc lập hoàn toàn với độ phân giải màn hình và thao tác Pan/Zoom.
-   - Khi người dùng thực hiện **Hiệu chuẩn tỷ lệ (Scale Calibration)** bằng cách chọn 2 điểm trên ảnh sơ đồ và nhập khoảng cách thực tế (mét), hệ thống tính hệ số quy đổi sang mét thực tế.
-
-2. **3 Chế độ tương tác trên màn hình Bản đồ (`IndoorMapScreen`):**
-   - **CHẾ ĐỘ XEM (VIEW MODE):** Phóng to/thu nhỏ, kéo bản đồ, chuyển tầng, chạm vào phòng/cảm biến/bình chữa cháy để xem chi tiết, đánh dấu vị trí hiện tại của người dùng (hoặc quét QR phòng), xem tuyến đường tới bình chữa cháy gần nhất và lối thoát hiểm.
-   - **CHẾ ĐỘ CHỈNH SỬA (EDIT MODE):** Vẽ/chỉnh sửa phòng đa giác hoặc hình chữ nhật, kéo thả vị trí node cảm biến, thêm bình chữa cháy, đặt cửa/lối thoát hiểm, nối các điểm hành lang (Topology Graph Edges) và hỗ trợ Undo/Redo.
-   - **CHẾ ĐỘ QUÉT / NHẬP SƠ ĐỒ (SCAN / IMPORT MODE):**
-     - **Mức 1 (Luôn sẵn sàng):** Nhập ảnh mặt bằng (PNG/JPG) từ thiết bị bằng Android Photo Picker hoặc chụp ảnh bản vẽ giấy, hiệu chuẩn kích thước 2 điểm, vẽ biên phòng.
-     - **Mức 2 (Hỗ trợ AI Vision / OCR):** Sử dụng Gemini Multimodal (`gemini-3.8-flash`) để đọc nhãn tên phòng và gợi ý cấu trúc phòng từ ảnh chụp sơ đồ mặt bằng, cho phép người dùng kiểm tra và chỉnh sửa trước khi lưu.
-
-3. **Thuật toán Tìm bình chữa cháy & Lối thoát hiểm (`IndoorPathfinder`):**
-   - Nếu tầng đã có đồ thị lối đi (`MapEdgeEntity`): Chạy thuật toán **Dijkstra Shortest Path** qua các cửa và hành lang. Các cạnh đi xuyên qua phòng đang có trạng thái `ALARM` được gắn cờ **`UNVERIFIED_HAZARD (Đường đi qua vùng đang báo động — Chưa xác minh an toàn)`** và hệ thống ưu tiên tìm tuyến đường vòng tránh vùng có cảnh báo cháy.
-   - Nếu tầng chưa khai báo đồ thị lối đi: Tính khoảng cách **Euclidean** và hiển thị rõ nhãn *"Khoảng cách chim bay (Chưa khai báo đồ thị tường/cửa)"*, tuyệt đối không gọi đường thẳng xuyên tường là lộ trình di chuyển thực tế.
+1. **Chuẩn hóa không gian bản đồ (Normalized Coordinate System):**
+   - Mọi tọa độ đối tượng được lưu dưới dạng số thực $[0.0 .. 1.0]$ tương ứng tỷ lệ theo chiều rộng/dài của sàn tầng.
+   - Khi hiển thị, nhân với kích thước Canvas và hệ số thu phóng `Zoom / Pan Matrix`.
+2. **Thuật toán Dijkstra có trọng số động (Hazard-Aware Dijkstra):**
+   - Đồ thị vô hướng $G = (V, E)$ tạo từ `map_objects` và `map_edges`.
+   - Trọng số cơ bản: Khoảng cách hình học Euclid theo mét thực tế $d(u, v)$.
+   - **Phạt trọng số khi đi qua phòng nguy hiểm:** Nếu cạnh $(u, v)$ đi qua hoặc điểm đến $v$ thuộc phòng đang có trạng thái `ALARM` hoặc `SUSPECTED`, trọng số được nhân hệ số phạt khẩn cấp ($W_{hazard} = 100 \times d(u, v)$).
+   - Tự động tìm lối đi thay thế an toàn hơn; nếu không còn đường nào khác, hiển thị cảnh báo đỏ **"LỐI ĐI DUY NHẤT ĐI QUA KHU VỰC ĐANG BÁO ĐỘNG"**.
 
 ---
 
-## 6. KIẾN TRÚC PHÂN TÍCH DỮ LIỆU & AI AN TOÀN (4-LAYER AI ARCHITECTURE)
+## 6. PHÂN TÍCH DỮ LIỆU & TRÍ TUỆ NHÂN TẠO (AI ANALYSIS PIPELINE)
 
-1. **Tầng 1 — Trạng thái Báo động Phần cứng (Firmware Alarm State):** Dữ liệu gốc từ ESP32 (`state`, `alarm`, `flame`, `gas_raw`, `gas_commissioned`). Không tầng phần mềm nào được phép ghi đè.
-2. **Tầng 2 — Phân tích Thống kê Nội bộ (Offline Local Analytics):**
-   - Tự động loại bỏ các mẫu trong giai đoạn `WARMING` hoặc `UNCONFIGURED` (`gas_ready == false` hoặc `gas_commissioned == false`) khỏi đường cơ sở (Baseline).
-   - Tính trung bình trượt (SMA), trung bình trượt hàm mũ (**EWMA Baseline**, $\alpha = 0.25$), tốc độ biến thiên (**Rate of Change** $\Delta \text{ADC}/\text{s}$), phát hiện điểm dị biệt (**Z-score Outlier $\ge 2.5\sigma$**) và phát hiện bất thường kết nối/khởi động lại liên tục.
-   - Nếu số mẫu hợp lệ $< 5$, hiển thị rõ: *"Chưa đủ dữ liệu để phân tích xu hướng."*
-3. **Tầng 3 — Suy luận AI & Tra cứu Địa điểm PCCC (Gemini AI Logic & Google Maps Grounding):**
-   - Sử dụng **`gemini-3.8-flash`** cho phân tích nhanh chuỗi số liệu cảm biến & nhận diện sơ đồ mặt bằng.
-   - Sử dụng **`gemini-4-argon`** cho phân tích chuyên sâu đa sự kiện (Root-Cause & Safety Audit) trong toàn bộ ngôi nhà.
-   - Sử dụng **`gemini-3.8-flash` kết hợp công cụ Google Maps Grounding** để tra cứu trạm cảnh sát PCCC, bệnh viện hoặc cửa hàng thiết bị chữa cháy gần khu vực công trình khi người dùng cần hỗ trợ khẩn cấp.
-   - **Bảo mật dữ liệu:** Tuyệt đối không gửi `NODE_TOKEN` hay mật khẩu Wi-Fi lên Gemini AI.
+Hệ thống phân tích vận hành theo mô hình 4 tầng nghiêm ngặt:
+1. **Tầng 1 — Trạng thái An toàn Phần cứng (Hardware Alarm Authority):**
+   - `state == ALARM` $\rightarrow$ Ưu tiên cảnh báo đỏ khẩn cấp tức thì.
+2. **Tầng 2 — Thống kê cục bộ (Local Statistical Analytics):**
+   - Tự động loại trừ dữ liệu sấy nóng `WARMING`.
+   - Tính toán đường cơ sở hàm mũ EWMA ($\alpha = 0.25$), độ lệch chuẩn $\sigma$, và phát hiện đột biến $\ge 2.5\sigma$.
+3. **Tầng 3 — Tích hợp Gemini AI & Google Maps Grounding:**
+   - Kết hợp các mô hình `gemini-3.8-flash`, `gemini-4-argon`, `gemini-3.5-flash-lite`.
+   - Đánh giá ngữ cảnh phòng (ví dụ: khói tại Nhà Bếp lúc 18h khác với khói tại Phòng Ngủ lúc 02h).
+   - Truy vấn trạm cứu hỏa và cơ sở PCCC gần vị trí công trình qua Google Maps Grounding Tool.
+   - **Bảo mật dữ liệu:** Tuyệt đối không gửi `NODE_TOKEN` hay mật khẩu Wi-Fi lên AI.
 4. **Tầng 4 — Giải thích & Ranh giới An toàn (AI Safety Boundary):**
    - Mọi nhận định đều kèm nguồn số liệu (`Source Measurements`), phương pháp phân tích (`Local Statistical` vs `Gemini AI Reasoning`) và độ tươi dữ liệu (`Data Freshness`).
    - Không bịa đặt phần trăm xác suất cháy vô căn cứ (ví dụ không tự gán *"95% fire probability"*).
@@ -215,3 +224,18 @@ com.example/
    - Kiểm thử bất biến giữ nguyên trạng thái `ALARM` khi mất kết nối (`OFFLINE`).
    - Kiểm thử thuật toán tìm đường ngắn nhất Dijkstra tránh vùng cháy trên đồ thị bản đồ.
    - Kiểm thử bộ phân tích thống kê nội bộ (EWMA, loại bỏ dữ liệu `WARMING`).
+
+---
+
+## 8. KIẾN TRÚC CI/CD & TỰ ĐỘNG HÓA BIÊN DỊCH (LINUX GITHUB ACTIONS)
+
+Workflow `.github/workflows/android-release.yml` đảm bảo tính toàn vẹn và xuất xưởng tự động:
+- **Runner:** `ubuntu-latest`
+- **Các bước thực thi:**
+  1. Setup JDK 21 (Temurin) với Gradle cache.
+  2. Setup Android SDK: platform `android-36`, build-tools `36.0.0`.
+  3. Tạo tự động cặp Keystore chuẩn ký ứng dụng (`my-upload-key.jks` & `debug.keystore`).
+  4. Chạy toàn bộ Unit Tests: `./gradlew testDebugUnitTest`.
+  5. Biên dịch đồng thời bản Release và Debug: `./gradlew assembleRelease assembleDebug`.
+  6. Gom artifact vào thư mục phát hành.
+  7. Khi có Git Tag `v*`: Tạo GitHub Release tự động qua `softprops/action-gh-release@v2`, đính kèm 2 file APK đã ký số.
