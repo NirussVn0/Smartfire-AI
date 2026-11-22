@@ -27,6 +27,8 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Lan
 import androidx.compose.material.icons.filled.Sensors
+import androidx.compose.material.icons.filled.Visibility
+import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -53,6 +55,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -89,6 +92,7 @@ fun AddDeviceWizardDialog(
     var targetIp by remember { mutableStateOf("") }
     var detectedDeviceId by remember { mutableStateOf("smartfire-node-01") }
     var nodeToken by remember { mutableStateOf(SmartFireRepository.DEFAULT_TOKEN) }
+    var showToken by remember { mutableStateOf(false) }
 
     // BLE Provisioning fields
     var isBleScanOpen by remember { mutableStateOf(false) }
@@ -148,6 +152,12 @@ fun AddDeviceWizardDialog(
             }
             is BleConnectionState.Disconnected -> {
                 isGattReady = false
+                if (isSendingBleConfig) {
+                    isSendingBleConfig = false
+                    bleFeedbackMessage = "Mất kết nối BLE khi đang nạp cấu hình Wi-Fi."
+                } else if (selectedBleDevice != null) {
+                    bleFeedbackMessage = "Đã ngắt kết nối BLE. Nhấn vào thiết bị để kết nối lại."
+                }
             }
         }
     }
@@ -323,8 +333,8 @@ fun AddDeviceWizardDialog(
                                     if (bleDevices.isEmpty() && scanState !is BleScanState.Scanning) {
                                         Text("Chưa tìm thấy SmartFire BLE. Kiểm tra ESP32 đã cấp nguồn.", color = TextSecondary, fontSize = 11.sp)
                                     } else {
-                                        LazyColumn(modifier = Modifier.height(90.dp)) {
-                                            items(bleDevices) { dev ->
+                                        LazyColumn(modifier = Modifier.height(100.dp)) {
+                                            items(bleDevices, key = { it.address }) { dev ->
                                                 val isSelected = selectedBleDevice?.address == dev.address
                                                 Row(
                                                     modifier = Modifier
@@ -341,11 +351,36 @@ fun AddDeviceWizardDialog(
                                                     horizontalArrangement = Arrangement.SpaceBetween,
                                                     verticalAlignment = Alignment.CenterVertically
                                                 ) {
-                                                    Column {
+                                                    Column(modifier = Modifier.weight(1f)) {
                                                         Text(dev.name, color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                                         Text(dev.address, color = TextSecondary, fontSize = 9.sp)
                                                     }
-                                                    Text("${dev.rssi} dBm", color = PrimaryBlue, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                                        if (isSelected) {
+                                                            when (bleConnectionState) {
+                                                                is BleConnectionState.Connecting -> {
+                                                                    CircularProgressIndicator(
+                                                                        modifier = Modifier.size(12.dp),
+                                                                        color = PrimaryBlue,
+                                                                        strokeWidth = 2.dp
+                                                                    )
+                                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                                }
+                                                                is BleConnectionState.Connected,
+                                                                is BleConnectionState.ServicesDiscovered -> {
+                                                                    Icon(
+                                                                        Icons.Default.CheckCircle,
+                                                                        contentDescription = "Đã kết nối",
+                                                                        tint = NormalGreen,
+                                                                        modifier = Modifier.size(14.dp)
+                                                                    )
+                                                                    Spacer(modifier = Modifier.width(6.dp))
+                                                                }
+                                                                else -> {}
+                                                            }
+                                                        }
+                                                        Text("${dev.rssi} dBm", color = PrimaryBlue, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                                                    }
                                                 }
                                             }
                                         }
@@ -415,10 +450,20 @@ fun AddDeviceWizardDialog(
 
                                     if (bleFeedbackMessage != null) {
                                         Spacer(modifier = Modifier.height(6.dp))
+                                        val isSuccess = bleFeedbackMessage!!.contains("thành công", ignoreCase = true)
+                                        val isErr = bleFeedbackMessage!!.contains("thất bại", ignoreCase = true) ||
+                                                bleFeedbackMessage!!.contains("lỗi", ignoreCase = true) ||
+                                                bleFeedbackMessage!!.contains("hết thời gian", ignoreCase = true) ||
+                                                bleFeedbackMessage!!.contains("mất kết nối", ignoreCase = true)
                                         Text(
                                             bleFeedbackMessage!!,
-                                            color = if (bleFeedbackMessage!!.contains("thành công", ignoreCase = true)) NormalGreen else TextSecondary,
-                                            fontSize = 11.sp
+                                            color = when {
+                                                isSuccess -> NormalGreen
+                                                isErr -> CriticalAlarmRed
+                                                else -> TextSecondary
+                                            },
+                                            fontSize = 11.sp,
+                                            fontWeight = if (isSuccess || isErr) FontWeight.SemiBold else FontWeight.Normal
                                         )
                                     }
                                 }
@@ -531,7 +576,23 @@ fun AddDeviceWizardDialog(
                     },
                     label = { Text("Mã Token bảo mật của Node") },
                     placeholder = { Text("Nhập API Token bảo mật (>= 24 ký tự)") },
-                    visualTransformation = PasswordVisualTransformation(),
+                    supportingText = {
+                        Text(
+                            "Hệ thống đã tự động điền mã bảo mật khớp với ESP32. Bạn có thể giữ nguyên.",
+                            fontSize = 10.sp,
+                            color = NormalGreen
+                        )
+                    },
+                    trailingIcon = {
+                        IconButton(onClick = { showToken = !showToken }) {
+                            Icon(
+                                imageVector = if (showToken) Icons.Default.VisibilityOff else Icons.Default.Visibility,
+                                contentDescription = "Hiện/Ẩn Token",
+                                tint = TextSecondary
+                            )
+                        }
+                    },
+                    visualTransformation = if (showToken) VisualTransformation.None else PasswordVisualTransformation(),
                     singleLine = true,
                     modifier = Modifier
                         .fillMaxWidth()
