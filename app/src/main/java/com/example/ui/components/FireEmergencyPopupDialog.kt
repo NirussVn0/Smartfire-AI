@@ -1,16 +1,7 @@
 package com.example.ui.components
 
 import android.content.Context
-import android.media.AudioAttributes
-import android.media.AudioFormat
 import android.media.AudioManager
-import android.media.AudioTrack
-import android.media.ToneGenerator
-import android.media.audiofx.LoudnessEnhancer
-import android.os.Build
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
@@ -65,16 +56,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.example.domain.model.AlarmSoundType
+import com.example.domain.model.AlertMode
 import com.example.domain.model.SmartFireNode
+import com.example.service.audio.AlarmAudioPlayer
 import com.example.ui.theme.CriticalAlarmRed
 import com.example.ui.theme.PrimaryBlue
 import com.example.ui.theme.TextSecondary
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.withContext
 import java.util.Locale
-import kotlin.math.sin
 
 /**
  * Forces Android STREAM_MUSIC, STREAM_ALARM, and STREAM_NOTIFICATION to 100% maximum volume
@@ -100,44 +89,21 @@ fun forceMaxSystemAlarmVolume(context: Context) {
     } catch (_: Throwable) {}
 }
 
-/**
- * Generates a full-scale (±32767) high-penetration square/harmonic piezo fire siren buffer
- * alternating between 1050 Hz and 1650 Hz with a 2900 Hz resonant overtone for maximum loudness.
- */
-private fun buildHighPowerSirenPcmBuffer(sampleRate: Int = 22050): ShortArray {
-    val totalSamples = sampleRate // 1.0 second full cycle (0.5s high-pierce + 0.5s low-pierce)
-    val buffer = ShortArray(totalSamples)
-    val twoPi = 2.0 * Math.PI
-
-    for (i in 0 until totalSamples) {
-        val t = i.toDouble() / sampleRate.toDouble()
-        // Alternate frequency rapidly (3 sweeps per second) for urgent fire-alarm piezo effect
-        val cyclePhase = (t * 3.0) % 1.0
-        val baseFreq = if (cyclePhase < 0.5) 1580.0 else 1080.0
-        val overtoneFreq = baseFreq * 2.0
-
-        val s1 = sin(twoPi * baseFreq * t)
-        val s2 = sin(twoPi * overtoneFreq * t)
-        // Clipped square-wave synthesis for maximum RMS acoustic power (+3 dB over sine wave)
-        val rawWave = if (s1 >= 0.0) 0.78 else -0.78
-        val harmonic = if (s2 >= 0.0) 0.22 else -0.22
-        val combined = (rawWave + harmonic).coerceIn(-1.0, 1.0)
-        buffer[i] = (combined * Short.MAX_VALUE).toInt().toShort()
-    }
-    return buffer
-}
-
 @Composable
 fun FireEmergencyPopupDialog(
     nearestAlarmNode: SmartFireNode,
     totalAlarmCount: Int,
     distanceMeters: Float,
     soundEnabled: Boolean,
+    alertMode: AlertMode = AlertMode.SOUND_AND_VIBRATE,
+    soundType: AlarmSoundType = AlarmSoundType.FIRE_SIREN,
+    volumePercent: Int = 85,
     onRouteToExtinguisher: () -> Unit,
     onRouteToNearestFireSensor: () -> Unit,
     onRouteTwoStageExtinguisherToFire: () -> Unit = onRouteToExtinguisher,
     onRouteToExit: () -> Unit = onRouteToExtinguisher,
-    onSilenceAllAlarms: () -> Unit
+    onSilenceAllAlarms: () -> Unit,
+    onDisarmAllAlarms: () -> Unit = onSilenceAllAlarms
 ) {
     val context = LocalContext.current
     var manualBoostCount by remember { mutableIntStateOf(0) }
@@ -164,111 +130,17 @@ fun FireEmergencyPopupDialog(
         label = "huge_icon_scale"
     )
 
-    // Ultra-Loud Continuous Fire Siren (Full-scale PCM AudioTrack + +20dB LoudnessEnhancer + Dual ToneGenerator + Vibrator)
-    // Stops immediately when Popup is closed (by pressing Extinguisher, Fire Sensor, or Silence Alarm)
-    LaunchedEffect(soundEnabled, nearestAlarmNode.deviceId, manualBoostCount) {
-        if (!soundEnabled) return@LaunchedEffect
-
-        withContext(Dispatchers.Default) {
-            var audioTrack: AudioTrack? = null
-            var loudnessEnhancer: LoudnessEnhancer? = null
-            var alarmToneGen: ToneGenerator? = null
-            var mediaToneGen: ToneGenerator? = null
-
-            try {
-                // 1. Force all system audio streams (MUSIC + ALARM + RING) to 100% Max Volume
-                forceMaxSystemAlarmVolume(context)
-
-                // 2. Build full-scale 16-bit PCM piezo siren on USAGE_MEDIA (for full WebRTC & speaker output)
-                val sampleRate = 22050
-                val pcmData = buildHighPowerSirenPcmBuffer(sampleRate)
-                val byteCount = pcmData.size * 2
-
-                audioTrack = AudioTrack.Builder()
-                    .setAudioAttributes(
-                        AudioAttributes.Builder()
-                            .setUsage(AudioAttributes.USAGE_MEDIA)
-                            .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
-                            .build()
-                    )
-                    .setAudioFormat(
-                        AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(sampleRate)
-                            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                            .build()
-                    )
-                    .setBufferSizeInBytes(byteCount)
-                    .setTransferMode(AudioTrack.MODE_STATIC)
-                    .build()
-
-                audioTrack.write(pcmData, 0, pcmData.size)
-                audioTrack.setLoopPoints(0, pcmData.size, -1)
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-                    audioTrack.setVolume(AudioTrack.getMaxVolume())
-                }
-
-                // Attach hardware/DSP LoudnessEnhancer (+2000 mB = +20 dB boost)
-                try {
-                    loudnessEnhancer = LoudnessEnhancer(audioTrack.audioSessionId).apply {
-                        setTargetGain(2200)
-                        enabled = true
-                    }
-                } catch (_: Throwable) {}
-
-                audioTrack.play()
-
-                // 3. Also layer dual ToneGenerators on STREAM_ALARM and STREAM_MUSIC at MAX_VOLUME (100)
-                try {
-                    alarmToneGen = ToneGenerator(AudioManager.STREAM_ALARM, ToneGenerator.MAX_VOLUME)
-                } catch (_: Throwable) {}
-                try {
-                    mediaToneGen = ToneGenerator(AudioManager.STREAM_MUSIC, ToneGenerator.MAX_VOLUME)
-                } catch (_: Throwable) {}
-
-                while (isActive) {
-                    forceMaxSystemAlarmVolume(context)
-                    try {
-                        alarmToneGen?.startTone(ToneGenerator.TONE_CDMA_EMERGENCY_RINGBACK, 400)
-                        mediaToneGen?.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 400)
-                    } catch (_: Throwable) {}
-
-                    try {
-                        val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                            val vm = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
-                            vm?.defaultVibrator
-                        } else {
-                            @Suppress("DEPRECATION")
-                            context.getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
-                        }
-                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                            vibrator?.vibrate(VibrationEffect.createOneShot(320, 255))
-                        }
-                    } catch (_: Throwable) {}
-
-                    delay(500L)
-                }
-            } catch (_: Throwable) {
-                // Ignore audio hardware init errors on headless environments
-            } finally {
-                try {
-                    loudnessEnhancer?.enabled = false
-                    loudnessEnhancer?.release()
-                } catch (_: Throwable) {}
-                try {
-                    audioTrack?.stop()
-                    audioTrack?.release()
-                } catch (_: Throwable) {}
-                try {
-                    alarmToneGen?.stopTone()
-                    alarmToneGen?.release()
-                } catch (_: Throwable) {}
-                try {
-                    mediaToneGen?.stopTone()
-                    mediaToneGen?.release()
-                } catch (_: Throwable) {}
-            }
-        }
+    // Customizable Fire Siren / Beep / Ringtone + Vibration via AlarmAudioPlayer
+    // Stops immediately when Popup is closed (by pressing Navigation or Silence Alarm)
+    LaunchedEffect(soundEnabled, alertMode, soundType, volumePercent, nearestAlarmNode.deviceId, manualBoostCount) {
+        if (!soundEnabled || alertMode == AlertMode.SILENT) return@LaunchedEffect
+        AlarmAudioPlayer.runAlertLoop(
+            context = context,
+            alertMode = alertMode,
+            soundType = soundType,
+            volumePercent = volumePercent,
+            isLevel1Warning = false
+        )
     }
 
     Dialog(
@@ -561,30 +433,67 @@ fun FireEmergencyPopupDialog(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // HUGE BUTTON 3: TẮT BÁO CHÁY NGAY
-                    Button(
-                        onClick = onSilenceAllAlarms,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp)
-                            .testTag("btn_popup_silence_alarm"),
-                        colors = ButtonDefaults.buttonColors(containerColor = CriticalAlarmRed),
-                        shape = RoundedCornerShape(14.dp)
+                    // TWO BUTTONS: TẮT TẠM 30s vs TẮT HẲN (Giữ nút ESP32 5s hoặc Bật Lại trên app)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Icon(
-                            Icons.Default.NotificationsOff,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(20.dp)
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = if (totalAlarmCount > 1) "TẮT TẤT CẢ BÁO CHÁY ($totalAlarmCount)" else "TẮT BÁO CHÁY NGAY",
-                            color = Color.White,
-                            fontSize = 14.sp,
-                            fontWeight = FontWeight.ExtraBold
-                        )
+                        Button(
+                            onClick = onSilenceAllAlarms,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(50.dp)
+                                .testTag("btn_popup_silence_alarm"),
+                            colors = ButtonDefaults.buttonColors(containerColor = CriticalAlarmRed),
+                            shape = RoundedCornerShape(14.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.NotificationsOff,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (totalAlarmCount > 1) "TẮT 30s ($totalAlarmCount)" else "TẮT TẠM 30s",
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+
+                        Button(
+                            onClick = onDisarmAllAlarms,
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(50.dp)
+                                .testTag("btn_popup_disarm_alarm"),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
+                            shape = RoundedCornerShape(14.dp)
+                        ) {
+                            Icon(
+                                Icons.Default.NotificationsOff,
+                                contentDescription = null,
+                                tint = Color.White,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = "TẮT HẲN",
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
                     }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Tắt hẳn sẽ tắt còi & app hoàn toàn · Giữ nút ESP32 5s hoặc bấm Bật Lại trên app để bật",
+                        color = TextSecondary,
+                        fontSize = 10.sp,
+                        textAlign = TextAlign.Center
+                    )
                 }
             }
         }

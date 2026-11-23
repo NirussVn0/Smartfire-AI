@@ -34,6 +34,12 @@ interface SmartFireApiService {
     @POST("v1/commands/test")
     suspend fun sendTest(): Response<CommandResponseDto>
 
+    @POST("v1/commands/disarm")
+    suspend fun sendDisarm(): Response<CommandResponseDto>
+
+    @POST("v1/commands/arm")
+    suspend fun sendArm(): Response<CommandResponseDto>
+
     @GET("v1/config")
     suspend fun getConfig(): Response<EspConfigDto>
 

@@ -100,6 +100,12 @@ fun FirmwareStateBadge(
         firmwareState == FirmwareState.SUSPECTED -> {
             listOf("NGHI NGỜ", WarningBackground, WarningBorder, WarningAmber, Icons.Default.Warning)
         }
+        firmwareState == FirmwareState.FAULT -> {
+            listOf("LỖI MQ-2", WarningBackground, WarningBorder, WarningAmber, Icons.Default.Warning)
+        }
+        firmwareState == FirmwareState.DISARMED -> {
+            listOf("ĐÃ TẮT HẲN", OfflineBackground, LightBorder, OfflineGray, Icons.Default.Info)
+        }
         firmwareState == FirmwareState.WARMING -> {
             listOf("SẤY NÓNG", WarmingPurpleLight, WarmingPurple.copy(alpha = 0.4f), WarmingPurple, Icons.Default.Sensors)
         }

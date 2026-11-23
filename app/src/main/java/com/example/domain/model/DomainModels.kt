@@ -9,6 +9,8 @@ enum class FirmwareState {
     NORMAL,
     SUSPECTED,
     ALARM,
+    FAULT,
+    DISARMED,
     UNKNOWN;
 
     companion object {
@@ -19,6 +21,8 @@ enum class FirmwareState {
                 "NORMAL" -> NORMAL
                 "SUSPECTED" -> SUSPECTED
                 "ALARM" -> ALARM
+                "FAULT" -> FAULT
+                "DISARMED" -> DISARMED
                 else -> UNKNOWN
             }
         }
@@ -60,8 +64,22 @@ data class SensorSnapshotPoint(
     val timestamp: Long,
     val gasRaw: Int,
     val temperatureCelsius: Float,
-    val fireProbabilityPercent: Float
+    val fireProbabilityPercent: Float,
+    val flamePercent: Float = 0f
 )
+
+enum class AlertMode {
+    SOUND_AND_VIBRATE,
+    VIBRATE_ONLY,
+    SILENT
+}
+
+enum class AlarmSoundType {
+    FIRE_SIREN,
+    URGENT_BEEP,
+    SYSTEM_ALARM,
+    SYSTEM_NOTIFICATION
+}
 
 /**
  * Chi tiết xác suất cháy đa thông số (Multi-Sensor Probabilistic Fusion Breakdown)
@@ -172,6 +190,7 @@ data class SmartFireTelemetry(
     val muted: Boolean = false,
     val acknowledged: Boolean = false,
     val testing: Boolean = false,
+    val disarmed: Boolean = false,
     val hornRequested: Boolean = false,
     val hornEnabled: Boolean = false,
     val gasCommissioned: Boolean = false,
@@ -180,6 +199,14 @@ data class SmartFireTelemetry(
     val isTemperatureInstalled: Boolean get() = temperatureCelsius != null
     val isCoInstalled: Boolean get() = coPpm != null
     val isHumidityInstalled: Boolean get() = humidityPercent != null
+
+    private fun isMq2MeasurementValid(effMq2: Boolean): Boolean {
+        return effMq2 &&
+            !gasFault &&
+            gasRaw < 4090 &&
+            !state.equals("WARMING", ignoreCase = true) &&
+            !state.equals("FAULT", ignoreCase = true)
+    }
 
     private fun evaluateLevelInternal(
         effMq2: Boolean,
@@ -190,14 +217,18 @@ data class SmartFireTelemetry(
         warnTemp: Float,
         alarmTemp: Float
     ): SensorAlertLevel {
-        val gasLevel2 = effMq2 && gasRaw >= alarmGas
+        if (disarmed || state.equals("DISARMED", ignoreCase = true)) {
+            return SensorAlertLevel.NORMAL
+        }
+        val mq2Valid = isMq2MeasurementValid(effMq2)
+        val gasLevel2 = mq2Valid && gasRaw >= alarmGas
         val tempLevel2 = effTemp && temperatureCelsius != null && temperatureCelsius >= alarmTemp
         val flameLevel2 = effFlame && (flame || (irFlameIntensity ?: 0f) >= 0.70f)
         if (gasLevel2 || tempLevel2 || flameLevel2) {
             return SensorAlertLevel.ALARM_LEVEL_2
         }
 
-        val gasLevel1 = effMq2 && gasRaw >= warnGas
+        val gasLevel1 = mq2Valid && gasRaw >= warnGas
         val tempLevel1 = effTemp && temperatureCelsius != null && temperatureCelsius >= warnTemp
         val flameLevel1 = effFlame && ((irFlameIntensity ?: 0f) >= 0.35f)
         if (gasLevel1 || tempLevel1 || flameLevel1) {
@@ -231,6 +262,7 @@ data class SmartFireTelemetry(
         val effMq2 = config?.mq2Enabled ?: mq2Enabled
         val effTemp = config?.tempEnabled ?: tempEnabled
         val effFlame = config?.flameEnabled ?: flameEnabled
+        val mq2Valid = isMq2MeasurementValid(effMq2)
 
         val alarmTemp = (config?.tempAlarmC ?: tempAlarmC).coerceIn(35f, 120f)
         val warnTemp = (config?.tempWarnC ?: tempWarnC).coerceIn(25f, (alarmTemp - 2f).coerceAtLeast(25f))
@@ -250,11 +282,11 @@ data class SmartFireTelemetry(
             0f
         }
 
-        // 2. Chuẩn hóa điểm Mật độ Khói & Gas MQ-2 [0..1] theo 2 mức ngưỡng
+        // 2. Chuẩn hóa điểm Mật độ Khói & Gas MQ-2 [0..1] theo 2 mức ngưỡng (bỏ qua nếu gasFault / 4095 / WARMING)
         val alarmGas = (config?.gasOn ?: gasThresholdAdc).coerceIn(800, 3900)
         val warnGas = (config?.gasWarn ?: minOf(gasWarnThreshold, (alarmGas * 0.78f).toInt()))
             .coerceIn(500, (alarmGas - 100).coerceAtLeast(500))
-        val smokeScore = if (effMq2) {
+        val smokeScore = if (mq2Valid) {
             val baselineGas = 550f
             val span = (alarmGas.toFloat() - baselineGas).coerceAtLeast(450f) * 1.25f
             val rawSmokeNorm = ((gasRaw - baselineGas) / span).coerceIn(0f, 1f)
@@ -310,10 +342,10 @@ data class SmartFireTelemetry(
             humidityDropScore > 0.45f
         ).count { it }
 
-        val thresholdExceededBoost = if (effMq2 && gasRaw >= alarmGas && (thermalScore > 0.35f || effectiveIr > 0.35f || (effFlame && flame))) 0.15f else 0f
+        val thresholdExceededBoost = if (mq2Valid && gasRaw >= alarmGas && (thermalScore > 0.35f || effectiveIr > 0.35f || (effFlame && flame))) 0.15f else 0f
 
         val synergyBoost = when {
-            effFlame && flame && effMq2 && gasRaw >= alarmGas -> 0.30f
+            effFlame && flame && mq2Valid && gasRaw >= alarmGas -> 0.30f
             highFactorCount >= 4 -> 0.22f
             highFactorCount == 3 -> 0.14f
             highFactorCount == 2 -> 0.07f
@@ -335,16 +367,26 @@ data class SmartFireTelemetry(
             alarmTemp = alarmTemp
         )
 
+        val isDisarmed = disarmed || state.equals("DISARMED", ignoreCase = true)
+        val isFaultState = (gasFault || gasRaw >= 4090 || state.equals("FAULT", ignoreCase = true)) && effMq2 && level == SensorAlertLevel.NORMAL
+        val isWarmingState = state.equals("WARMING", ignoreCase = true) && level == SensorAlertLevel.NORMAL
+
         val totalPercent = when {
-            effFlame && flame && effMq2 && gasRaw >= alarmGas -> 99.5f
+            isDisarmed -> 0f
+            effFlame && flame && mq2Valid && gasRaw >= alarmGas -> 99.5f
             level == SensorAlertLevel.ALARM_LEVEL_2 -> maxOf(rawLogisticPercent, 82.0f).coerceAtMost(99.8f)
             level == SensorAlertLevel.WARNING_LEVEL_1 -> rawLogisticPercent.coerceIn(48.0f, 72.0f)
+            isFaultState -> rawLogisticPercent.coerceAtMost(15.0f)
+            isWarmingState -> rawLogisticPercent.coerceAtMost(10.0f)
             else -> rawLogisticPercent.coerceAtMost(42.0f)
         }
 
         val riskLabel = when {
+            isDisarmed -> "ĐÃ TẮT HẲN (GIỮ NÚT 5s HOẶC BẤM BẬT LẠI)"
             level == SensorAlertLevel.ALARM_LEVEL_2 || totalPercent >= 75f -> "MỨC 2: BÁO CHÁY KHẨN CẤP"
             level == SensorAlertLevel.WARNING_LEVEL_1 || totalPercent >= 45f -> "MỨC 1: CẢNH BÁO SỚM"
+            isFaultState -> "LỖI CẢM BIẾN MQ-2 (ADC=$gasRaw — KIỂM TRA DÂY/CHIA ÁP)"
+            isWarmingState -> "ĐANG SẤY NÓNG CẢM BIẾN (WARMING)"
             totalPercent >= 22f -> "THEO DÕI BIẾN ĐỘNG NHIỆT/KHÓI"
             else -> "AN TOÀN (XÁC SUẤT THẤP)"
         }

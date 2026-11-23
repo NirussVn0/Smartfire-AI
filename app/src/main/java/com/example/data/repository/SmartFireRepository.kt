@@ -122,6 +122,54 @@ class SmartFireRepository(context: Context) {
     private val _stepStrideMeters = MutableStateFlow(prefs.getFloat("step_stride_m", 0.65f))
     val stepStrideMeters: StateFlow<Float> = _stepStrideMeters.asStateFlow()
 
+    // --- CUSTOMIZABLE ALERT SOUND / VIBRATION / VOLUME / LEVEL-1 POPUP SETTINGS ---
+    private val _alertMode = MutableStateFlow(
+        runCatching {
+            com.example.domain.model.AlertMode.valueOf(
+                prefs.getString("alert_mode", com.example.domain.model.AlertMode.SOUND_AND_VIBRATE.name)
+                    ?: com.example.domain.model.AlertMode.SOUND_AND_VIBRATE.name
+            )
+        }.getOrDefault(com.example.domain.model.AlertMode.SOUND_AND_VIBRATE)
+    )
+    val alertMode: StateFlow<com.example.domain.model.AlertMode> = _alertMode.asStateFlow()
+
+    private val _alarmSoundType = MutableStateFlow(
+        runCatching {
+            com.example.domain.model.AlarmSoundType.valueOf(
+                prefs.getString("alarm_sound_type", com.example.domain.model.AlarmSoundType.FIRE_SIREN.name)
+                    ?: com.example.domain.model.AlarmSoundType.FIRE_SIREN.name
+            )
+        }.getOrDefault(com.example.domain.model.AlarmSoundType.FIRE_SIREN)
+    )
+    val alarmSoundType: StateFlow<com.example.domain.model.AlarmSoundType> = _alarmSoundType.asStateFlow()
+
+    private val _alarmVolumePercent = MutableStateFlow(prefs.getInt("alarm_volume_pct", 85).coerceIn(10, 100))
+    val alarmVolumePercent: StateFlow<Int> = _alarmVolumePercent.asStateFlow()
+
+    private val _level1PopupEnabled = MutableStateFlow(prefs.getBoolean("level1_popup_enabled", true))
+    val level1PopupEnabled: StateFlow<Boolean> = _level1PopupEnabled.asStateFlow()
+
+    fun updateAlertMode(mode: com.example.domain.model.AlertMode) {
+        _alertMode.value = mode
+        prefs.edit().putString("alert_mode", mode.name).apply()
+    }
+
+    fun updateAlarmSoundType(type: com.example.domain.model.AlarmSoundType) {
+        _alarmSoundType.value = type
+        prefs.edit().putString("alarm_sound_type", type.name).apply()
+    }
+
+    fun updateAlarmVolumePercent(percent: Int) {
+        val clamped = percent.coerceIn(10, 100)
+        _alarmVolumePercent.value = clamped
+        prefs.edit().putInt("alarm_volume_pct", clamped).apply()
+    }
+
+    fun updateLevel1PopupEnabled(enabled: Boolean) {
+        _level1PopupEnabled.value = enabled
+        prefs.edit().putBoolean("level1_popup_enabled", enabled).apply()
+    }
+
     // --- LOCAL DEVICE NOTIFICATION MUTE (auto-muted when user starts Fire/Exit Navigation) ---
     private val _localAlarmMutedUntilMs = MutableStateFlow(0L)
     val localAlarmMutedUntilMs: StateFlow<Long> = _localAlarmMutedUntilMs.asStateFlow()
@@ -153,7 +201,7 @@ class SmartFireRepository(context: Context) {
             flameWarnMs = prefs.getInt("esp_cfg_flame_warn_ms", 150),
             flameAlarmMs = prefs.getInt("esp_cfg_flame_alarm_ms", 500),
             hornEnabled = prefs.getBoolean("esp_cfg_horn_enabled", false),
-            gasCommissioned = prefs.getBoolean("esp_cfg_gas_commissioned", true),
+            gasCommissioned = prefs.getBoolean("esp_cfg_gas_commissioned", false),
             txPower1m = prefs.getInt("esp_cfg_tx_power_1m", -45),
             pathLossN = prefs.getFloat("esp_cfg_path_loss_n", 2.4f)
         )
@@ -1162,8 +1210,21 @@ class SmartFireRepository(context: Context) {
     // --- COMMAND DISPATCHING WITH HTTP 202 LIFECYCLE & RESILIENT LOCAL FALLBACK ---
     suspend fun sendCommand(
         deviceId: String,
-        commandType: String // "ack", "silence", "test"
+        commandType: String // "ack", "silence", "test", "disarm", "arm"
     ): Result<String> = withContext(Dispatchers.IO) {
+        when (commandType.lowercase()) {
+            "silence" -> {
+                muteLocalNotificationsTemporarily(30_000L)
+                notificationManager.cancelAllAlertNotifications()
+            }
+            "disarm" -> {
+                muteLocalNotificationsTemporarily(300_000L)
+                notificationManager.cancelAllAlertNotifications()
+            }
+            "arm" -> {
+                unmuteLocalNotifications()
+            }
+        }
         if (_isDemoMode.value) {
             handleDemoCommand(deviceId, commandType)
             return@withContext Result.success("Lệnh mô phỏng đã thực thi")
@@ -1181,6 +1242,8 @@ class SmartFireRepository(context: Context) {
                     "ack" -> service.sendAcknowledge()
                     "silence" -> service.sendSilence()
                     "test" -> service.sendTest()
+                    "disarm" -> service.sendDisarm()
+                    "arm" -> service.sendArm()
                     else -> null
                 }
 
@@ -1421,6 +1484,8 @@ class SmartFireRepository(context: Context) {
                 humidityPercent = if (snap.alarm) 28f else 61f,
                 irFlameIntensity = if (snap.flame) 0.90f else 0.03f,
                 flame = snap.flame,
+                gasReady = snap.gasReady,
+                gasFault = snap.gasFault,
                 alarm = snap.alarm,
                 state = snap.state,
                 receivedAt = snap.receivedAt
@@ -1430,7 +1495,8 @@ class SmartFireRepository(context: Context) {
                 timestamp = snap.receivedAt,
                 gasRaw = snap.gasRaw,
                 temperatureCelsius = estTemp,
-                fireProbabilityPercent = telem.calculateFireProbability(threshold).totalProbabilityPercent
+                fireProbabilityPercent = telem.calculateFireProbability(threshold).totalProbabilityPercent,
+                flamePercent = if (snap.flame) 100f else 0f
             )
         }
     }.flowOn(Dispatchers.IO)
@@ -1453,6 +1519,8 @@ class SmartFireRepository(context: Context) {
                 humidityPercent = if (snap.alarm) 28f else 61f,
                 irFlameIntensity = if (snap.flame) 0.90f else 0.03f,
                 flame = snap.flame,
+                gasReady = snap.gasReady,
+                gasFault = snap.gasFault,
                 alarm = snap.alarm,
                 state = snap.state,
                 receivedAt = snap.receivedAt
@@ -1462,7 +1530,8 @@ class SmartFireRepository(context: Context) {
                 timestamp = snap.receivedAt,
                 gasRaw = snap.gasRaw,
                 temperatureCelsius = estTemp,
-                fireProbabilityPercent = telem.calculateFireProbability(threshold).totalProbabilityPercent
+                fireProbabilityPercent = telem.calculateFireProbability(threshold).totalProbabilityPercent,
+                flamePercent = if (snap.flame) 100f else 0f
             )
         }
     }.flowOn(Dispatchers.IO)
@@ -1745,11 +1814,47 @@ class SmartFireRepository(context: Context) {
                         lastKnownAlarm = true,
                         telemetry = node.telemetry.copy(
                             testing = true,
+                            disarmed = false,
                             alarm = true,
                             flame = true,
                             hornRequested = true,
                             gasRaw = 2280,
-                            temperatureCelsius = 77.2f
+                            temperatureCelsius = 77.2f,
+                            state = "ALARM"
+                        ),
+                        activeCommandStatus = CommandStatus.APPLIED
+                    )
+                }
+                "disarm" -> {
+                    current[idx] = node.copy(
+                        firmwareState = FirmwareState.DISARMED,
+                        lastKnownAlarm = false,
+                        telemetry = node.telemetry.copy(
+                            disarmed = true,
+                            alarm = false,
+                            flame = false,
+                            muted = false,
+                            testing = false,
+                            hornRequested = false,
+                            state = "DISARMED"
+                        ),
+                        activeCommandStatus = CommandStatus.APPLIED
+                    )
+                }
+                "arm" -> {
+                    current[idx] = node.copy(
+                        firmwareState = FirmwareState.NORMAL,
+                        lastKnownAlarm = false,
+                        telemetry = node.telemetry.copy(
+                            disarmed = false,
+                            alarm = false,
+                            flame = false,
+                            muted = false,
+                            testing = false,
+                            hornRequested = false,
+                            gasRaw = 920,
+                            temperatureCelsius = 28.5f,
+                            state = "NORMAL"
                         ),
                         activeCommandStatus = CommandStatus.APPLIED
                     )

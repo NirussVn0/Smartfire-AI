@@ -43,6 +43,8 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Slider
+import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Tab
@@ -51,6 +53,7 @@ import androidx.compose.material3.TabRowDefaults
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -68,9 +71,12 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.data.repository.SmartFireRepository
+import com.example.domain.model.AlarmSoundType
+import com.example.domain.model.AlertMode
 import com.example.domain.model.DeviceEvent
 import com.example.domain.model.HomeProfile
 import com.example.domain.model.SmartFireNode
+import com.example.service.audio.AlarmAudioPlayer
 import com.example.ui.theme.CriticalAlarmBorder
 import com.example.ui.theme.CriticalAlarmRed
 import com.example.ui.theme.DemoGold
@@ -170,6 +176,26 @@ fun SettingsTabContent(
     val phoneAlarmSound by repository.phoneAlarmSoundEnabled.collectAsState()
     val autoRouteOnAlarm by repository.autoRouteOnAlarm.collectAsState()
     val stepStrideMeters by repository.stepStrideMeters.collectAsState()
+    val alertMode by repository.alertMode.collectAsState()
+    val alarmSoundType by repository.alarmSoundType.collectAsState()
+    val alarmVolumePercent by repository.alarmVolumePercent.collectAsState()
+    val level1PopupEnabled by repository.level1PopupEnabled.collectAsState()
+
+    val context = LocalContext.current
+    var previewLevel by remember { mutableStateOf<Int?>(null) }
+    LaunchedEffect(previewLevel, alertMode, alarmSoundType, alarmVolumePercent) {
+        val lvl = previewLevel ?: return@LaunchedEffect
+        kotlinx.coroutines.withTimeoutOrNull(2500L) {
+            AlarmAudioPlayer.runAlertLoop(
+                context = context,
+                alertMode = alertMode,
+                soundType = alarmSoundType,
+                volumePercent = alarmVolumePercent,
+                isLevel1Warning = (lvl == 1)
+            )
+        }
+        previewLevel = null
+    }
 
     LazyColumn(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         // 1. STEM DEMO MODE (SOV LABS)
@@ -370,6 +396,129 @@ fun SettingsTabContent(
                     }
 
                     Spacer(modifier = Modifier.height(12.dp))
+
+                    // --- CHẾ ĐỘ ÂM THANH / RUNG / ĐỘ LỚN / KIỂU CHUÔNG ---
+                    Text("Chế độ cảnh báo trên điện thoại:", color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        val modeOptions = listOf(
+                            "Chuông + Rung" to AlertMode.SOUND_AND_VIBRATE,
+                            "Chỉ Rung" to AlertMode.VIBRATE_ONLY,
+                            "Im Lặng" to AlertMode.SILENT
+                        )
+                        modeOptions.forEach { (label, mode) ->
+                            val selected = alertMode == mode
+                            FilterChip(
+                                selected = selected,
+                                onClick = { repository.updateAlertMode(mode) },
+                                label = { Text(label, fontSize = 10.sp, fontWeight = FontWeight.Bold) },
+                                colors = FilterChipDefaults.filterChipColors(
+                                    selectedContainerColor = PrimaryBlue,
+                                    selectedLabelColor = Color.White,
+                                    containerColor = LightSurfaceVariant,
+                                    labelColor = TextPrimary
+                                ),
+                                modifier = Modifier.weight(1f).testTag("chip_alert_mode_${mode.name}")
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text("Kiểu âm thanh cảnh báo:", color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    Spacer(modifier = Modifier.height(6.dp))
+                    val soundRow1 = listOf(
+                        "Còi Hú PCCC" to AlarmSoundType.FIRE_SIREN,
+                        "Bíp Điện Tử" to AlarmSoundType.URGENT_BEEP
+                    )
+                    val soundRow2 = listOf(
+                        "Chuông Báo Thức" to AlarmSoundType.SYSTEM_ALARM,
+                        "Thông Báo Máy" to AlarmSoundType.SYSTEM_NOTIFICATION
+                    )
+                    listOf(soundRow1, soundRow2).forEach { rowItems ->
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            rowItems.forEach { (label, sType) ->
+                                val selected = alarmSoundType == sType
+                                FilterChip(
+                                    selected = selected,
+                                    enabled = alertMode == AlertMode.SOUND_AND_VIBRATE,
+                                    onClick = { repository.updateAlarmSoundType(sType) },
+                                    label = { Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold) },
+                                    colors = FilterChipDefaults.filterChipColors(
+                                        selectedContainerColor = CriticalAlarmRed,
+                                        selectedLabelColor = Color.White,
+                                        containerColor = LightSurfaceVariant,
+                                        labelColor = TextPrimary
+                                    ),
+                                    modifier = Modifier.weight(1f).testTag("chip_sound_type_${sType.name}")
+                                )
+                            }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Độ lớn âm thanh cảnh báo:", color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                        Text("$alarmVolumePercent%", color = PrimaryBlue, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                    }
+                    Slider(
+                        value = alarmVolumePercent.toFloat(),
+                        onValueChange = { repository.updateAlarmVolumePercent(it.roundToInt()) },
+                        enabled = alertMode == AlertMode.SOUND_AND_VIBRATE,
+                        valueRange = 10f..100f,
+                        colors = SliderDefaults.colors(thumbColor = PrimaryBlue, activeTrackColor = PrimaryBlue),
+                        modifier = Modifier.testTag("slider_alarm_volume")
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        OutlinedButton(
+                            onClick = { previewLevel = if (previewLevel == 1) null else 1 },
+                            modifier = Modifier.weight(1f).height(38.dp).testTag("btn_test_sound_l1"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text(
+                                text = if (previewLevel == 1) "Đang phát Mức 1..." else "Nghe thử Mức 1",
+                                color = Color(0xFFD97706),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = { previewLevel = if (previewLevel == 2) null else 2 },
+                            modifier = Modifier.weight(1f).height(38.dp).testTag("btn_test_sound_l2"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text(
+                                text = if (previewLevel == 2) "Đang phát Mức 2..." else "Nghe thử Mức 2",
+                                color = CriticalAlarmRed,
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("Hiện popup & chuông Mức 1 (Cảnh báo sớm)", color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Thông báo & cảnh báo nhẹ ngay khi vượt ngưỡng Mức 1", color = TextSecondary, fontSize = 11.sp)
+                        }
+                        Switch(
+                            checked = level1PopupEnabled,
+                            onCheckedChange = { repository.updateLevel1PopupEnabled(it) },
+                            colors = SwitchDefaults.colors(checkedTrackColor = Color(0xFFD97706)),
+                            modifier = Modifier.testTag("switch_level1_popup")
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),

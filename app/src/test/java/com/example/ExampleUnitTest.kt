@@ -514,4 +514,80 @@ class ExampleUnitTest {
         val flameBypassedPlusHighTemp = com.example.domain.model.SmartFireTelemetry(gasRaw = 900, temperatureCelsius = 65.0f, flame = true)
         assertEquals(com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2, flameBypassedPlusHighTemp.evaluateTwoLevelStatus(noFlameCfg))
     }
+
+    @Test
+    fun testGasFaultAndWarming_doNotTriggerFalseFireAlarm() {
+        // Disconnected/rail-fault MQ-2 (ADC 4095, gasFault=true, state=FAULT) must NOT trigger fire alarm
+        val faultTelem = com.example.domain.model.SmartFireTelemetry(
+            gasRaw = 4095,
+            gasReady = false,
+            gasFault = true,
+            flame = false,
+            state = "FAULT"
+        )
+        assertEquals(com.example.domain.model.SensorAlertLevel.NORMAL, faultTelem.evaluateTwoLevelStatus())
+        val faultProb = faultTelem.calculateFireProbability(gasThresholdAdc = 1800)
+        assertTrue("MQ-2 FAULT 4095 must stay below 20%, got ${faultProb.totalProbabilityPercent}", faultProb.totalProbabilityPercent < 20f)
+        assertTrue(faultProb.riskLevelLabel.contains("LỖI", ignoreCase = true))
+
+        // Warming sensor reading 4095 must NOT trigger false alarm
+        val warmingTelem = com.example.domain.model.SmartFireTelemetry(
+            gasRaw = 4095,
+            gasReady = false,
+            gasFault = false,
+            flame = false,
+            state = "WARMING"
+        )
+        assertEquals(com.example.domain.model.SensorAlertLevel.NORMAL, warmingTelem.evaluateTwoLevelStatus())
+        val warmProb = warmingTelem.calculateFireProbability(gasThresholdAdc = 1800)
+        assertTrue("WARMING must stay below 20%, got ${warmProb.totalProbabilityPercent}", warmProb.totalProbabilityPercent < 20f)
+    }
+
+    @Test
+    fun testDisarmedState_suppressesAlarmAndParsesFromDto() {
+        assertEquals(FirmwareState.DISARMED, FirmwareState.fromString("DISARMED"))
+
+        val json = """
+        {
+          "api_version": 1,
+          "device_id": "smartfire-node-01",
+          "room_id": "room-101",
+          "boot_id": "boot-disarm",
+          "latest_seq": 22,
+          "status": {
+            "uptime_ms": 15000,
+            "state": "DISARMED",
+            "gas_raw": 2900,
+            "flame": false,
+            "gas_ready": true,
+            "gas_fault": false,
+            "alarm": false,
+            "muted": false,
+            "acknowledged": false,
+            "testing": false,
+            "disarmed": true,
+            "horn_requested": false,
+            "horn_enabled": true,
+            "gas_commissioned": true
+          }
+        }
+        """.trimIndent()
+
+        val moshi = Moshi.Builder().addLast(KotlinJsonAdapterFactory()).build()
+        val parsed = moshi.adapter(StatusResponseDto::class.java).fromJson(json)
+        assertNotNull(parsed)
+        assertTrue(parsed!!.status.disarmed)
+        assertEquals("DISARMED", parsed.status.state)
+
+        val disarmedTelem = com.example.domain.model.SmartFireTelemetry(
+            gasRaw = 3500,
+            flame = true,
+            disarmed = true,
+            state = "DISARMED"
+        )
+        assertEquals(com.example.domain.model.SensorAlertLevel.NORMAL, disarmedTelem.evaluateTwoLevelStatus())
+        val prob = disarmedTelem.calculateFireProbability(gasThresholdAdc = 1800)
+        assertEquals(0f, prob.totalProbabilityPercent, 0.01f)
+        assertTrue(prob.riskLevelLabel.contains("TẮT HẲN", ignoreCase = true))
+    }
 }

@@ -25,6 +25,7 @@ data class StatusPayloadDto(
     @Json(name = "muted") val muted: Boolean = false,
     @Json(name = "acknowledged") val acknowledged: Boolean = false,
     @Json(name = "testing") val testing: Boolean = false,
+    @Json(name = "disarmed") val disarmed: Boolean = false,
     @Json(name = "horn_requested") val hornRequested: Boolean = false,
     @Json(name = "horn_enabled") val hornEnabled: Boolean = false,
     @Json(name = "gas_commissioned") val gasCommissioned: Boolean = false,

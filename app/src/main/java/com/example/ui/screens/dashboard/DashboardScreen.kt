@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -113,9 +114,10 @@ enum class ChartTimeRange {
 }
 
 enum class ChartMetricType {
-    GAS_ADC, // Khói ADC
-    TEMP_C,  // Nhiệt °C
-    PROB_PCT // Xác suất %
+    GAS_ADC,  // Khói ADC
+    TEMP_C,   // Nhiệt °C
+    FLAME_IR, // Lửa (IR %)
+    PROB_PCT  // Xác suất %
 }
 
 enum class SensorListFilterTab {
@@ -145,12 +147,17 @@ fun DashboardScreen(
     onSilenceClick: (String) -> Unit,
     onAckClick: (String) -> Unit,
     onTestClick: (String) -> Unit,
+    onDisarmClick: (String) -> Unit = {},
+    onArmClick: (String) -> Unit = {},
     onAdjustMultiSensorParams: (String, Float, Float, Int, Int, Float, Float) -> Unit = { _, _, _, _, _, _, _ -> },
     modifier: Modifier = Modifier
 ) {
-    val alarmNodes = nodes.filter {
-        it.lastKnownAlarm || it.firmwareState == FirmwareState.ALARM ||
-            it.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent >= 75f
+    val alarmNodes = nodes.filter { node ->
+        val isDisarmed = node.telemetry.disarmed || node.firmwareState == FirmwareState.DISARMED
+        val isRealFaultOrWarming = !node.isDemoSensor &&
+            (node.firmwareState == FirmwareState.WARMING || node.firmwareState == FirmwareState.FAULT || node.telemetry.gasFault)
+        !isDisarmed && (node.lastKnownAlarm || node.firmwareState == FirmwareState.ALARM ||
+            (!isRealFaultOrWarming && node.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent >= 75f))
     }
     val onlineCount = nodes.count { it.connectionState == DeviceConnectionState.ONLINE_FRESH }
     val totalCount = nodes.size
@@ -166,6 +173,11 @@ fun DashboardScreen(
     val maxProb = peakNode?.telemetry?.calculateFireProbability(gasThresholdAdc)?.totalProbabilityPercent ?: 3.5f
     val maxTemp = nodes.mapNotNull { it.telemetry.temperatureCelsius }.maxOrNull() ?: 28.5f
     val maxGas = nodes.maxOfOrNull { it.telemetry.gasRaw } ?: 920
+    val currentFlamePct = if (nodes.any { it.telemetry.flame }) {
+        100f
+    } else {
+        ((nodes.maxOfOrNull { it.telemetry.irFlameIntensity ?: 0f } ?: 0f) * 100f).coerceIn(0f, 100f)
+    }
     val maxCo = nodes.mapNotNull { it.telemetry.coPpm }.maxOrNull() ?: 12
     val avgHum = if (nodes.any { it.telemetry.humidityPercent != null }) nodes.mapNotNull { it.telemetry.humidityPercent }.average().toFloat() else 60f
 
@@ -526,27 +538,40 @@ fun DashboardScreen(
 
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Metric Selector Chips: Khói ADC | Nhiệt °C | P(Cháy) %
-                    Row(
+                    // Metric Selector Chips: Khói ADC | Nhiệt °C | Lửa (IR) | P(Cháy) %
+                    LazyRow(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        MetricFilterChip(
-                            label = "Khói MQ-2 (ADC)",
-                            selected = selectedMetric == ChartMetricType.GAS_ADC,
-                            onClick = { selectedMetric = ChartMetricType.GAS_ADC }
-                        )
-                        MetricFilterChip(
-                            label = "Nhiệt Độ (°C)",
-                            selected = selectedMetric == ChartMetricType.TEMP_C,
-                            onClick = { selectedMetric = ChartMetricType.TEMP_C }
-                        )
-                        MetricFilterChip(
-                            label = "P(Cháy) %",
-                            selected = selectedMetric == ChartMetricType.PROB_PCT,
-                            onClick = { selectedMetric = ChartMetricType.PROB_PCT }
-                        )
+                        item {
+                            MetricFilterChip(
+                                label = "Khói MQ-2 (ADC)",
+                                selected = selectedMetric == ChartMetricType.GAS_ADC,
+                                onClick = { selectedMetric = ChartMetricType.GAS_ADC }
+                            )
+                        }
+                        item {
+                            MetricFilterChip(
+                                label = "Nhiệt Độ (°C)",
+                                selected = selectedMetric == ChartMetricType.TEMP_C,
+                                onClick = { selectedMetric = ChartMetricType.TEMP_C }
+                            )
+                        }
+                        item {
+                            MetricFilterChip(
+                                label = "Lửa (IR %)",
+                                selected = selectedMetric == ChartMetricType.FLAME_IR,
+                                onClick = { selectedMetric = ChartMetricType.FLAME_IR }
+                            )
+                        }
+                        item {
+                            MetricFilterChip(
+                                label = "P(Cháy) %",
+                                selected = selectedMetric == ChartMetricType.PROB_PCT,
+                                onClick = { selectedMetric = ChartMetricType.PROB_PCT }
+                            )
+                        }
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
@@ -573,6 +598,7 @@ fun DashboardScreen(
                                 metricType = selectedMetric,
                                 currentGas = maxGas,
                                 currentTemp = maxTemp,
+                                currentFlamePct = currentFlamePct,
                                 currentProb = maxProb,
                                 gasThresholdAdc = gasThresholdAdc,
                                 snapshots = snapshots
@@ -625,11 +651,11 @@ fun DashboardScreen(
                                     modifier = Modifier.weight(1f)
                                 )
                                 SquareMetricBlock(
-                                    title = "P(Cháy)",
+                                    title = "P(Cháy) / Lửa",
                                     mainValue = String.format(Locale.US, "%.1f%%", maxProb),
-                                    subLabel = if (maxProb >= 75f) "Nguy hiểm" else "An toàn",
+                                    subLabel = if (currentFlamePct >= 50f) "CÓ NGỌN LỬA!" else if (maxProb >= 75f) "Nguy hiểm" else "Lửa: Không",
                                     progress = (maxProb / 100f).coerceIn(0.08f, 1f),
-                                    color = if (maxProb >= 75f) CriticalAlarmRed else PrimaryBlue,
+                                    color = if (maxProb >= 75f || currentFlamePct >= 50f) CriticalAlarmRed else PrimaryBlue,
                                     modifier = Modifier.weight(1f)
                                 )
                             }
@@ -916,6 +942,8 @@ fun DashboardScreen(
                         onSilence = { onSilenceClick(node.deviceId) },
                         onAck = { onAckClick(node.deviceId) },
                         onTest = { onTestClick(node.deviceId) },
+                        onDisarm = { onDisarmClick(node.deviceId) },
+                        onArm = { onArmClick(node.deviceId) },
                         onDelete = { onDeleteDeviceClick(node.deviceId) },
                         onAdjustMultiSensorParams = { tempC, ror, gas, co, hum, ir ->
                             onAdjustMultiSensorParams(node.deviceId, tempC, ror, gas, co, hum, ir)
@@ -1239,6 +1267,7 @@ private fun CompactLineChartColumn(
     metricType: ChartMetricType,
     currentGas: Int,
     currentTemp: Float,
+    currentFlamePct: Float,
     currentProb: Float,
     gasThresholdAdc: Int = 1800,
     snapshots: List<SensorSnapshotPoint> = emptyList()
@@ -1272,12 +1301,13 @@ private fun CompactLineChartColumn(
         }
     }
 
-    val seriesValues: List<Float> = remember(orderedSnapshots, timeRange, metricType, currentGas, currentTemp, currentProb) {
+    val seriesValues: List<Float> = remember(orderedSnapshots, timeRange, metricType, currentGas, currentTemp, currentFlamePct, currentProb) {
         if (orderedSnapshots.size == 7) {
             val fromDb = orderedSnapshots.map { snap ->
                 when (metricType) {
                     ChartMetricType.GAS_ADC -> snap.gasRaw.toFloat().coerceAtLeast(250f)
                     ChartMetricType.TEMP_C -> snap.temperatureCelsius.coerceAtLeast(20f)
+                    ChartMetricType.FLAME_IR -> snap.flamePercent.coerceIn(0f, 100f)
                     ChartMetricType.PROB_PCT -> snap.fireProbabilityPercent.coerceIn(1f, 99.9f)
                 }
             }.toMutableList()
@@ -1285,6 +1315,7 @@ private fun CompactLineChartColumn(
             fromDb[fromDb.lastIndex] = when (metricType) {
                 ChartMetricType.GAS_ADC -> maxOf(fromDb.last(), currentGas.toFloat())
                 ChartMetricType.TEMP_C -> maxOf(fromDb.last(), currentTemp)
+                ChartMetricType.FLAME_IR -> maxOf(fromDb.last(), currentFlamePct)
                 ChartMetricType.PROB_PCT -> maxOf(fromDb.last(), currentProb)
             }
             fromDb
@@ -1305,6 +1336,10 @@ private fun CompactLineChartColumn(
                     } else {
                         listOf(base - 3.0f, base - 2.2f, base - 1.8f, base - 1.4f, base - 0.9f, base - 0.4f, base)
                     }
+                }
+                ChartMetricType.FLAME_IR -> {
+                    val base = currentFlamePct.coerceIn(0f, 100f)
+                    listOf(0f, 0f, 0f, 0f, (base * 0.25f), (base * 0.5f), base)
                 }
                 ChartMetricType.PROB_PCT -> {
                     val base = currentProb.coerceIn(2f, 99f)
@@ -1337,19 +1372,30 @@ private fun CompactLineChartColumn(
     val thresholdVal = when (metricType) {
         ChartMetricType.GAS_ADC -> gasThresholdAdc.toFloat()
         ChartMetricType.TEMP_C -> 55f
+        ChartMetricType.FLAME_IR -> 50f
         ChartMetricType.PROB_PCT -> 75f
     }
 
     val unitStr = when (metricType) {
         ChartMetricType.GAS_ADC -> "ADC"
         ChartMetricType.TEMP_C -> "°C"
+        ChartMetricType.FLAME_IR -> "%"
         ChartMetricType.PROB_PCT -> "%"
     }
 
     val minVal = 0f
-    val maxVal = maxOf(thresholdVal * 1.15f, (seriesValues.maxOrNull() ?: 100f) * 1.15f)
+    val maxVal = if (metricType == ChartMetricType.FLAME_IR) {
+        110f
+    } else {
+        maxOf(thresholdVal * 1.15f, (seriesValues.maxOrNull() ?: 100f) * 1.15f)
+    }
     val latestVal = seriesValues.lastOrNull() ?: 0f
-    val lineColor = if (latestVal >= thresholdVal) CriticalAlarmRed else PrimaryBlue
+    val lineColor = when {
+        metricType == ChartMetricType.FLAME_IR && latestVal >= thresholdVal -> Color(0xFFEA580C)
+        metricType == ChartMetricType.FLAME_IR -> Color(0xFFF59E0B)
+        latestVal >= thresholdVal -> CriticalAlarmRed
+        else -> PrimaryBlue
+    }
 
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -1523,13 +1569,18 @@ fun FriendlySensorCard(
     onSilence: () -> Unit,
     onAck: () -> Unit,
     onTest: () -> Unit,
+    onDisarm: () -> Unit = {},
+    onArm: () -> Unit = {},
     onDelete: () -> Unit,
     onAdjustMultiSensorParams: (Float, Float, Int, Int, Float, Float) -> Unit = { _, _, _, _, _, _ -> },
     modifier: Modifier = Modifier
 ) {
     val probBreakdown = node.telemetry.calculateFireProbability(gasThresholdAdc)
     val probPercent = probBreakdown.totalProbabilityPercent
-    val isAlarm = node.lastKnownAlarm || node.firmwareState == FirmwareState.ALARM || probPercent >= 75f
+    val isDisarmed = node.telemetry.disarmed || node.firmwareState == FirmwareState.DISARMED
+    val isRealFaultOrWarming = !node.isDemoSensor &&
+        (node.firmwareState == FirmwareState.WARMING || node.firmwareState == FirmwareState.FAULT || node.telemetry.gasFault)
+    val isAlarm = !isDisarmed && (node.lastKnownAlarm || node.firmwareState == FirmwareState.ALARM || (!isRealFaultOrWarming && probPercent >= 75f))
     val isDemo = node.isDemoSensor || node.displayName.contains("DEMO", ignoreCase = true)
     var showChartDetail by remember { mutableStateOf(false) }
     var showMultiParamSimulator by remember { mutableStateOf(false) }
@@ -1719,9 +1770,9 @@ fun FriendlySensorCard(
                 ) {
                     Text("Khói ADC", color = TextSecondary, fontSize = 9.sp, maxLines = 1)
                     Text(
-                        text = "${node.telemetry.gasRaw}",
-                        color = if (node.telemetry.gasRaw >= gasThresholdAdc) CriticalAlarmRed else PrimaryBlue,
-                        fontSize = 12.sp,
+                        text = if (!node.isDemoSensor && (node.telemetry.gasFault || node.telemetry.gasRaw >= 4090)) "${node.telemetry.gasRaw} (LỖI)" else "${node.telemetry.gasRaw}",
+                        color = if (!node.isDemoSensor && (node.telemetry.gasFault || node.telemetry.gasRaw >= 4090)) WarningAmber else if (node.telemetry.gasRaw >= gasThresholdAdc) CriticalAlarmRed else PrimaryBlue,
+                        fontSize = 11.sp,
                         fontWeight = FontWeight.ExtraBold,
                         maxLines = 1
                     )
@@ -1934,74 +1985,125 @@ fun FriendlySensorCard(
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // Compact Action Row: Dẫn Đường | Tắt Còi | Test Còi
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(6.dp)
-            ) {
-                Button(
-                    onClick = onRouteToSensor,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isAlarm) Color(0xFFEA580C) else PrimaryBlue
-                    ),
-                    shape = RoundedCornerShape(9.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                    modifier = Modifier
-                        .weight(1.2f)
-                        .height(38.dp)
-                        .testTag("btn_route_to_node_${node.deviceId}")
+            // Compact Action Rows: (Dẫn Đường | Test Còi) + (Tắt 30s | Tắt Hẳn / Bật Lại)
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(14.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = if (isAlarm) "Dẫn Tới Đám Cháy" else "Dẫn Đường",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                    Button(
+                        onClick = onRouteToSensor,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isAlarm) Color(0xFFEA580C) else PrimaryBlue
+                        ),
+                        shape = RoundedCornerShape(9.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        modifier = Modifier
+                            .weight(1.25f)
+                            .height(36.dp)
+                            .testTag("btn_route_to_node_${node.deviceId}")
+                    ) {
+                        Icon(Icons.Default.Navigation, contentDescription = null, modifier = Modifier.size(14.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = if (isAlarm) "Dẫn Tới Đám Cháy" else "Dẫn Đường",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    OutlinedButton(
+                        onClick = onTest,
+                        enabled = !isDisarmed,
+                        shape = RoundedCornerShape(9.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        modifier = Modifier
+                            .weight(0.95f)
+                            .height(36.dp)
+                            .testTag("btn_test_${node.deviceId}")
+                    ) {
+                        Icon(Icons.Default.VolumeUp, contentDescription = null, tint = if (isDisarmed) TextSecondary else CriticalAlarmRed, modifier = Modifier.size(14.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Test Còi",
+                            color = if (isDisarmed) TextSecondary else CriticalAlarmRed,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
+                        )
+                    }
                 }
 
-                Button(
-                    onClick = onSilence,
-                    colors = ButtonDefaults.buttonColors(
-                        containerColor = if (isAlarm) CriticalAlarmRed else Color(0xFF475569)
-                    ),
-                    shape = RoundedCornerShape(9.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(38.dp)
-                        .testTag("btn_silence_${node.deviceId}")
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
-                    Icon(Icons.Default.NotificationsOff, contentDescription = null, modifier = Modifier.size(14.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = "Tắt Còi",
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1
-                    )
-                }
+                    Button(
+                        onClick = onSilence,
+                        enabled = !isDisarmed,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = if (isAlarm) CriticalAlarmRed else Color(0xFF475569)
+                        ),
+                        shape = RoundedCornerShape(9.dp),
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(36.dp)
+                            .testTag("btn_silence_${node.deviceId}")
+                    ) {
+                        Icon(Icons.Default.NotificationsOff, contentDescription = null, modifier = Modifier.size(14.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text(
+                            text = "Tắt Tạm 30s",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
+                        )
+                    }
 
-                OutlinedButton(
-                    onClick = onTest,
-                    shape = RoundedCornerShape(9.dp),
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(38.dp)
-                        .testTag("btn_test_${node.deviceId}")
-                ) {
-                    Icon(Icons.Default.VolumeUp, contentDescription = null, tint = CriticalAlarmRed, modifier = Modifier.size(14.dp))
-                    Spacer(modifier = Modifier.width(4.dp))
-                    Text(
-                        text = "Test Còi",
-                        color = CriticalAlarmRed,
-                        fontSize = 11.sp,
-                        fontWeight = FontWeight.Bold,
-                        maxLines = 1
-                    )
+                    if (isDisarmed) {
+                        Button(
+                            onClick = onArm,
+                            colors = ButtonDefaults.buttonColors(containerColor = NormalGreen),
+                            shape = RoundedCornerShape(9.dp),
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp)
+                                .testTag("btn_arm_${node.deviceId}")
+                        ) {
+                            Icon(Icons.Default.CheckCircle, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Bật Lại",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                        }
+                    } else {
+                        Button(
+                            onClick = onDisarm,
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F172A)),
+                            shape = RoundedCornerShape(9.dp),
+                            contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 8.dp, vertical = 0.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp)
+                                .testTag("btn_disarm_${node.deviceId}")
+                        ) {
+                            Icon(Icons.Default.NotificationsOff, contentDescription = null, modifier = Modifier.size(14.dp))
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = "Tắt Hẳn",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
+                            )
+                        }
+                    }
                 }
             }
         }

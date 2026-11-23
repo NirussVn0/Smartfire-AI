@@ -6,6 +6,7 @@ import com.example.data.remote.api.SmartFireHttpClientFactory
 import com.example.data.repository.SmartFireRepository
 import com.example.domain.model.CommandStatus
 import com.example.domain.model.DeviceConnectionState
+import com.example.domain.model.FirmwareState
 import com.example.domain.model.SmartFireTelemetry
 import com.example.service.notification.SmartFireNotificationManager
 import kotlinx.coroutines.CoroutineScope
@@ -163,6 +164,7 @@ class DeviceMonitoringCoordinator(
                         muted = status.muted,
                         acknowledged = status.acknowledged,
                         testing = status.testing,
+                        disarmed = status.disarmed,
                         hornRequested = status.hornRequested,
                         hornEnabled = status.hornEnabled,
                         gasCommissioned = status.gasCommissioned,
@@ -170,13 +172,27 @@ class DeviceMonitoringCoordinator(
                         receivedAt = now
                     )
 
-                    // Notify if ALARM state newly detected AND local device notifications are not muted
+                    val alertMode = repository.alertMode.value
+                    // Notify if ALARM (Level 2) or SUSPECTED (Level 1) newly detected AND local notifications not muted
                     if (status.alarm && !device.lastKnownAlarm && !repository.isLocalNotificationMutedNow()) {
                         notificationManager.showFireAlarmNotification(
                             deviceName = device.displayName,
                             roomName = device.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
                             gasRaw = status.gasRaw,
-                            hasFlame = status.flame
+                            hasFlame = status.flame,
+                            alertMode = alertMode
+                        )
+                    } else if (!status.alarm &&
+                        telemetry.state.equals("SUSPECTED", ignoreCase = true) &&
+                        device.firmwareState != FirmwareState.SUSPECTED &&
+                        repository.level1PopupEnabled.value &&
+                        !repository.isLocalNotificationMutedNow()
+                    ) {
+                        notificationManager.showLevel1WarningNotification(
+                            deviceName = device.displayName,
+                            roomName = device.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
+                            detail = "Phát hiện vượt ngưỡng Mức 1 (Gas=${status.gasRaw} ADC, Lửa=${if (status.flame) "CÓ" else "Không"})",
+                            alertMode = alertMode
                         )
                     }
 
