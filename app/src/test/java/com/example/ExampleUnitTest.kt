@@ -223,4 +223,295 @@ class ExampleUnitTest {
         val smoothed = DeviceMovementTracker.smoothHeadingDegrees(355f, 5f, alpha = 0.5f)
         assertTrue("Smoothed heading across North wrap must stay near 0/360", smoothed < 10f || smoothed > 350f)
     }
+
+    @Test
+    fun testOutdoorPresenceDetection_gpsPolygonAndRssi() {
+        val housePoly = listOf(
+            Point2D(0.15f, 0.15f),
+            Point2D(0.85f, 0.15f),
+            Point2D(0.85f, 0.85f),
+            Point2D(0.15f, 0.85f)
+        )
+
+        // 1. Inside house with good Wi-Fi RSSI
+        val inside = DeviceMovementTracker.evaluatePresenceZone(
+            userPos = Point2D(0.50f, 0.50f),
+            housePolygon = housePoly,
+            houseWidthMeters = 10f,
+            houseLengthMeters = 14f,
+            gpsDistanceFromHouseCenterMeters = 3.0f,
+            gpsAccuracyMeters = 8.0f,
+            hasRealGpsFix = true,
+            rssiDbm = -54,
+            rssiDistanceMeters = 2.4f
+        )
+        assertEquals(com.example.sensor.PresenceZone.INSIDE_HOUSE, inside.zone)
+
+        // 2. Walked outside polygon bounds (must NOT stay stuck inside)
+        val outsidePoly = DeviceMovementTracker.evaluatePresenceZone(
+            userPos = Point2D(0.50f, 1.08f),
+            housePolygon = housePoly,
+            houseWidthMeters = 10f,
+            houseLengthMeters = 14f,
+            gpsDistanceFromHouseCenterMeters = null,
+            gpsAccuracyMeters = 20f,
+            hasRealGpsFix = false,
+            rssiDbm = -68,
+            rssiDistanceMeters = 9.0f
+        )
+        assertEquals(com.example.sensor.PresenceZone.OUTSIDE_HOUSE, outsidePoly.zone)
+
+        // 3. Clearly outside via GPS geo-fence (45m away)
+        val outsideGps = DeviceMovementTracker.evaluatePresenceZone(
+            userPos = Point2D(0.50f, 0.50f),
+            housePolygon = housePoly,
+            houseWidthMeters = 10f,
+            houseLengthMeters = 14f,
+            gpsDistanceFromHouseCenterMeters = 45.0f,
+            gpsAccuracyMeters = 8.0f,
+            hasRealGpsFix = true,
+            rssiDbm = -75,
+            rssiDistanceMeters = 15.0f
+        )
+        assertEquals(com.example.sensor.PresenceZone.OUTSIDE_HOUSE, outsideGps.zone)
+        assertTrue(outsideGps.isGpsOutside)
+        assertTrue(outsideGps.distanceOutsideMeters > 30f)
+
+        // 4. All real ESP32 nodes offline -> outside Wi-Fi coverage
+        val outsideOffline = DeviceMovementTracker.evaluatePresenceZone(
+            userPos = Point2D(0.50f, 0.50f),
+            housePolygon = housePoly,
+            houseWidthMeters = 10f,
+            houseLengthMeters = 14f,
+            gpsDistanceFromHouseCenterMeters = null,
+            gpsAccuracyMeters = 30f,
+            hasRealGpsFix = false,
+            rssiDbm = -88,
+            rssiDistanceMeters = 35.0f,
+            allRealNodesOffline = true
+        )
+        assertEquals(com.example.sensor.PresenceZone.OUTSIDE_HOUSE, outsideOffline.zone)
+        assertTrue(outsideOffline.isRssiWeakOrOffline)
+    }
+
+    @Test
+    fun testRssiKalmanFilter_suppressesSpikeAndDistanceCalibration() {
+        val filter = com.example.domain.model.RssiKalmanFilter()
+        filter.update(-55)
+        filter.update(-56)
+        filter.update(-54)
+        // Sudden multipath outlier spike (-95 dBm) must be rejected by median+Kalman
+        val afterSpike = filter.update(-95)
+        assertTrue("Spike must be suppressed, got $afterSpike", afterSpike in -60..-52)
+
+        val telemAt1m = com.example.domain.model.SmartFireTelemetry(
+            rssiDbm = -45,
+            txPower1m = -45,
+            pathLossN = 2.4f
+        )
+        assertEquals(1.0f, telemAt1m.estimateDistanceFromRssiMeters(), 0.05f)
+
+        val telemAt10m = com.example.domain.model.SmartFireTelemetry(
+            rssiDbm = -69,
+            txPower1m = -45,
+            pathLossN = 2.4f
+        )
+        assertEquals(10.0f, telemAt10m.estimateDistanceFromRssiMeters(), 0.2f)
+    }
+
+    @Test
+    fun testTurnByTurnNavigator_turnLeftNextStepAndOutdoorBanner() {
+        // Route: Go North 10m, then Turn Left (West) 8m
+        val route = com.example.domain.pathfinding.NavigationRoute(
+            pathPoints = listOf(
+                Point2D(0.5f, 0.9f),
+                Point2D(0.5f, 0.4f),
+                Point2D(0.1f, 0.4f)
+            ),
+            totalDistanceMeters = 18f,
+            targetName = "Cửa Exit 1",
+            targetType = "EXIT",
+            crossesHazardRoom = false
+        )
+
+        val indoorGuidance = com.example.domain.pathfinding.TurnByTurnNavigator.buildGuidance(
+            route = route,
+            userHeadingDeg = 0f, // Facing North
+            houseWidthMeters = 20f,
+            houseLengthMeters = 20f,
+            isOutsideHouse = false
+        )
+        assertEquals(com.example.domain.pathfinding.TurnDirection.TURN_LEFT, indoorGuidance.currentStep.direction)
+        assertTrue(indoorGuidance.currentStep.primaryText.contains("rẽ trái", ignoreCase = true))
+        assertNotNull(indoorGuidance.nextStep)
+        assertTrue(indoorGuidance.nextStep!!.primaryText.contains("đi thẳng", ignoreCase = true))
+
+        // Far outdoor distance (500m)
+        val outdoorGuidance = com.example.domain.pathfinding.TurnByTurnNavigator.buildGuidance(
+            route = route,
+            userHeadingDeg = 0f,
+            houseWidthMeters = 20f,
+            houseLengthMeters = 20f,
+            isOutsideHouse = true,
+            outdoorOverrideDistanceMeters = 500f
+        )
+        assertTrue(outdoorGuidance.isOutsideHouse)
+        assertTrue(outdoorGuidance.currentStep.primaryText.contains("500m"))
+        assertTrue(outdoorGuidance.currentStep.primaryText.contains("cửa thoát hiểm", ignoreCase = true))
+    }
+
+    @Test
+    fun testEspConfigAndStatusWifiDtoParsing() {
+        val json = """
+        {
+          "api_version": 1,
+          "device_id": "smartfire-node-01",
+          "room_id": "kitchen",
+          "boot_id": "abcd1234",
+          "latest_seq": 9,
+          "status": {
+            "uptime_ms": 50000,
+            "state": "NORMAL",
+            "gas_raw": 820,
+            "flame": false,
+            "gas_ready": true,
+            "gas_fault": false,
+            "alarm": false,
+            "muted": false,
+            "acknowledged": false,
+            "testing": false,
+            "horn_requested": false,
+            "horn_enabled": true,
+            "gas_commissioned": true,
+            "wifi_rssi": -58,
+            "wifi_rssi_raw": -60,
+            "wifi_reconnects": 2,
+            "gas_on": 2200,
+            "gas_off": 1700,
+            "tx_power_1m": -45,
+            "path_loss_n": 2.4,
+            "firmware_version": "2.1.0-wifi-ota"
+          }
+        }
+        """.trimIndent()
+
+        val moshi = Moshi.Builder().addLast(KotlinJsonAdapterFactory()).build()
+        val parsed = moshi.adapter(StatusResponseDto::class.java).fromJson(json)
+        assertNotNull(parsed)
+        assertEquals(-58, parsed!!.status.wifiRssi)
+        assertEquals(2L, parsed.status.wifiReconnects)
+        assertEquals(2200, parsed.status.gasOn)
+        assertEquals(1700, parsed.status.gasOff)
+        assertEquals(-45, parsed.status.txPower1m)
+        assertEquals("2.1.0-wifi-ota", parsed.status.firmwareVersion)
+    }
+
+    @Test
+    fun testTurnByTurnAndOutdoorStepExit_respectsLiveHeadingAndUnclampedBounds() {
+        val route = com.example.domain.pathfinding.NavigationRoute(
+            pathPoints = listOf(
+                Point2D(0.5f, 0.9f),
+                Point2D(0.5f, 0.4f),
+                Point2D(0.5f, 0.4f) // degenerate duplicate waypoint must be ignored
+            ),
+            totalDistanceMeters = 10f,
+            targetName = "Cửa Chính",
+            targetType = "EXIT",
+            crossesHazardRoom = false
+        )
+
+        // User facing South (180 deg) while Exit is North (0 deg) -> must instruct U-turn
+        val guidance = com.example.domain.pathfinding.TurnByTurnNavigator.buildGuidance(
+            route = route,
+            userHeadingDeg = 180f,
+            houseWidthMeters = 12f,
+            houseLengthMeters = 20f,
+            isOutsideHouse = false
+        )
+        assertEquals(com.example.domain.pathfinding.TurnDirection.U_TURN, guidance.currentStep.direction)
+        assertTrue(guidance.currentStep.primaryText.contains("quay đầu", ignoreCase = true))
+
+        // Walking South past the bottom house wall (0.90) with allowOutsideBounds = true leaves the polygon
+        val fused = DeviceMovementTracker.fuseIndoorPosition(
+            currentPos = Point2D(0.50f, 0.90f),
+            stepsDelta = 5,
+            stepStrideMeters = 0.70f,
+            compassHeadingDeg = 180f,
+            houseWidthMeters = 10f,
+            houseLengthMeters = 14f,
+            anchorPos = null,
+            rssiDistanceMeters = 8.0f,
+            rssiDbm = -72,
+            allowOutsideBounds = true
+        )
+        assertTrue("Walking past wall must exit > 1.0 normalized Y, got ${fused.fusedPosition.y}", fused.fusedPosition.y > 1.0f)
+    }
+
+    @Test
+    fun testTwoLevelThresholds_independentWarningAndAlarmLevels() {
+        val cfg = com.example.domain.model.EspDeviceConfig(
+            mq2Enabled = true,
+            gasWarn = 1800,
+            gasOn = 2400,
+            gasOff = 1500,
+            tempEnabled = true,
+            tempWarnC = 45.0f,
+            tempAlarmC = 60.0f,
+            flameEnabled = true
+        )
+
+        // MQ-2 only checks
+        val mq2Normal = com.example.domain.model.SmartFireTelemetry(gasRaw = 1400, temperatureCelsius = 30.0f)
+        assertEquals(com.example.domain.model.SensorAlertLevel.NORMAL, mq2Normal.evaluateTwoLevelStatus(cfg))
+
+        val mq2Warn = com.example.domain.model.SmartFireTelemetry(gasRaw = 1950, temperatureCelsius = 30.0f)
+        assertEquals(com.example.domain.model.SensorAlertLevel.WARNING_LEVEL_1, mq2Warn.evaluateTwoLevelStatus(cfg))
+        val mq2WarnProb = mq2Warn.calculateFireProbability(config = cfg)
+        assertTrue("Mức 1 MQ-2 phải nằm trong [45..74.9], thực tế ${mq2WarnProb.totalProbabilityPercent}", mq2WarnProb.totalProbabilityPercent in 45f..74.9f)
+        assertTrue(mq2WarnProb.riskLevelLabel.contains("MỨC 1"))
+
+        val mq2Alarm = com.example.domain.model.SmartFireTelemetry(gasRaw = 2500, temperatureCelsius = 30.0f)
+        assertEquals(com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2, mq2Alarm.evaluateTwoLevelStatus(cfg))
+        val mq2AlarmProb = mq2Alarm.calculateFireProbability(config = cfg)
+        assertTrue("Mức 2 MQ-2 phải >= 78%, thực tế ${mq2AlarmProb.totalProbabilityPercent}", mq2AlarmProb.totalProbabilityPercent >= 78f)
+        assertTrue(mq2AlarmProb.riskLevelLabel.contains("MỨC 2"))
+
+        // Temperature only checks
+        val tempNormal = com.example.domain.model.SmartFireTelemetry(gasRaw = 800, temperatureCelsius = 35.0f)
+        assertEquals(com.example.domain.model.SensorAlertLevel.NORMAL, tempNormal.evaluateTwoLevelStatus(cfg))
+
+        val tempWarn = com.example.domain.model.SmartFireTelemetry(gasRaw = 800, temperatureCelsius = 50.0f)
+        assertEquals(com.example.domain.model.SensorAlertLevel.WARNING_LEVEL_1, tempWarn.evaluateTwoLevelStatus(cfg))
+        val tempWarnProb = tempWarn.calculateFireProbability(config = cfg)
+        assertTrue("Mức 1 Nhiệt độ phải nằm trong [45..74.9], thực tế ${tempWarnProb.totalProbabilityPercent}", tempWarnProb.totalProbabilityPercent in 45f..74.9f)
+
+        val tempAlarm = com.example.domain.model.SmartFireTelemetry(gasRaw = 800, temperatureCelsius = 64.0f)
+        assertEquals(com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2, tempAlarm.evaluateTwoLevelStatus(cfg))
+        val tempAlarmProb = tempAlarm.calculateFireProbability(config = cfg)
+        assertTrue("Mức 2 Nhiệt độ phải >= 78%, thực tế ${tempAlarmProb.totalProbabilityPercent}", tempAlarmProb.totalProbabilityPercent >= 78f)
+    }
+
+    @Test
+    fun testSensorBypass_disabledSensorDoesNotTriggerWhileEnabledWorks() {
+        // 1. MQ-2 disabled -> high gas does not alert
+        val noMq2Cfg = com.example.domain.model.EspDeviceConfig(mq2Enabled = false, tempEnabled = true, flameEnabled = true)
+        val highGas = com.example.domain.model.SmartFireTelemetry(gasRaw = 3600, temperatureCelsius = 32.0f, flame = false)
+        assertEquals(com.example.domain.model.SensorAlertLevel.NORMAL, highGas.evaluateTwoLevelStatus(noMq2Cfg))
+        assertTrue(highGas.calculateFireProbability(config = noMq2Cfg).totalProbabilityPercent < 45f)
+
+        // 2. Temperature disabled -> high temp does not alert
+        val noTempCfg = com.example.domain.model.EspDeviceConfig(mq2Enabled = true, tempEnabled = false, flameEnabled = true)
+        val highTemp = com.example.domain.model.SmartFireTelemetry(gasRaw = 900, temperatureCelsius = 90.0f, flame = false)
+        assertEquals(com.example.domain.model.SensorAlertLevel.NORMAL, highTemp.evaluateTwoLevelStatus(noTempCfg))
+        assertTrue(highTemp.calculateFireProbability(config = noTempCfg).totalProbabilityPercent < 45f)
+
+        // 3. Flame disabled -> flame=true suppressed, while enabled Temperature still triggers Level 2
+        val noFlameCfg = com.example.domain.model.EspDeviceConfig(mq2Enabled = true, tempEnabled = true, flameEnabled = false)
+        val flameOnly = com.example.domain.model.SmartFireTelemetry(gasRaw = 900, temperatureCelsius = 32.0f, flame = true, irFlameIntensity = 0.95f)
+        assertEquals(com.example.domain.model.SensorAlertLevel.NORMAL, flameOnly.evaluateTwoLevelStatus(noFlameCfg))
+        assertTrue(flameOnly.calculateFireProbability(config = noFlameCfg).totalProbabilityPercent < 45f)
+
+        val flameBypassedPlusHighTemp = com.example.domain.model.SmartFireTelemetry(gasRaw = 900, temperatureCelsius = 65.0f, flame = true)
+        assertEquals(com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2, flameBypassedPlusHighTemp.evaluateTwoLevelStatus(noFlameCfg))
+    }
 }

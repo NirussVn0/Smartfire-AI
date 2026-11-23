@@ -27,6 +27,7 @@ class DeviceMonitoringCoordinator(
     private val pollingJobs = ConcurrentHashMap<String, Job>()
     private val lastSeenTimestamp = ConcurrentHashMap<String, Long>()
     private val lastSeenUptime = ConcurrentHashMap<String, Long>()
+    private val rssiFilters = ConcurrentHashMap<String, com.example.domain.model.RssiKalmanFilter>()
 
     private var masterJob: Job? = null
 
@@ -93,10 +94,19 @@ class DeviceMonitoringCoordinator(
                 val timeoutSec = repository.httpTimeoutSeconds.value
                 val service = SmartFireHttpClientFactory.getService(device.ipAddress, token, timeoutSec)
 
-                val response = try {
+                var response = try {
                     service.getStatus()
                 } catch (_: Exception) {
                     null
+                }
+                // 1 fast retry on transient Wi-Fi packet loss to prevent false OFFLINE flickers
+                if (response == null || !response.isSuccessful) {
+                    delay(150L)
+                    response = try {
+                        service.getStatus()
+                    } catch (_: Exception) {
+                        null
+                    }
                 }
 
                 val now = System.currentTimeMillis()
@@ -119,6 +129,9 @@ class DeviceMonitoringCoordinator(
                         0L
                     }
 
+                    val rssiFilter = rssiFilters.getOrPut(deviceId) { com.example.domain.model.RssiKalmanFilter() }
+                    val smoothedRssi = status.wifiRssi?.let { rssiFilter.update(it) } ?: device.telemetry.rssiDbm
+
                     val telemetry = SmartFireTelemetry(
                         uptimeMs = status.uptimeMs,
                         temperatureCelsius = status.temperatureCelsius,
@@ -126,6 +139,21 @@ class DeviceMonitoringCoordinator(
                         coPpm = status.coPpm,
                         tempRateOfRiseCPerMin = status.tempRateOfRise,
                         irFlameIntensity = if (status.flame) 0.88f else null,
+                        rssiDbm = smoothedRssi,
+                        wifiReconnects = status.wifiReconnects ?: 0L,
+                        txPower1m = status.txPower1m ?: -45,
+                        pathLossN = status.pathLossN ?: 2.4f,
+                        mq2Enabled = status.mq2Enabled ?: true,
+                        gasWarnThreshold = status.gasWarn ?: 1800,
+                        gasOnThreshold = status.gasOn ?: 2400,
+                        gasOffThreshold = status.gasOff ?: 1600,
+                        tempEnabled = status.tempEnabled ?: true,
+                        tempWarnC = status.tempWarnC ?: 45.0f,
+                        tempAlarmC = status.tempAlarmC ?: 60.0f,
+                        flameEnabled = status.flameEnabled ?: true,
+                        flameWarnMs = status.flameWarnMs ?: 150,
+                        flameAlarmMs = status.flameAlarmMs ?: 500,
+                        firmwareVersion = status.firmwareVersion ?: "",
                         alarmStartedAtMs = alarmStartMs,
                         gasRaw = status.gasRaw,
                         flame = status.flame,
@@ -142,8 +170,8 @@ class DeviceMonitoringCoordinator(
                         receivedAt = now
                     )
 
-                    // Notify if ALARM state newly detected
-                    if (status.alarm && !device.lastKnownAlarm) {
+                    // Notify if ALARM state newly detected AND local device notifications are not muted
+                    if (status.alarm && !device.lastKnownAlarm && !repository.isLocalNotificationMutedNow()) {
                         notificationManager.showFireAlarmNotification(
                             deviceName = device.displayName,
                             roomName = device.firmwareRoomId.ifBlank { "Khu vực cảm biến" },

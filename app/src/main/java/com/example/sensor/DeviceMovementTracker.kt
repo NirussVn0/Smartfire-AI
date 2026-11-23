@@ -26,6 +26,21 @@ import kotlin.math.hypot
 import kotlin.math.sin
 import kotlin.math.sqrt
 
+enum class PresenceZone {
+    INSIDE_HOUSE,
+    NEAR_BOUNDARY,
+    OUTSIDE_HOUSE
+}
+
+data class OutdoorDetectionState(
+    val zone: PresenceZone,
+    val distanceOutsideMeters: Float,
+    val distanceToHouseCenterMeters: Float,
+    val isGpsOutside: Boolean,
+    val isRssiWeakOrOffline: Boolean,
+    val reason: String
+)
+
 data class TriSensorFusionResult(
     val fusedPosition: Point2D,
     val fusedDistanceToAnchorMeters: Float,
@@ -360,9 +375,137 @@ class DeviceMovementTracker(
         }
 
         /**
+         * Ray-casting point-in-polygon check (works for arbitrary house polygons).
+         */
+        fun isPointInsidePolygon(pt: Point2D, polygon: List<Point2D>): Boolean {
+            if (polygon.size < 3) {
+                return pt.x in 0.06f..0.94f && pt.y in 0.06f..0.94f
+            }
+            var inside = false
+            var j = polygon.lastIndex
+            for (i in polygon.indices) {
+                val xi = polygon[i].x
+                val yi = polygon[i].y
+                val xj = polygon[j].x
+                val yj = polygon[j].y
+                val denom = (yj - yi).let { if (abs(it) < 0.00001f) 0.00001f else it }
+                val intersect = ((yi > pt.y) != (yj > pt.y)) &&
+                    (pt.x < (xj - xi) * (pt.y - yi) / denom + xi)
+                if (intersect) inside = !inside
+                j = i
+            }
+            return inside
+        }
+
+        /**
+         * Determines whether the user is INSIDE_HOUSE, NEAR_BOUNDARY, or OUTSIDE_HOUSE
+         * using multi-signal fusion:
+         * 1. Floorplan polygon containment on unclamped IMU+RSSI position
+         * 2. Real GPS geo-fence distance from house center (when GPS fix is available)
+         * 3. ESP32 Wi-Fi RSSI signal drop / OFFLINE detection
+         */
+        fun evaluatePresenceZone(
+            userPos: Point2D,
+            housePolygon: List<Point2D>,
+            houseWidthMeters: Float,
+            houseLengthMeters: Float,
+            gpsDistanceFromHouseCenterMeters: Float?,
+            gpsAccuracyMeters: Float,
+            hasRealGpsFix: Boolean,
+            rssiDbm: Int?,
+            rssiDistanceMeters: Float?,
+            allRealNodesOffline: Boolean = false
+        ): OutdoorDetectionState {
+            val safeW = houseWidthMeters.coerceAtLeast(4f)
+            val safeL = houseLengthMeters.coerceAtLeast(4f)
+            val houseRadiusM = hypot((safeW / 2f).toDouble(), (safeL / 2f).toDouble()).toFloat()
+
+            val cx = if (housePolygon.size >= 3) housePolygon.map { it.x }.average().toFloat() else 0.50f
+            val cy = if (housePolygon.size >= 3) housePolygon.map { it.y }.average().toFloat() else 0.50f
+            val localDistFromCenterM = hypot(
+                ((userPos.x - cx) * safeW).toDouble(),
+                ((userPos.y - cy) * safeL).toDouble()
+            ).toFloat()
+
+            val insidePoly = isPointInsidePolygon(userPos, housePolygon)
+
+            // 1. GPS geo-fence check (accounts for GPS uncertainty margin so indoor jitter doesn't false-trigger)
+            val gpsMarginM = (gpsAccuracyMeters.coerceIn(3f, 25f) * 0.45f).coerceAtLeast(2.5f)
+            val isGpsClearlyOutside = hasRealGpsFix &&
+                gpsDistanceFromHouseCenterMeters != null &&
+                gpsAccuracyMeters <= 25f &&
+                gpsDistanceFromHouseCenterMeters > (houseRadiusM + gpsMarginM)
+
+            // 2. Wi-Fi RSSI / offline check
+            val maxIndoorRssiRangeM = maxOf(safeW, safeL) * 1.15f + 2.5f
+            val isRssiWeak = (rssiDbm != null && rssiDbm <= -82) ||
+                (rssiDistanceMeters != null && rssiDistanceMeters > maxIndoorRssiRangeM)
+            val isRssiWeakOrOffline = isRssiWeak || allRealNodesOffline
+
+            if (isGpsClearlyOutside) {
+                val distOut = (gpsDistanceFromHouseCenterMeters!! - houseRadiusM).coerceAtLeast(1.0f)
+                return OutdoorDetectionState(
+                    zone = PresenceZone.OUTSIDE_HOUSE,
+                    distanceOutsideMeters = distOut,
+                    distanceToHouseCenterMeters = gpsDistanceFromHouseCenterMeters,
+                    isGpsOutside = true,
+                    isRssiWeakOrOffline = isRssiWeakOrOffline,
+                    reason = if (isRssiWeakOrOffline) "GPS & Wi-Fi xác nhận ngoài nhà" else "GPS xác nhận đã ra khỏi nhà"
+                )
+            }
+
+            if (!insidePoly) {
+                val distOut = (localDistFromCenterM - houseRadiusM * 0.72f).coerceAtLeast(0.8f)
+                return OutdoorDetectionState(
+                    zone = PresenceZone.OUTSIDE_HOUSE,
+                    distanceOutsideMeters = distOut,
+                    distanceToHouseCenterMeters = localDistFromCenterM,
+                    isGpsOutside = false,
+                    isRssiWeakOrOffline = isRssiWeakOrOffline,
+                    reason = "Vị trí bước chân đã vượt ra ngoài ranh giới nhà"
+                )
+            }
+
+            if (isRssiWeakOrOffline && (rssiDbm == null || rssiDbm <= -85 || allRealNodesOffline)) {
+                val estDist = rssiDistanceMeters ?: (houseRadiusM + 4.0f)
+                return OutdoorDetectionState(
+                    zone = PresenceZone.OUTSIDE_HOUSE,
+                    distanceOutsideMeters = (estDist - houseRadiusM).coerceAtLeast(1.5f),
+                    distanceToHouseCenterMeters = estDist,
+                    isGpsOutside = false,
+                    isRssiWeakOrOffline = true,
+                    reason = if (allRealNodesOffline) "Mất kết nối LAN ESP32 (Ngoài vùng phủ sóng nhà)" else "Tín hiệu Wi-Fi ESP32 rất yếu (${rssiDbm} dBm)"
+                )
+            }
+
+            // Near boundary check (within 1.0m of house edge)
+            if (localDistFromCenterM >= houseRadiusM * 0.85f) {
+                return OutdoorDetectionState(
+                    zone = PresenceZone.NEAR_BOUNDARY,
+                    distanceOutsideMeters = 0f,
+                    distanceToHouseCenterMeters = localDistFromCenterM,
+                    isGpsOutside = false,
+                    isRssiWeakOrOffline = isRssiWeakOrOffline,
+                    reason = "Sát cửa / ranh giới ngoài nhà"
+                )
+            }
+
+            return OutdoorDetectionState(
+                zone = PresenceZone.INSIDE_HOUSE,
+                distanceOutsideMeters = 0f,
+                distanceToHouseCenterMeters = localDistFromCenterM,
+                isGpsOutside = false,
+                isRssiWeakOrOffline = false,
+                reason = "Trong phạm vi căn nhà"
+            )
+        }
+
+        /**
          * Tri-Sensor Indoor Position Fusion:
          * Combines (1) Phone IMU Steps, (2) Phone Gyro/Compass True-North Heading, and
          * (3) External ESP32 RSSI radial distance to suppress dead-reckoning drift with 0% GPS reliance indoors.
+         * When [allowOutsideBounds] is true, walking out past the walls allows the position to leave [0.06..0.94]
+         * so outdoor departure is accurately reflected instead of sticking the icon inside the house.
          */
         fun fuseIndoorPosition(
             currentPos: Point2D,
@@ -374,12 +517,15 @@ class DeviceMovementTracker(
             anchorPos: Point2D?,
             rssiDistanceMeters: Float,
             rssiDbm: Int,
-            activePath: List<Point2D>? = null
+            activePath: List<Point2D>? = null,
+            allowOutsideBounds: Boolean = true
         ): TriSensorFusionResult {
             val safeWidth = houseWidthMeters.coerceAtLeast(4.0f)
             val safeLength = houseLengthMeters.coerceAtLeast(4.0f)
             val stride = stepStrideMeters.coerceIn(0.40f, 1.0f)
             val stepMeters = (stepsDelta.coerceAtLeast(0)) * stride
+            val minBound = if (allowOutsideBounds) -0.30f else 0.06f
+            val maxBound = if (allowOutsideBounds) 1.30f else 0.94f
 
             // 1. Dead-reckoning prediction from Phone IMU Steps + Phone Compass Heading (North-Up: 0° = -Y, 90° = +X)
             val pdrPos = if (stepMeters > 0f) {
@@ -414,16 +560,16 @@ class DeviceMovementTracker(
                     val combNorm = hypot(combX.toDouble(), combY.toDouble()).toFloat().coerceAtLeast(0.01f)
 
                     Point2D(
-                        x = (currentPos.x + (combX / combNorm) * moveM / safeWidth).coerceIn(0.06f, 0.94f),
-                        y = (currentPos.y + (combY / combNorm) * moveM / safeLength).coerceIn(0.06f, 0.94f)
+                        x = (currentPos.x + (combX / combNorm) * moveM / safeWidth).coerceIn(minBound, maxBound),
+                        y = (currentPos.y + (combY / combNorm) * moveM / safeLength).coerceIn(minBound, maxBound)
                     )
                 } else {
                     val rad = Math.toRadians(compassHeadingDeg.toDouble())
                     val dxM = sin(rad).toFloat() * stepMeters
                     val dyM = -cos(rad).toFloat() * stepMeters
                     Point2D(
-                        x = (currentPos.x + dxM / safeWidth).coerceIn(0.06f, 0.94f),
-                        y = (currentPos.y + dyM / safeLength).coerceIn(0.06f, 0.94f)
+                        x = (currentPos.x + dxM / safeWidth).coerceIn(minBound, maxBound),
+                        y = (currentPos.y + dyM / safeLength).coerceIn(minBound, maxBound)
                     )
                 }
             } else {
@@ -435,7 +581,7 @@ class DeviceMovementTracker(
                 val fallbackDist = if (stepMeters > 0f) stepMeters else rssiDistanceMeters
                 return TriSensorFusionResult(
                     fusedPosition = pdrPos,
-                    fusedDistanceToAnchorMeters = fallbackDist.coerceIn(0.4f, 40f),
+                    fusedDistanceToAnchorMeters = fallbackDist.coerceIn(0.4f, 60f),
                     estimatedErrorMeters = 1.15f,
                     accuracyPercent = 86.5f,
                     discrepancyMeters = 0f,
@@ -449,7 +595,7 @@ class DeviceMovementTracker(
             val vecXM = (pdrPos.x - anchorPos.x) * safeWidth
             val vecYM = (pdrPos.y - anchorPos.y) * safeLength
             val pdrDistM = hypot(vecXM.toDouble(), vecYM.toDouble()).toFloat()
-            val clampedRssiM = rssiDistanceMeters.coerceIn(0.4f, 35.0f)
+            val clampedRssiM = rssiDistanceMeters.coerceIn(0.35f, 60.0f)
             val discrepancy = abs(pdrDistM - clampedRssiM)
 
             // Stronger signal (-30..-64 dBm) gets higher RSSI correction weight; noisy weak signal gets gentler pull
@@ -468,8 +614,8 @@ class DeviceMovementTracker(
                 val targetDistM = pdrDistM + (clampedRssiM - pdrDistM) * alphaRssi
                 val scale = targetDistM / pdrDistM
                 Point2D(
-                    x = (anchorPos.x + (vecXM * scale) / safeWidth).coerceIn(0.06f, 0.94f),
-                    y = (anchorPos.y + (vecYM * scale) / safeLength).coerceIn(0.06f, 0.94f)
+                    x = (anchorPos.x + (vecXM * scale) / safeWidth).coerceIn(minBound, maxBound),
+                    y = (anchorPos.y + (vecYM * scale) / safeLength).coerceIn(minBound, maxBound)
                 )
             } else {
                 pdrPos

@@ -18,9 +18,9 @@ object SmartFireHttpClientFactory {
 
     private val clientCache = ConcurrentHashMap<String, SmartFireApiService>()
 
-    fun getService(ipAddress: String, bearerToken: String, timeoutSeconds: Int = 2): SmartFireApiService {
+    fun getService(ipAddress: String, bearerToken: String, timeoutSeconds: Int = 3): SmartFireApiService {
         val sanitizedIp = ipAddress.trim().removePrefix("http://").removePrefix("https://").trimEnd('/')
-        val clampedTimeout = timeoutSeconds.coerceIn(1, 15).toLong()
+        val clampedTimeout = timeoutSeconds.coerceIn(1, 60).toLong()
         val cacheKey = "$sanitizedIp::$bearerToken::$clampedTimeout"
 
         return clientCache.getOrPut(cacheKey) {
@@ -28,6 +28,7 @@ object SmartFireHttpClientFactory {
                 .connectTimeout(clampedTimeout, TimeUnit.SECONDS)
                 .readTimeout(clampedTimeout, TimeUnit.SECONDS)
                 .writeTimeout(clampedTimeout, TimeUnit.SECONDS)
+                .retryOnConnectionFailure(true)
                 .addInterceptor(AuthInterceptor(bearerToken))
                 .build()
 
@@ -42,10 +43,16 @@ object SmartFireHttpClientFactory {
         }
     }
 
+    fun getOtaService(ipAddress: String, bearerToken: String): SmartFireApiService {
+        return getService(ipAddress = ipAddress, bearerToken = bearerToken, timeoutSeconds = 60)
+    }
+
     private class AuthInterceptor(private val token: String) : Interceptor {
         override fun intercept(chain: Interceptor.Chain): Response {
             val original = chain.request()
             val requestBuilder = original.newBuilder()
+                // ESP32 single-threaded WebServer handles short-lived connections far more reliably
+                .header("Connection", "close")
             if (token.isNotBlank()) {
                 requestBuilder.header("Authorization", "Bearer $token")
             }

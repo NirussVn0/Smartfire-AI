@@ -58,9 +58,11 @@ class SmartFireRepository(context: Context) {
         const val DEFAULT_TOKEN = "b57701282c9b134039851e5ba993be6a3f025322f437644f"
     }
 
+    private val appContext = context.applicationContext
     private val db = SmartFireDatabase.getInstance(context)
     private val dao = db.smartFireDao()
     private val tokenStore = SecureTokenStore(context)
+    private val notificationManager = com.example.service.notification.SmartFireNotificationManager(context.applicationContext)
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val prefs = context.getSharedPreferences("smartfire_settings", Context.MODE_PRIVATE)
@@ -119,6 +121,230 @@ class SmartFireRepository(context: Context) {
 
     private val _stepStrideMeters = MutableStateFlow(prefs.getFloat("step_stride_m", 0.65f))
     val stepStrideMeters: StateFlow<Float> = _stepStrideMeters.asStateFlow()
+
+    // --- LOCAL DEVICE NOTIFICATION MUTE (auto-muted when user starts Fire/Exit Navigation) ---
+    private val _localAlarmMutedUntilMs = MutableStateFlow(0L)
+    val localAlarmMutedUntilMs: StateFlow<Long> = _localAlarmMutedUntilMs.asStateFlow()
+
+    fun muteLocalNotificationsTemporarily(durationMs: Long = 180_000L) {
+        _localAlarmMutedUntilMs.value = System.currentTimeMillis() + durationMs.coerceIn(15_000L, 600_000L)
+        notificationManager.cancelFireAlarmNotification()
+    }
+
+    fun unmuteLocalNotifications() {
+        _localAlarmMutedUntilMs.value = 0L
+    }
+
+    fun isLocalNotificationMutedNow(): Boolean {
+        return System.currentTimeMillis() < _localAlarmMutedUntilMs.value
+    }
+
+    // --- ESP32 REMOTE CONFIG (SAVE LOCALLY + PUSH OVER WI-FI + OTA) ---
+    private val _savedEspConfig = MutableStateFlow(
+        com.example.domain.model.EspDeviceConfig(
+            mq2Enabled = prefs.getBoolean("esp_cfg_mq2_enabled", true),
+            gasWarn = prefs.getInt("esp_cfg_gas_warn", 1800),
+            gasOn = prefs.getInt("esp_cfg_gas_on", 2400),
+            gasOff = prefs.getInt("esp_cfg_gas_off", 1600),
+            tempEnabled = prefs.getBoolean("esp_cfg_temp_enabled", true),
+            tempWarnC = prefs.getFloat("esp_cfg_temp_warn_c", 45.0f),
+            tempAlarmC = prefs.getFloat("esp_cfg_temp_alarm_c", 60.0f),
+            flameEnabled = prefs.getBoolean("esp_cfg_flame_enabled", true),
+            flameWarnMs = prefs.getInt("esp_cfg_flame_warn_ms", 150),
+            flameAlarmMs = prefs.getInt("esp_cfg_flame_alarm_ms", 500),
+            hornEnabled = prefs.getBoolean("esp_cfg_horn_enabled", false),
+            gasCommissioned = prefs.getBoolean("esp_cfg_gas_commissioned", true),
+            txPower1m = prefs.getInt("esp_cfg_tx_power_1m", -45),
+            pathLossN = prefs.getFloat("esp_cfg_path_loss_n", 2.4f)
+        )
+    )
+    val savedEspConfig: StateFlow<com.example.domain.model.EspDeviceConfig> = _savedEspConfig.asStateFlow()
+
+    fun saveEspConfigLocally(config: com.example.domain.model.EspDeviceConfig): com.example.domain.model.EspDeviceConfig {
+        val safeGasOn = config.gasOn.coerceIn(800, 3900)
+        val safeGasWarn = config.gasWarn.coerceIn(500, (safeGasOn - 150).coerceAtLeast(500))
+        val safeGasOff = config.gasOff.coerceIn(400, (safeGasWarn - 100).coerceAtLeast(400))
+        val safeTempAlarm = config.tempAlarmC.coerceIn(35.0f, 120.0f)
+        val safeTempWarn = config.tempWarnC.coerceIn(25.0f, (safeTempAlarm - 4.0f).coerceAtLeast(25.0f))
+        val safeFlameAlarmMs = config.flameAlarmMs.coerceIn(100, 5000)
+        val safeFlameWarnMs = config.flameWarnMs.coerceIn(0, safeFlameAlarmMs)
+        val safeTx = config.txPower1m.coerceIn(-75, -20)
+        val safeN = config.pathLossN.coerceIn(1.6f, 4.5f)
+        val normalized = config.copy(
+            gasWarn = safeGasWarn,
+            gasOn = safeGasOn,
+            gasOff = safeGasOff,
+            tempWarnC = safeTempWarn,
+            tempAlarmC = safeTempAlarm,
+            flameWarnMs = safeFlameWarnMs,
+            flameAlarmMs = safeFlameAlarmMs,
+            txPower1m = safeTx,
+            pathLossN = safeN
+        )
+        _savedEspConfig.value = normalized
+        updateGasThresholdAdc(safeGasOn)
+        prefs.edit()
+            .putBoolean("esp_cfg_mq2_enabled", normalized.mq2Enabled)
+            .putInt("esp_cfg_gas_warn", normalized.gasWarn)
+            .putInt("esp_cfg_gas_on", normalized.gasOn)
+            .putInt("esp_cfg_gas_off", normalized.gasOff)
+            .putBoolean("esp_cfg_temp_enabled", normalized.tempEnabled)
+            .putFloat("esp_cfg_temp_warn_c", normalized.tempWarnC)
+            .putFloat("esp_cfg_temp_alarm_c", normalized.tempAlarmC)
+            .putBoolean("esp_cfg_flame_enabled", normalized.flameEnabled)
+            .putInt("esp_cfg_flame_warn_ms", normalized.flameWarnMs)
+            .putInt("esp_cfg_flame_alarm_ms", normalized.flameAlarmMs)
+            .putBoolean("esp_cfg_horn_enabled", normalized.hornEnabled)
+            .putBoolean("esp_cfg_gas_commissioned", normalized.gasCommissioned)
+            .putInt("esp_cfg_tx_power_1m", normalized.txPower1m)
+            .putFloat("esp_cfg_path_loss_n", normalized.pathLossN)
+            .apply()
+        return normalized
+    }
+
+    suspend fun pushEspConfigToNode(
+        deviceId: String,
+        config: com.example.domain.model.EspDeviceConfig
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val normalized = saveEspConfigLocally(config)
+        val devices = allDevices.firstOrNull() ?: emptyList()
+        val node = devices.find { it.deviceId == deviceId }
+            ?: return@withContext Result.failure(IllegalArgumentException("Không tìm thấy thiết bị $deviceId"))
+
+        if (_isDemoMode.value || node.isDemoSensor) {
+            _demoNodes.value = _demoNodes.value.map { n ->
+                if (n.deviceId == deviceId) {
+                    val updatedTelem = n.telemetry.copy(
+                        mq2Enabled = normalized.mq2Enabled,
+                        gasWarnThreshold = normalized.gasWarn,
+                        gasOnThreshold = normalized.gasOn,
+                        gasOffThreshold = normalized.gasOff,
+                        tempEnabled = normalized.tempEnabled,
+                        tempWarnC = normalized.tempWarnC,
+                        tempAlarmC = normalized.tempAlarmC,
+                        flameEnabled = normalized.flameEnabled,
+                        flameWarnMs = normalized.flameWarnMs,
+                        flameAlarmMs = normalized.flameAlarmMs,
+                        hornEnabled = normalized.hornEnabled,
+                        gasCommissioned = normalized.gasCommissioned,
+                        txPower1m = normalized.txPower1m,
+                        pathLossN = normalized.pathLossN
+                    )
+                    val level = updatedTelem.evaluateTwoLevelStatus(normalized)
+                    val isAlarm = level == com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2
+                    val newState = when (level) {
+                        com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2 -> "ALARM"
+                        com.example.domain.model.SensorAlertLevel.WARNING_LEVEL_1 -> "SUSPECTED"
+                        com.example.domain.model.SensorAlertLevel.NORMAL -> "NORMAL"
+                    }
+                    n.copy(
+                        firmwareState = FirmwareState.fromString(newState),
+                        lastKnownAlarm = isAlarm,
+                        telemetry = updatedTelem.copy(
+                            state = newState,
+                            alarm = isAlarm,
+                            hornRequested = isAlarm && !updatedTelem.muted
+                        )
+                    )
+                } else n
+            }
+            return@withContext Result.success("Đã push cấu hình lên ${node.displayName} [DEMO] (MQ-2=${if (normalized.mq2Enabled) "${normalized.gasWarn}/${normalized.gasOn}" else "BỎ QUA"}, Nhiệt=${if (normalized.tempEnabled) "${normalized.tempWarnC.toInt()}/${normalized.tempAlarmC.toInt()}°C" else "BỎ QUA"}, Lửa=${if (normalized.flameEnabled) "BẬT" else "BỎ QUA"})")
+        }
+
+        if (node.ipAddress.isBlank()) {
+            return@withContext Result.failure(IllegalStateException("Thiết bị chưa có địa chỉ IP LAN"))
+        }
+
+        try {
+            val token = getDeviceToken(deviceId)?.ifBlank { null } ?: DEFAULT_TOKEN
+            val service = SmartFireHttpClientFactory.getService(node.ipAddress, token, timeoutSeconds = 5)
+            val dto = com.example.data.remote.dto.EspConfigDto(
+                mq2Enabled = normalized.mq2Enabled,
+                gasWarn = normalized.gasWarn,
+                gasOn = normalized.gasOn,
+                gasOff = normalized.gasOff,
+                tempEnabled = normalized.tempEnabled,
+                tempWarnC = normalized.tempWarnC,
+                tempAlarmC = normalized.tempAlarmC,
+                flameEnabled = normalized.flameEnabled,
+                flameWarnMs = normalized.flameWarnMs,
+                flameAlarmMs = normalized.flameAlarmMs,
+                hornEnabled = normalized.hornEnabled,
+                gasCommissioned = normalized.gasCommissioned,
+                txPower1m = normalized.txPower1m,
+                pathLossN = normalized.pathLossN
+            )
+            val resp = service.pushConfig(dto)
+            if (resp.isSuccessful && resp.body()?.applied == true) {
+                Result.success("Đã push cấu hình 2 mức lên ${node.displayName} (${node.ipAddress}) qua Wi-Fi")
+            } else {
+                Result.failure(RuntimeException("ESP32 từ chối cấu hình (HTTP ${resp.code()}): ${resp.body()?.error ?: resp.message()}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(RuntimeException("Lỗi kết nối Wi-Fi tới ${node.ipAddress}: ${e.message}"))
+        }
+    }
+
+    suspend fun pushEspConfigToAllNodes(
+        config: com.example.domain.model.EspDeviceConfig
+    ): Result<String> = withContext(Dispatchers.IO) {
+        val normalized = saveEspConfigLocally(config)
+        val devices = allDevices.firstOrNull() ?: emptyList()
+        if (devices.isEmpty()) {
+            return@withContext Result.failure(IllegalStateException("Chưa có node ESP32 nào trong hệ thống"))
+        }
+        var okCount = 0
+        val errors = mutableListOf<String>()
+        for (d in devices) {
+            val r = pushEspConfigToNode(d.deviceId, normalized)
+            if (r.isSuccess) okCount++ else errors.add("${d.displayName}: ${r.exceptionOrNull()?.message}")
+        }
+        if (okCount > 0 && errors.isEmpty()) {
+            Result.success("Đã push cấu hình thành công lên $okCount/${devices.size} node ESP32 qua Wi-Fi!")
+        } else if (okCount > 0) {
+            Result.success("Đã push $okCount/${devices.size} node. Lỗi: ${errors.first()}")
+        } else {
+            Result.failure(RuntimeException("Không thể push lên ESP32: ${errors.firstOrNull() ?: "Không rõ lỗi"}"))
+        }
+    }
+
+    suspend fun pushOtaFirmwareToNode(
+        deviceId: String,
+        firmwareBytes: ByteArray,
+        fileName: String = "firmware.bin"
+    ): Result<String> = withContext(Dispatchers.IO) {
+        if (firmwareBytes.size < 4096) {
+            return@withContext Result.failure(IllegalArgumentException("File firmware .bin quá nhỏ hoặc không hợp lệ (${firmwareBytes.size} bytes)"))
+        }
+        val devices = allDevices.firstOrNull() ?: emptyList()
+        val node = devices.find { it.deviceId == deviceId }
+            ?: return@withContext Result.failure(IllegalArgumentException("Không tìm thấy thiết bị $deviceId"))
+
+        if (_isDemoMode.value || node.isDemoSensor) {
+            delay(600L)
+            return@withContext Result.success("OTA thành công lên ${node.displayName} [DEMO] ($fileName · ${firmwareBytes.size / 1024} KB)")
+        }
+
+        if (node.ipAddress.isBlank()) {
+            return@withContext Result.failure(IllegalStateException("Thiết bị chưa có địa chỉ IP LAN"))
+        }
+
+        try {
+            val token = getDeviceToken(deviceId)?.ifBlank { null } ?: DEFAULT_TOKEN
+            val service = SmartFireHttpClientFactory.getOtaService(node.ipAddress, token)
+            val mediaType = okhttp3.MediaType.Companion.run { "application/octet-stream".toMediaTypeOrNull() }
+            val reqBody = okhttp3.RequestBody.Companion.run { firmwareBytes.toRequestBody(mediaType) }
+            val part = okhttp3.MultipartBody.Part.createFormData("firmware", fileName, reqBody)
+            val resp = service.uploadOtaFirmware(part)
+            if (resp.isSuccessful && resp.body()?.ota == "ok") {
+                Result.success("OTA thành công (${firmwareBytes.size / 1024} KB)! ${node.displayName} đang khởi động lại...")
+            } else {
+                Result.failure(RuntimeException("OTA thất bại (HTTP ${resp.code()}): ${resp.body()?.error ?: resp.message()}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(RuntimeException("Lỗi upload OTA tới ${node.ipAddress}: ${e.message}"))
+        }
+    }
 
     fun updateGasThresholdAdc(value: Int) {
         val clamped = value.coerceIn(1000, 3200)
@@ -248,16 +474,18 @@ class SmartFireRepository(context: Context) {
                         alarmStartedAtMs = alarmStart,
                         receivedAt = now
                     )
-                    val prob = candidateTelem.calculateFireProbability(_gasThresholdAdc.value).totalProbabilityPercent
-                    val probAlarm = prob >= 75f
+                    val activeCfg = _savedEspConfig.value
+                    val prob = candidateTelem.calculateFireProbability(_gasThresholdAdc.value, activeCfg).totalProbabilityPercent
+                    val level = candidateTelem.evaluateTwoLevelStatus(activeCfg)
+                    val probAlarm = level == com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2 || prob >= 75f
                     val probState = when {
-                        prob >= 75f -> "ALARM"
-                        prob >= 45f -> "SUSPECTED"
+                        probAlarm -> "ALARM"
+                        level == com.example.domain.model.SensorAlertLevel.WARNING_LEVEL_1 || prob >= 45f -> "SUSPECTED"
                         else -> "NORMAL"
                     }
                     val finalTelem = candidateTelem.copy(
                         alarm = probAlarm,
-                        flame = probAlarm || nextIr >= 0.65f,
+                        flame = activeCfg.flameEnabled && (probAlarm || nextIr >= 0.65f),
                         hornRequested = probAlarm && !candidateTelem.muted,
                         state = probState,
                         alarmStartedAtMs = if (probAlarm) (if (alarmStart > 0L) alarmStart else now) else 0L
@@ -307,6 +535,7 @@ class SmartFireRepository(context: Context) {
         irFlameIntensity: Float
     ) = withContext(Dispatchers.IO) {
         val now = System.currentTimeMillis()
+        val activeCfg = _savedEspConfig.value
         val tempTelem = SmartFireTelemetry(
             uptimeMs = 120_000L,
             temperatureCelsius = temperatureCelsius,
@@ -316,22 +545,33 @@ class SmartFireRepository(context: Context) {
             humidityPercent = humidityPercent,
             irFlameIntensity = irFlameIntensity,
             rssiDbm = -50,
+            mq2Enabled = activeCfg.mq2Enabled,
+            gasWarnThreshold = activeCfg.gasWarn,
+            gasOnThreshold = activeCfg.gasOn,
+            gasOffThreshold = activeCfg.gasOff,
+            tempEnabled = activeCfg.tempEnabled,
+            tempWarnC = activeCfg.tempWarnC,
+            tempAlarmC = activeCfg.tempAlarmC,
+            flameEnabled = activeCfg.flameEnabled,
+            flameWarnMs = activeCfg.flameWarnMs,
+            flameAlarmMs = activeCfg.flameAlarmMs,
             gasReady = true,
-            hornEnabled = true,
-            gasCommissioned = true,
+            hornEnabled = activeCfg.hornEnabled,
+            gasCommissioned = activeCfg.gasCommissioned,
             receivedAt = now
         )
-        val breakdown = tempTelem.calculateFireProbability(_gasThresholdAdc.value)
-        val isAlarm = breakdown.totalProbabilityPercent >= 75f
+        val breakdown = tempTelem.calculateFireProbability(_gasThresholdAdc.value, activeCfg)
+        val level = tempTelem.evaluateTwoLevelStatus(activeCfg)
+        val isAlarm = level == com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2 || breakdown.totalProbabilityPercent >= 75f
         val newState = when {
-            breakdown.totalProbabilityPercent >= 75f -> "ALARM"
-            breakdown.totalProbabilityPercent >= 45f -> "SUSPECTED"
+            isAlarm -> "ALARM"
+            level == com.example.domain.model.SensorAlertLevel.WARNING_LEVEL_1 || breakdown.totalProbabilityPercent >= 45f -> "SUSPECTED"
             else -> "NORMAL"
         }
         val finalTelem = tempTelem.copy(
             state = newState,
             alarm = isAlarm,
-            flame = isAlarm || irFlameIntensity >= 0.65f,
+            flame = activeCfg.flameEnabled && (isAlarm || irFlameIntensity >= 0.65f),
             hornRequested = isAlarm,
             alarmStartedAtMs = if (isAlarm) now else 0L
         )

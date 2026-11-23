@@ -213,6 +213,8 @@ fun DeviceDetailScreen(
                 3 -> HistoryTab(deviceEvents)
                 4 -> SettingsTab(
                     node = node,
+                    repository = repository,
+                    allNodes = allDevices,
                     onRenameClick = {
                         newAliasInput = node.displayName
                         showRenameDialog = true
@@ -347,6 +349,14 @@ fun OverviewTab(node: SmartFireNode, gasThresholdAdc: Int = 1800) {
                     DetailRow("Khói MQ-2 / Ngưỡng", "${node.telemetry.gasRaw} / $gasThresholdAdc ADC")
                     DetailRow("Device ID", node.deviceId)
                     DetailRow("Địa chỉ IP mạng LAN", node.ipAddress)
+                    DetailRow(
+                        "Tín hiệu Wi-Fi / Khoảng cách",
+                        "${node.telemetry.rssiDbm} dBm (~${String.format(java.util.Locale.US, "%.1fm", node.telemetry.estimateDistanceFromRssiMeters())})"
+                    )
+                    DetailRow("Số lần reconnect Wi-Fi", "${node.telemetry.wifiReconnects}")
+                    if (node.telemetry.firmwareVersion.isNotBlank()) {
+                        DetailRow("Firmware ESP32", node.telemetry.firmwareVersion)
+                    }
                     DetailRow("Thời gian hoạt động", "${node.telemetry.uptimeMs / 1000}s (${node.telemetry.uptimeMs} ms)")
                     DetailRow("Mã phiên Boot ID", node.bootId.ifBlank { "N/A" })
                     DetailRow("Event Sequence", "#${node.latestSeq}")
@@ -609,12 +619,22 @@ fun HistoryTab(events: List<DeviceEvent>) {
 @Composable
 fun SettingsTab(
     node: SmartFireNode,
+    repository: SmartFireRepository,
+    allNodes: List<SmartFireNode>,
     onRenameClick: () -> Unit,
     onUpdateIpClick: () -> Unit,
     onReconfigureBleClick: () -> Unit,
     onDeleteClick: () -> Unit
 ) {
     LazyColumn(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+        item {
+            com.example.ui.components.EspWifiConfigAndOtaCard(
+                repository = repository,
+                targetNode = node,
+                allNodes = allNodes
+            )
+        }
+
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),

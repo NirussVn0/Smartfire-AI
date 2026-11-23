@@ -1,4 +1,4 @@
-name: Android CI/CD (Linux)
+name: Android CI/CD & Auto GitHub Release
 
 on:
   push:
@@ -14,12 +14,12 @@ on:
       create_release:
         description: 'Tạo GitHub Release (true/false)'
         required: false
-        default: 'false'
+        default: 'true'
         type: boolean
       release_tag:
-        description: 'Tag cho Release (ví dụ v1.0.1)'
+        description: 'Tag cho Release (để trống để tự sinh v1.0.<run_number>)'
         required: false
-        default: 'v1.0.0'
+        default: ''
         type: string
 
 permissions:
@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   build-and-release:
-    name: Build Android APK (Linux)
+    name: Build Android Release APK & Auto Publish
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
@@ -50,21 +50,29 @@ jobs:
         run: |
           echo "ANDROID_HOME: $ANDROID_HOME"
           mkdir -p "$ANDROID_HOME/licenses" || true
-          # Accept standard licenses
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
-          # Install platform 36 if not already cached
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-36" "build-tools;36.0.0" || true
 
-      - name: Generate Signing Keystores
+      - name: Prepare Signing Keystores
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
         run: |
-          keytool -genkeypair -v -keystore my-upload-key.jks \
-            -alias upload -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass android -keypass android \
-            -dname "CN=SmartFire AI, OU=SOV Labs, O=STEM, L=HCMC, C=VN"
-          keytool -genkeypair -v -keystore debug.keystore \
-            -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
-            -storepass android -keypass android \
-            -dname "CN=Android Debug, O=Android, C=US"
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 --decode > my-upload-key.jks
+            echo "Restored release keystore from GitHub Secrets."
+          elif [ ! -f my-upload-key.jks ]; then
+            keytool -genkeypair -v -keystore my-upload-key.jks \
+              -alias upload -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=SmartFire AI, OU=SOV Labs, O=STEM, L=HCMC, C=VN"
+          fi
+
+          if [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v -keystore debug.keystore \
+              -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 \
+              -storepass android -keypass android \
+              -dname "CN=Android Debug, O=Android, C=US"
+          fi
 
       - name: Grant Execute Permission for Gradle Wrapper
         run: chmod +x ./gradlew
@@ -74,47 +82,66 @@ jobs:
 
       - name: Build Release & Debug APKs
         env:
-          STORE_PASSWORD: android
-          KEY_PASSWORD: android
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD || 'android' }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD || 'android' }}
         run: ./gradlew assembleRelease assembleDebug --stacktrace
 
-      - name: Organize APK Artifacts
-        id: organize_apks
+      - name: Compute Release Tag & Organize APK Artifacts
+        id: release_meta
         run: |
           mkdir -p artifacts
-          REF_NAME="${GITHUB_REF_NAME:-latest}"
-          TAG_CLEAN=$(echo "$REF_NAME" | sed 's|refs/tags/||; s|refs/heads/||; s|/|-|g')
-          
-          # Copy release APK
-          RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
-          if [ -n "$RELEASE_APK" ] && [ -f "$RELEASE_APK" ]; then
-            cp "$RELEASE_APK" "artifacts/SmartFire-AI-${TAG_CLEAN}-release.apk"
-            echo "RELEASE_FILE=artifacts/SmartFire-AI-${TAG_CLEAN}-release.apk" >> $GITHUB_ENV
+          SHORT_SHA="${GITHUB_SHA::7}"
+
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            RELEASE_TAG="${GITHUB_REF_NAME}"
+          elif [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            RELEASE_TAG="${{ github.event.inputs.release_tag }}"
+          else
+            RELEASE_TAG="v1.0.${GITHUB_RUN_NUMBER}-${SHORT_SHA}"
           fi
 
-          # Copy debug APK
+          echo "release_tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+          RELEASE_APK=$(find app/build/outputs/apk/release -name "*.apk" | head -n 1)
+          if [ -z "$RELEASE_APK" ] || [ ! -f "$RELEASE_APK" ]; then
+            echo "::error::Release APK was not generated!"
+            exit 1
+          fi
+          cp "$RELEASE_APK" "artifacts/SmartFire-AI-${RELEASE_TAG}-release.apk"
+          cp "$RELEASE_APK" "artifacts/SmartFire-AI-release.apk"
+
           DEBUG_APK=$(find app/build/outputs/apk/debug -name "*.apk" | head -n 1)
           if [ -n "$DEBUG_APK" ] && [ -f "$DEBUG_APK" ]; then
-            cp "$DEBUG_APK" "artifacts/SmartFire-AI-${TAG_CLEAN}-debug.apk"
-            echo "DEBUG_FILE=artifacts/SmartFire-AI-${TAG_CLEAN}-debug.apk" >> $GITHUB_ENV
+            cp "$DEBUG_APK" "artifacts/SmartFire-AI-${RELEASE_TAG}-debug.apk"
           fi
 
+          (cd artifacts && sha256sum *.apk > SHA256SUMS.txt)
           ls -la artifacts/
 
       - name: Upload APKs to GitHub Actions Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: SmartFire-AI-APKs
+          name: SmartFire-AI-APKs-${{ steps.release_meta.outputs.release_tag }}
           path: artifacts/*
           retention-days: 30
 
-      - name: Create or Update GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
+      - name: Auto Publish Release APK to GitHub Releases
+        if: >
+          github.event_name == 'push' ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.create_release != 'false')
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name || github.event.inputs.release_tag || 'v1.0.0' }}
-          name: SmartFire AI ${{ github.ref_name || github.event.inputs.release_tag || 'v1.0.0' }}
-          files: artifacts/*
+          tag_name: ${{ steps.release_meta.outputs.release_tag }}
+          name: SmartFire AI ${{ steps.release_meta.outputs.release_tag }}
+          body: |
+            ## SmartFire AI Automated Release (${{ steps.release_meta.outputs.release_tag }})
+            - **Commit:** `${{ github.sha }}`
+            - **Branch / Ref:** `${{ github.ref_name }}`
+            - **Artifacts:** Signed Release APK (`SmartFire-AI-release.apk`), Debug APK, and `SHA256SUMS.txt`
+          files: |
+            artifacts/*.apk
+            artifacts/SHA256SUMS.txt
           draft: false
           prerelease: false
+          make_latest: true
           generate_release_notes: true

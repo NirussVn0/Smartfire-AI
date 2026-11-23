@@ -82,6 +82,64 @@ data class FireProbabilityBreakdown(
     val riskLevelLabel: String
 )
 
+enum class SensorAlertLevel {
+    NORMAL,
+    WARNING_LEVEL_1,
+    ALARM_LEVEL_2
+}
+
+data class EspDeviceConfig(
+    val mq2Enabled: Boolean = true,
+    val gasWarn: Int = 1800,
+    val gasOn: Int = 2400,
+    val gasOff: Int = 1600,
+    val tempEnabled: Boolean = true,
+    val tempWarnC: Float = 45.0f,
+    val tempAlarmC: Float = 60.0f,
+    val flameEnabled: Boolean = true,
+    val flameWarnMs: Int = 150,
+    val flameAlarmMs: Int = 500,
+    val hornEnabled: Boolean = false,
+    val gasCommissioned: Boolean = false,
+    val txPower1m: Int = -45,
+    val pathLossN: Float = 2.4f,
+    val firmwareVersion: String = ""
+)
+
+/**
+ * 1D Median + Kalman filter for Wi-Fi RSSI stabilization so multipath jitter
+ * doesn't cause ±5m distance jumps on every poll.
+ */
+class RssiKalmanFilter(
+    private val processNoiseQ: Float = 0.65f,
+    private val measurementNoiseR: Float = 6.5f
+) {
+    private val window = ArrayDeque<Int>(5)
+    private var estimate: Float? = null
+    private var errorCovariance: Float = 10.0f
+
+    fun update(rawRssiDbm: Int): Int {
+        val clamped = rawRssiDbm.coerceIn(-100, -25)
+        if (window.size >= 5) window.removeFirst()
+        window.addLast(clamped)
+        val sorted = window.sorted()
+        val median = sorted[sorted.size / 2].toFloat()
+
+        val prev = estimate
+        if (prev == null) {
+            estimate = median
+            errorCovariance = 4.0f
+            return median.toInt()
+        }
+        val predictedError = errorCovariance + processNoiseQ
+        val kalmanGain = predictedError / (predictedError + measurementNoiseR)
+        val next = prev + kalmanGain * (median - prev)
+        estimate = next
+        errorCovariance = (1f - kalmanGain) * predictedError
+        return kotlin.math.round(next).toInt()
+    }
+}
+
 data class SmartFireTelemetry(
     val uptimeMs: Long = 0L,
     val state: String = "NORMAL",
@@ -92,6 +150,20 @@ data class SmartFireTelemetry(
     val humidityPercent: Float? = null,
     val irFlameIntensity: Float? = null, // 0.0 (no IR flame) .. 1.0 (strong IR flame)
     val rssiDbm: Int = -54,              // Signal strength (dBm) for RSSI distance ranging
+    val wifiReconnects: Long = 0L,
+    val txPower1m: Int = -45,
+    val pathLossN: Float = 2.4f,
+    val mq2Enabled: Boolean = true,
+    val gasWarnThreshold: Int = 1800,
+    val gasOnThreshold: Int = 2400,
+    val gasOffThreshold: Int = 1600,
+    val tempEnabled: Boolean = true,
+    val tempWarnC: Float = 45.0f,
+    val tempAlarmC: Float = 60.0f,
+    val flameEnabled: Boolean = true,
+    val flameWarnMs: Int = 150,
+    val flameAlarmMs: Int = 500,
+    val firmwareVersion: String = "",
     val alarmStartedAtMs: Long = 0L,     // Timestamp when continuous alarm started (for circular fire spread calculation)
     val flame: Boolean = false,
     val gasReady: Boolean = false,
@@ -109,30 +181,90 @@ data class SmartFireTelemetry(
     val isCoInstalled: Boolean get() = coPpm != null
     val isHumidityInstalled: Boolean get() = humidityPercent != null
 
+    private fun evaluateLevelInternal(
+        effMq2: Boolean,
+        effTemp: Boolean,
+        effFlame: Boolean,
+        warnGas: Int,
+        alarmGas: Int,
+        warnTemp: Float,
+        alarmTemp: Float
+    ): SensorAlertLevel {
+        val gasLevel2 = effMq2 && gasRaw >= alarmGas
+        val tempLevel2 = effTemp && temperatureCelsius != null && temperatureCelsius >= alarmTemp
+        val flameLevel2 = effFlame && (flame || (irFlameIntensity ?: 0f) >= 0.70f)
+        if (gasLevel2 || tempLevel2 || flameLevel2) {
+            return SensorAlertLevel.ALARM_LEVEL_2
+        }
+
+        val gasLevel1 = effMq2 && gasRaw >= warnGas
+        val tempLevel1 = effTemp && temperatureCelsius != null && temperatureCelsius >= warnTemp
+        val flameLevel1 = effFlame && ((irFlameIntensity ?: 0f) >= 0.35f)
+        if (gasLevel1 || tempLevel1 || flameLevel1) {
+            return SensorAlertLevel.WARNING_LEVEL_1
+        }
+
+        return SensorAlertLevel.NORMAL
+    }
+
+    fun evaluateTwoLevelStatus(config: EspDeviceConfig? = null): SensorAlertLevel {
+        return evaluateLevelInternal(
+            effMq2 = config?.mq2Enabled ?: mq2Enabled,
+            effTemp = config?.tempEnabled ?: tempEnabled,
+            effFlame = config?.flameEnabled ?: flameEnabled,
+            warnGas = config?.gasWarn ?: gasWarnThreshold,
+            alarmGas = config?.gasOn ?: gasOnThreshold,
+            warnTemp = config?.tempWarnC ?: tempWarnC,
+            alarmTemp = config?.tempAlarmC ?: tempAlarmC
+        )
+    }
+
     /**
      * Tính toán xác suất cháy tổng hợp P(Fire) dựa trên mô hình kết hợp xác suất đa thông số
-     * (Weighted Logistic / Bayesian Multi-Parameter Sensor Fusion), đồng bộ với ngưỡng gasThresholdAdc.
-     * Khi các cảm biến phụ (Nhiệt, CO, Ẩm) chưa trang bị (null), tính toán dựa trên Cảm biến Khói/Gas + Lửa thực tế.
+     * (Weighted Logistic / Bayesian Multi-Parameter Sensor Fusion), hỗ trợ bật/bỏ qua từng cảm biến
+     * và 2 mức ngưỡng độc lập (Mức 1 Cảnh báo sớm vs Mức 2 Báo cháy khẩn cấp).
      */
-    fun calculateFireProbability(gasThresholdAdc: Int = 1800): FireProbabilityBreakdown {
+    fun calculateFireProbability(
+        gasThresholdAdc: Int = 1800,
+        config: EspDeviceConfig? = null
+    ): FireProbabilityBreakdown {
+        val effMq2 = config?.mq2Enabled ?: mq2Enabled
+        val effTemp = config?.tempEnabled ?: tempEnabled
+        val effFlame = config?.flameEnabled ?: flameEnabled
+
+        val alarmTemp = (config?.tempAlarmC ?: tempAlarmC).coerceIn(35f, 120f)
+        val warnTemp = (config?.tempWarnC ?: tempWarnC).coerceIn(25f, (alarmTemp - 2f).coerceAtLeast(25f))
+
         // 1. Chuẩn hóa điểm Nhiệt độ & Tốc độ tăng nhiệt RoR [0..1]
-        val thermalScore = if (temperatureCelsius != null) {
-            val tempNorm = ((temperatureCelsius - 26f) / 48f).coerceIn(0f, 1f)
+        val thermalScore = if (effTemp && temperatureCelsius != null) {
+            val tempSpan = (alarmTemp - 26f).coerceAtLeast(15f)
+            val tempNorm = ((temperatureCelsius - 26f) / tempSpan).coerceIn(0f, 1f)
             val rorNorm = ((tempRateOfRiseCPerMin ?: 0.4f) / 12f).coerceIn(0f, 1f)
-            (0.72f * tempNorm + 0.28f * rorNorm).coerceIn(0f, 1f)
+            val rawTherm = (0.76f * tempNorm + 0.24f * rorNorm).coerceIn(0f, 1f)
+            when {
+                temperatureCelsius >= alarmTemp -> maxOf(rawTherm, 0.85f)
+                temperatureCelsius >= warnTemp -> maxOf(rawTherm, 0.55f)
+                else -> rawTherm
+            }
         } else {
             0f
         }
 
-        // 2. Chuẩn hóa điểm Mật độ Khói & Gas MQ-2 [0..1] theo ngưỡng cài đặt gasThresholdAdc
-        val effectiveThreshold = gasThresholdAdc.coerceIn(1000, 3200).toFloat()
-        val baselineGas = 550f
-        val span = (effectiveThreshold - baselineGas).coerceAtLeast(450f) * 1.25f
-        val rawSmokeNorm = ((gasRaw - baselineGas) / span).coerceIn(0f, 1f)
-        val smokeScore = if (gasRaw >= effectiveThreshold) {
-            maxOf(rawSmokeNorm, 0.78f)
+        // 2. Chuẩn hóa điểm Mật độ Khói & Gas MQ-2 [0..1] theo 2 mức ngưỡng
+        val alarmGas = (config?.gasOn ?: gasThresholdAdc).coerceIn(800, 3900)
+        val warnGas = (config?.gasWarn ?: minOf(gasWarnThreshold, (alarmGas * 0.78f).toInt()))
+            .coerceIn(500, (alarmGas - 100).coerceAtLeast(500))
+        val smokeScore = if (effMq2) {
+            val baselineGas = 550f
+            val span = (alarmGas.toFloat() - baselineGas).coerceAtLeast(450f) * 1.25f
+            val rawSmokeNorm = ((gasRaw - baselineGas) / span).coerceIn(0f, 1f)
+            when {
+                gasRaw >= alarmGas -> maxOf(rawSmokeNorm, 0.85f)
+                gasRaw >= warnGas -> maxOf(rawSmokeNorm, 0.55f)
+                else -> rawSmokeNorm
+            }
         } else {
-            rawSmokeNorm
+            0f
         }
 
         // 3. Chuẩn hóa điểm Nồng độ Khí CO (ppm) [0..1]
@@ -142,7 +274,7 @@ data class SmartFireTelemetry(
             0f
         }
 
-        // 4. Chuẩn hóa điểm Độ sụt giảm Độ ẩm (Khi cháy nhiệt tăng làm độ ẩm giảm mạnh từ ~65% xuống <25%) [0..1]
+        // 4. Chuẩn hóa điểm Độ sụt giảm Độ ẩm [0..1]
         val humidityDropScore = if (humidityPercent != null) {
             ((65f - humidityPercent) / 42f).coerceIn(0f, 1f)
         } else {
@@ -150,14 +282,16 @@ data class SmartFireTelemetry(
         }
 
         // 5. Điểm Bức xạ Hồng ngoại Ngọn lửa IR [0..1]
-        val effectiveIr = if (flame) {
+        val effectiveIr = if (!effFlame) {
+            0f
+        } else if (flame) {
             0.88f
         } else {
             (irFlameIntensity ?: 0f).coerceIn(0f, 1f)
         }
 
-        // Điều chỉnh trọng số tùy theo cảm biến thực tế có sẵn:
-        val hasAuxSensors = temperatureCelsius != null || coPpm != null || humidityPercent != null
+        // Điều chỉnh trọng số tùy theo cảm biến thực tế có sẵn và được bật:
+        val hasAuxSensors = (effTemp && temperatureCelsius != null) || coPpm != null || humidityPercent != null
         val weightedLinear = if (hasAuxSensors) {
             (0.28f * thermalScore) +
             (0.24f * smokeScore) +
@@ -165,11 +299,9 @@ data class SmartFireTelemetry(
             (0.20f * effectiveIr) +
             (0.10f * humidityDropScore)
         } else {
-            // Chỉ có Cảm biến Khói MQ-2 + Cảm biến Ngọn lửa Flame Sensor (phần cứng tiêu chuẩn)
             (0.55f * smokeScore) + (0.45f * effectiveIr)
         }
 
-        // Hiệu ứng cộng hưởng xác suất (Synergy bonus khi nhiều thông số cùng tăng cao)
         val highFactorCount = listOf(
             thermalScore > 0.45f,
             smokeScore > 0.45f,
@@ -178,10 +310,10 @@ data class SmartFireTelemetry(
             humidityDropScore > 0.45f
         ).count { it }
 
-        val thresholdExceededBoost = if (gasRaw >= effectiveThreshold && (thermalScore > 0.35f || effectiveIr > 0.35f || flame)) 0.15f else 0f
+        val thresholdExceededBoost = if (effMq2 && gasRaw >= alarmGas && (thermalScore > 0.35f || effectiveIr > 0.35f || (effFlame && flame))) 0.15f else 0f
 
         val synergyBoost = when {
-            flame && gasRaw >= effectiveThreshold -> 0.30f
+            effFlame && flame && effMq2 && gasRaw >= alarmGas -> 0.30f
             highFactorCount >= 4 -> 0.22f
             highFactorCount == 3 -> 0.14f
             highFactorCount == 2 -> 0.07f
@@ -191,17 +323,28 @@ data class SmartFireTelemetry(
         // Hàm Logistic Sigmoid chuyển đổi sang xác suất P(Cháy) %
         val z = ((weightedLinear + synergyBoost) - 0.42f) * 8.5f
         val logisticProb = (1.0f / (1.0f + exp(-z))).coerceIn(0.01f, 0.999f)
-        val totalPercent = if (flame && gasRaw >= effectiveThreshold) {
-            99.5f
-        } else if (flame) {
-            maxOf(85.0f, (logisticProb * 100f).coerceIn(1.2f, 99.8f))
-        } else {
-            (logisticProb * 100f).coerceIn(1.2f, 99.8f)
+        val rawLogisticPercent = (logisticProb * 100f).coerceIn(1.2f, 99.8f)
+
+        val level = evaluateLevelInternal(
+            effMq2 = effMq2,
+            effTemp = effTemp,
+            effFlame = effFlame,
+            warnGas = warnGas,
+            alarmGas = alarmGas,
+            warnTemp = warnTemp,
+            alarmTemp = alarmTemp
+        )
+
+        val totalPercent = when {
+            effFlame && flame && effMq2 && gasRaw >= alarmGas -> 99.5f
+            level == SensorAlertLevel.ALARM_LEVEL_2 -> maxOf(rawLogisticPercent, 82.0f).coerceAtMost(99.8f)
+            level == SensorAlertLevel.WARNING_LEVEL_1 -> rawLogisticPercent.coerceIn(48.0f, 72.0f)
+            else -> rawLogisticPercent.coerceAtMost(42.0f)
         }
 
         val riskLabel = when {
-            totalPercent >= 75f -> "NGUY CƠ CHÁY CỰC CAO (BÁO ĐỘNG)"
-            totalPercent >= 45f -> "NGHI NGỜ CHÁY (CẢNH BÁO SỚM)"
+            level == SensorAlertLevel.ALARM_LEVEL_2 || totalPercent >= 75f -> "MỨC 2: BÁO CHÁY KHẨN CẤP"
+            level == SensorAlertLevel.WARNING_LEVEL_1 || totalPercent >= 45f -> "MỨC 1: CẢNH BÁO SỚM"
             totalPercent >= 22f -> "THEO DÕI BIẾN ĐỘNG NHIỆT/KHÓI"
             else -> "AN TOÀN (XÁC SUẤT THẤP)"
         }
@@ -220,12 +363,16 @@ data class SmartFireTelemetry(
     /**
      * Ước lượng khoảng cách từ điện thoại tới cảm biến dựa trên suy hao tín hiệu RSSI (Log-Distance Path Loss Model):
      * d = 10 ^ ((TxPower - RSSI) / (10 * n))
-     * Với TxPower = -41 dBm tại 1m, hệ số môi trường trong nhà n = 2.2
+     * Sử dụng tham số hiệu chuẩn thực tế từ ESP32 (mặc định TxPower = -45 dBm tại 1m, n = 2.4).
      */
-    fun estimateDistanceFromRssiMeters(txPowerAt1m: Int = -41, pathLossExponent: Float = 2.2f): Float {
-        val clampedRssi = rssiDbm.coerceIn(-95, -30)
-        val exponent = (txPowerAt1m - clampedRssi).toFloat() / (10f * pathLossExponent)
-        return 10.0.pow(exponent.toDouble()).toFloat().coerceIn(0.4f, 35.0f)
+    fun estimateDistanceFromRssiMeters(
+        txPowerAt1m: Int = this.txPower1m,
+        pathLossExponent: Float = this.pathLossN
+    ): Float {
+        val clampedRssi = rssiDbm.coerceIn(-98, -28)
+        val safeN = pathLossExponent.coerceIn(1.6f, 4.5f)
+        val exponent = (txPowerAt1m - clampedRssi).toFloat() / (10f * safeN)
+        return 10.0.pow(exponent.toDouble()).toFloat().coerceIn(0.35f, 80.0f)
     }
 }
 

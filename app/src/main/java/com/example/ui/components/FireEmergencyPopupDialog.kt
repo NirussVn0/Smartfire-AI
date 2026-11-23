@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ExitToApp
 import androidx.compose.material.icons.filled.FireExtinguisher
 import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material.icons.filled.NotificationsActive
@@ -135,6 +136,7 @@ fun FireEmergencyPopupDialog(
     onRouteToExtinguisher: () -> Unit,
     onRouteToNearestFireSensor: () -> Unit,
     onRouteTwoStageExtinguisherToFire: () -> Unit = onRouteToExtinguisher,
+    onRouteToExit: () -> Unit = onRouteToExtinguisher,
     onSilenceAllAlarms: () -> Unit
 ) {
     val context = LocalContext.current
@@ -517,6 +519,40 @@ fun FireEmergencyPopupDialog(
                             )
                             Text(
                                 text = "Đi thẳng tới vị trí ${nearestAlarmNode.displayName}",
+                                color = Color.White.copy(alpha = 0.9f),
+                                fontSize = 10.sp
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // HUGE BUTTON 2B: DẪN TỚI CỬA THOÁT HIỂM (EXIT)
+                    Button(
+                        onClick = onRouteToExit,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(52.dp)
+                            .testTag("btn_popup_route_exit"),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F766E)),
+                        shape = RoundedCornerShape(14.dp)
+                    ) {
+                        Icon(
+                            Icons.Default.ExitToApp,
+                            contentDescription = null,
+                            tint = Color.White,
+                            modifier = Modifier.size(22.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column(horizontalAlignment = Alignment.Start) {
+                            Text(
+                                text = "DẪN TỚI CỬA THOÁT HIỂM (EXIT)",
+                                color = Color.White,
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                            Text(
+                                text = "Tạm tắt còi máy này & hiện biển chỉ đường thoát nạn",
                                 color = Color.White.copy(alpha = 0.9f),
                                 fontSize = 10.sp
                             )

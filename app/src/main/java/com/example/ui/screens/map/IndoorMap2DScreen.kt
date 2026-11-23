@@ -132,7 +132,10 @@ import com.example.domain.model.UserPosition
 import com.example.domain.pathfinding.GeoLatLng
 import com.example.domain.pathfinding.GeoMapMath
 import com.example.domain.pathfinding.NavigationRoute
+import com.example.domain.pathfinding.TurnByTurnNavigator
 import com.example.sensor.DeviceMovementTracker
+import com.example.sensor.PresenceZone
+import com.example.ui.components.TurnByTurnNavigationBanner
 import com.example.ui.theme.CriticalAlarmBackground
 import com.example.ui.theme.CriticalAlarmBorder
 import com.example.ui.theme.CriticalAlarmRed
@@ -256,6 +259,11 @@ fun IndoorMap2DScreen(
     onUpdateFloorDimensions: (String, Float, Float) -> Unit = { _, _, _ -> },
     onClearAllMapConfig: (String) -> Unit = {},
     onSetUserPosition: (String, Float, Float) -> Unit,
+    onMuteLocalNotifications: () -> Unit = {},
+    sharedMovementTracker: DeviceMovementTracker? = null,
+    isLocalAlarmMuted: Boolean = false,
+    onBackToDashboardWithNav: () -> Unit = {},
+    onStopGlobalNavigation: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val context = LocalContext.current
@@ -263,8 +271,10 @@ fun IndoorMap2DScreen(
     val currentFloor = floors.firstOrNull()
     val floorId = currentFloor?.id ?: "floor_1"
 
-    // Hardware Movement Tracker (Step Detector + Accelerometer + Compass + GPS)
-    val movementTracker = remember { DeviceMovementTracker(context, scope) }
+    // Hardware Movement Tracker (reuses app-wide tracker if provided so Dashboard Turn-by-Turn & 2D Map stay in sync)
+    val movementTracker = remember(sharedMovementTracker) {
+        sharedMovementTracker ?: DeviceMovementTracker(context, scope)
+    }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
@@ -273,8 +283,12 @@ fun IndoorMap2DScreen(
         movementTracker.forceRecognizeMapLocation()
     }
 
-    DisposableEffect(Unit) {
-        movementTracker.startTracking()
+    DisposableEffect(movementTracker, sharedMovementTracker) {
+        if (sharedMovementTracker == null) {
+            movementTracker.startTracking()
+        } else {
+            movementTracker.refreshGpsLocationNow()
+        }
         val perms = mutableListOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
@@ -287,7 +301,11 @@ fun IndoorMap2DScreen(
         } catch (_: Exception) {
             movementTracker.forceRecognizeMapLocation()
         }
-        onDispose { movementTracker.stopTracking() }
+        onDispose {
+            if (sharedMovementTracker == null) {
+                movementTracker.stopTracking()
+            }
+        }
     }
 
     val stepCount by movementTracker.stepCount.collectAsState()
@@ -600,6 +618,56 @@ fun IndoorMap2DScreen(
     val fusedAccuracyPercent = triFusionSnapshot.accuracyPercent
     val fusedErrorMeters = triFusionSnapshot.estimatedErrorMeters
 
+    // Real-time Indoor vs Outdoor Presence Classification (Polygon + GPS Geo-fence + ESP32 Wi-Fi RSSI)
+    val houseGeoCenter = remember(geoPolygonPoints.size, mapCenterLatLng) {
+        if (geoPolygonPoints.size >= 3) {
+            GeoLatLng(
+                lat = geoPolygonPoints.map { it.lat }.average(),
+                lng = geoPolygonPoints.map { it.lng }.average()
+            )
+        } else {
+            mapCenterLatLng
+        }
+    }
+    val gpsDistFromHouseCenterM = remember(gpsLocation, houseGeoCenter, hasRealGpsFix) {
+        if (hasRealGpsFix && gpsLocation != null) {
+            GeoMapMath.haversineDistanceMeters(
+                GeoLatLng(gpsLocation!!.latitude, gpsLocation!!.longitude),
+                houseGeoCenter
+            )
+        } else null
+    }
+    val allRealNodesOffline = nodes.isNotEmpty() &&
+        nodes.none { it.isDemoSensor } &&
+        nodes.all { it.connectionState == com.example.domain.model.DeviceConnectionState.OFFLINE }
+    val presenceState = remember(
+        currentUserPos,
+        activeFloorplanPolygon,
+        houseWidthMeters,
+        houseLengthMeters,
+        gpsDistFromHouseCenterM,
+        gpsAccuracyMeters,
+        hasRealGpsFix,
+        liveRssiDbm,
+        rssiDistanceMeters,
+        allRealNodesOffline
+    ) {
+        DeviceMovementTracker.evaluatePresenceZone(
+            userPos = currentUserPos,
+            housePolygon = activeFloorplanPolygon,
+            houseWidthMeters = houseWidthMeters,
+            houseLengthMeters = houseLengthMeters,
+            gpsDistanceFromHouseCenterMeters = gpsDistFromHouseCenterM,
+            gpsAccuracyMeters = gpsAccuracyMeters,
+            hasRealGpsFix = hasRealGpsFix,
+            rssiDbm = selectedNodeObj?.telemetry?.rssiDbm,
+            rssiDistanceMeters = if (selectedNodeObj != null) rssiDistanceMeters else null,
+            allRealNodesOffline = allRealNodesOffline
+        )
+    }
+    val isUserOutsideHouse = presenceState.zone == PresenceZone.OUTSIDE_HOUSE
+    var localMutedForNav by remember { mutableStateOf(false) }
+
     var activeRoute by remember { mutableStateOf<NavigationRoute?>(null) }
     var emergencyPhase by remember { mutableStateOf(EmergencyAutoPhase.IDLE) }
     var selectedMapElement by remember { mutableStateOf<SelectedMapElement?>(null) }
@@ -871,10 +939,15 @@ fun IndoorMap2DScreen(
             anchorPos = anchorSensorPin?.position,
             rssiDistanceMeters = rssiDistanceMeters,
             rssiDbm = liveRssiDbm,
-            activePath = activeSubPath
+            activePath = activeSubPath,
+            allowOutsideBounds = true
         )
 
-        currentUserPos = clampPointIntoPolygonBounds(fusionStepResult.fusedPosition, activeFloorplanPolygon)
+        // Do NOT force-clamp into house polygon so walking outside actually moves the user icon outside the house!
+        currentUserPos = Point2D(
+            x = fusionStepResult.fusedPosition.x.coerceIn(-0.22f, 1.22f),
+            y = fusionStepResult.fusedPosition.y.coerceIn(-0.22f, 1.22f)
+        )
         onSetUserPosition(floorId, currentUserPos.x, currentUserPos.y)
 
         if (currentRoute != null && currentRoute.pathPoints.isNotEmpty()) {
@@ -913,15 +986,33 @@ fun IndoorMap2DScreen(
         }
     }
 
-    // Strict Indoor GPS Isolation: GPS is only used before indoor sensors take over AND only if accuracy <= 4.5m outdoor fix.
-    // Once indoors (anchor pinned, steps > 0, or accuracy > 4.5m), GPS drift carries 0% weight so position relies cleanly on IMU + Compass + ESP32 RSSI.
-    LaunchedEffect(gpsDeltaMeters, gpsAccuracyMeters, hasRealGpsFix) {
-        val isIndoorFusionActive = anchorSensorPin != null || stepCount > 0 || !hasRealGpsFix || gpsAccuracyMeters > 4.5f
-        if (!isIndoorFusionActive && hypot(gpsDeltaMeters.x.toDouble(), gpsDeltaMeters.y.toDouble()) > 0.65) {
-            val normX = (0.50f + (gpsDeltaMeters.x / houseWidthMeters.coerceAtLeast(8f))).coerceIn(0.10f, 0.90f)
-            val normY = (0.72f - (gpsDeltaMeters.y / houseLengthMeters.coerceAtLeast(8f))).coerceIn(0.10f, 0.90f)
-            currentUserPos = clampPointIntoPolygonBounds(Point2D(normX, normY), activeFloorplanPolygon)
-            onSetUserPosition(floorId, currentUserPos.x, currentUserPos.y)
+    // Hybrid Indoor/Outdoor GPS Fusion:
+    // - Indoors: GPS carries 0% weight so indoor jitter never corrupts IMU + Compass + ESP32 RSSI.
+    // - Outdoors: When real GPS confirms user moved OUTSIDE the house geo-fence, project their position
+    //   outside the house boundary on the 2D canvas so the icon never stays stuck indoors!
+    LaunchedEffect(gpsLocation, gpsDeltaMeters, gpsAccuracyMeters, hasRealGpsFix, houseGeoCenter) {
+        if (hasRealGpsFix && gpsLocation != null && gpsAccuracyMeters <= 25f) {
+            val dLatM = (gpsLocation!!.latitude - houseGeoCenter.lat) * 111_320.0
+            val dLngM = (gpsLocation!!.longitude - houseGeoCenter.lng) * 111_320.0 * cos(Math.toRadians(houseGeoCenter.lat))
+            val distFromCenterM = hypot(dLngM, dLatM).toFloat()
+            val houseRadiusM = hypot((houseWidthMeters / 2f).toDouble(), (houseLengthMeters / 2f).toDouble()).toFloat()
+            val gpsOutsideMargin = (gpsAccuracyMeters * 0.45f).coerceAtLeast(2.5f)
+
+            if (distFromCenterM > houseRadiusM + gpsOutsideMargin) {
+                // User is clearly OUTSIDE the house -> place icon outside the house polygon along true GPS vector
+                val normX = (0.50f + (dLngM.toFloat() / houseWidthMeters.coerceAtLeast(6f))).coerceIn(-0.18f, 1.18f)
+                val normY = (0.50f - (dLatM.toFloat() / houseLengthMeters.coerceAtLeast(6f))).coerceIn(-0.18f, 1.18f)
+                currentUserPos = Point2D(normX, normY)
+                onSetUserPosition(floorId, currentUserPos.x, currentUserPos.y)
+            } else {
+                val isIndoorFusionActive = anchorSensorPin != null || stepCount > 0 || gpsAccuracyMeters > 4.5f
+                if (!isIndoorFusionActive && hypot(gpsDeltaMeters.x.toDouble(), gpsDeltaMeters.y.toDouble()) > 0.65) {
+                    val normX = (0.50f + (gpsDeltaMeters.x / houseWidthMeters.coerceAtLeast(8f))).coerceIn(0.08f, 0.92f)
+                    val normY = (0.72f - (gpsDeltaMeters.y / houseLengthMeters.coerceAtLeast(8f))).coerceIn(0.08f, 0.92f)
+                    currentUserPos = Point2D(normX, normY)
+                    onSetUserPosition(floorId, currentUserPos.x, currentUserPos.y)
+                }
+            }
         }
     }
 
@@ -1712,6 +1803,74 @@ fun IndoorMap2DScreen(
         // STAGE 2 & STAGE 3: INTERACTIVE 2D MAP CANVAS SHAPED BY THE EXACT KHOANH VÙNG POLYGON!
         // =========================================================================
         if (mapStage == MapStage.READY_MAP) {
+            // Indoor / Outdoor Live Presence Status Banner
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 6.dp)
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(
+                        when (presenceState.zone) {
+                            PresenceZone.OUTSIDE_HOUSE -> Color(0xFFFFF7ED)
+                            PresenceZone.NEAR_BOUNDARY -> Color(0xFFFEFCE8)
+                            PresenceZone.INSIDE_HOUSE -> Color(0xFFECFDF5)
+                        }
+                    )
+                    .border(
+                        1.dp,
+                        when (presenceState.zone) {
+                            PresenceZone.OUTSIDE_HOUSE -> Color(0xFFEA580C)
+                            PresenceZone.NEAR_BOUNDARY -> WarningAmber
+                            PresenceZone.INSIDE_HOUSE -> NormalGreen
+                        },
+                        RoundedCornerShape(10.dp)
+                    )
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = when (presenceState.zone) {
+                        PresenceZone.OUTSIDE_HOUSE -> String.format(Locale.US, "📍 NGOÀI NHÀ (~%.1fm) · %s", presenceState.distanceOutsideMeters, presenceState.reason)
+                        PresenceZone.NEAR_BOUNDARY -> "🚪 SÁT RÌA NHÀ · ${presenceState.reason}"
+                        PresenceZone.INSIDE_HOUSE -> "🏠 TRONG NHÀ · RSSI ${liveRssiDbm} dBm (~${String.format(Locale.US, "%.1fm", rssiDistanceMeters)})"
+                    },
+                    color = when (presenceState.zone) {
+                        PresenceZone.OUTSIDE_HOUSE -> Color(0xFFC2410C)
+                        PresenceZone.NEAR_BOUNDARY -> Color(0xFFA16207)
+                        PresenceZone.INSIDE_HOUSE -> Color(0xFF047857)
+                    },
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f)
+                )
+            }
+
+            // Google Maps-Style Turn-by-Turn Guidance Sign when navigating on 2D Map
+            activeRoute?.let { route ->
+                val guidance = TurnByTurnNavigator.buildGuidance(
+                    route = route,
+                    userHeadingDeg = compassHeading,
+                    houseWidthMeters = houseWidthMeters,
+                    houseLengthMeters = houseLengthMeters,
+                    isOutsideHouse = isUserOutsideHouse,
+                    outdoorOverrideDistanceMeters = if (isUserOutsideHouse) presenceState.distanceToHouseCenterMeters else null
+                )
+                TurnByTurnNavigationBanner(
+                    guidance = guidance,
+                    isMapCurrentlyVisible = true,
+                    isLocalAlarmMuted = isLocalAlarmMuted || localMutedForNav,
+                    onToggleMapView = { onBackToDashboardWithNav() },
+                    onStopNavigation = {
+                        activeRoute = null
+                        onStopGlobalNavigation()
+                    },
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+            }
+
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1873,9 +2032,10 @@ fun IndoorMap2DScreen(
                             selectedMapElement = hitItem
                         } else {
                             selectedMapElement = null
-                            val clampedPt = clampPointIntoPolygonBounds(tapPt, activeFloorplanPolygon)
-                            currentUserPos = clampedPt
-                            onSetUserPosition(floorId, clampedPt.x, clampedPt.y)
+                            // Allow positioning both inside AND outside the house polygon
+                            val freePt = Point2D(tapPt.x.coerceIn(0.01f, 0.99f), tapPt.y.coerceIn(0.01f, 0.99f))
+                            currentUserPos = freePt
+                            onSetUserPosition(floorId, freePt.x, freePt.y)
                             activeRoute?.let { curRoute ->
                                 if (curRoute.targetType == "TWO_STAGE") {
                                     routeTwoStageExtinguisherToFire(null)
@@ -2207,11 +2367,18 @@ fun IndoorMap2DScreen(
                     )
                 }
 
-                // 13. Draw Current Standing User Position
+                // 13. Draw Current Standing User Position (clamped to visible canvas border when outside so icon never disappears off-screen)
+                val rawUserScreen = toScreen(currentUserPos)
+                val visibleUserScreen = Offset(
+                    x = rawUserScreen.x.coerceIn(28f, (w - 28f).coerceAtLeast(28f)),
+                    y = rawUserScreen.y.coerceIn(28f, (h - 48f).coerceAtLeast(28f))
+                )
                 drawUserStandingBeacon(
-                    center = toScreen(currentUserPos),
+                    center = visibleUserScreen,
                     headingDeg = compassHeading,
-                    isWalking = isWalking
+                    isWalking = isWalking,
+                    isOutsideHouse = isUserOutsideHouse,
+                    outsideDistanceMeters = presenceState.distanceOutsideMeters
                 )
             }
 
@@ -2858,7 +3025,11 @@ fun IndoorMap2DScreen(
                     horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Button(
-                        onClick = { routeToFireSensor(null) },
+                        onClick = {
+                            onMuteLocalNotifications()
+                            localMutedForNav = true
+                            routeToFireSensor(null)
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .height(60.dp)
@@ -2893,7 +3064,11 @@ fun IndoorMap2DScreen(
                     }
 
                     Button(
-                        onClick = { routeToExtinguisher() },
+                        onClick = {
+                            onMuteLocalNotifications()
+                            localMutedForNav = true
+                            routeToExtinguisher()
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .height(60.dp)
@@ -2933,7 +3108,11 @@ fun IndoorMap2DScreen(
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Button(
-                        onClick = { routeTwoStageExtinguisherToFire(null) },
+                        onClick = {
+                            onMuteLocalNotifications()
+                            localMutedForNav = true
+                            routeTwoStageExtinguisherToFire(null)
+                        },
                         modifier = Modifier
                             .weight(1.1f)
                             .height(38.dp)
@@ -2954,7 +3133,11 @@ fun IndoorMap2DScreen(
                     }
 
                     OutlinedButton(
-                        onClick = { routeToExitDoor() },
+                        onClick = {
+                            onMuteLocalNotifications()
+                            localMutedForNav = true
+                            routeToExitDoor()
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .height(38.dp)
@@ -3752,10 +3935,18 @@ private fun DrawScope.drawLargeFireSensorSymbol(
 private fun DrawScope.drawUserStandingBeacon(
     center: Offset,
     headingDeg: Float,
-    isWalking: Boolean
+    isWalking: Boolean,
+    isOutsideHouse: Boolean = false,
+    outsideDistanceMeters: Float = 0f
 ) {
+    val coneColor = if (isOutsideHouse) Color(0xFFEA580C) else PrimaryBlue
+    val dotColor = when {
+        isOutsideHouse -> Color(0xFFEA580C)
+        isWalking -> NormalGreen
+        else -> PrimaryBlue
+    }
     drawArc(
-        color = PrimaryBlue.copy(alpha = 0.28f),
+        color = coneColor.copy(alpha = 0.28f),
         startAngle = headingDeg - 120f,
         sweepAngle = 60f,
         useCenter = true,
@@ -3765,16 +3956,25 @@ private fun DrawScope.drawUserStandingBeacon(
 
     drawCircle(color = Color.White, radius = 20f, center = center)
     drawCircle(
-        color = if (isWalking) NormalGreen else PrimaryBlue,
+        color = dotColor,
         radius = 15f,
         center = center
     )
     drawCircle(color = Color.White, radius = 5f, center = center)
 
+    val label = if (isOutsideHouse) {
+        if (outsideDistanceMeters >= 1f) {
+            String.format(Locale.US, "NGOÀI NHÀ (~%.0fm)", outsideDistanceMeters)
+        } else {
+            "BẠN (NGOÀI NHÀ)"
+        }
+    } else {
+        "BẠN ĐANG ĐỨNG ĐÂY"
+    }
     drawLabelPill(
         center = Offset(center.x, center.y + 34f),
-        text = "BẠN ĐANG ĐỨNG ĐÂY",
-        bgColor = Color(0xFF0F172A)
+        text = label,
+        bgColor = if (isOutsideHouse) Color(0xFFC2410C) else Color(0xFF0F172A)
     )
 }
 

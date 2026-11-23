@@ -43,8 +43,6 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Slider
-import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Tab
@@ -167,7 +165,7 @@ fun SettingsTabContent(
     val scope = rememberCoroutineScope()
     var lastTriggeredScenario by remember { mutableStateOf<String?>(null) }
 
-    val gasThreshold by repository.gasThresholdAdc.collectAsState()
+    val savedEspConfig by repository.savedEspConfig.collectAsState()
     val pollingIntervalMs by repository.pollingIntervalMs.collectAsState()
     val phoneAlarmSound by repository.phoneAlarmSoundEnabled.collectAsState()
     val autoRouteOnAlarm by repository.autoRouteOnAlarm.collectAsState()
@@ -318,32 +316,60 @@ fun SettingsTabContent(
                         }
                         Spacer(modifier = Modifier.width(10.dp))
                         Column {
-                            Text("Cài Đặt Báo Động & Ngưỡng Khí Gas", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                            Text("Tuỳ chỉnh độ nhạy MQ-2 ADC & phản ứng tự động", color = TextSecondary, fontSize = 11.sp)
+                            Text("Cài Đặt Báo Động & Ngưỡng 2 Mức", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                            Text("Tách biệt Mức 1 Cảnh báo & Mức 2 Báo cháy + Bật/Bỏ qua từng cảm biến", color = TextSecondary, fontSize = 11.sp)
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(14.dp))
+                    Spacer(modifier = Modifier.height(12.dp))
 
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                        verticalAlignment = Alignment.CenterVertically
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(LightSurfaceVariant)
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        Text("Ngưỡng cảnh báo khí MQ-2:", color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
-                        Text("$gasThreshold ADC", color = CriticalAlarmRed, fontSize = 13.sp, fontWeight = FontWeight.ExtraBold)
+                        Text(
+                            text = "Cấu hình đang áp dụng (chỉnh chi tiết & Push ở thẻ ngay bên dưới):",
+                            color = TextSecondary,
+                            fontSize = 10.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = if (savedEspConfig.mq2Enabled) {
+                                "• MQ-2 (Khói/Gas): BẬT · Mức 1=${savedEspConfig.gasWarn} ADC · Mức 2=${savedEspConfig.gasOn} ADC"
+                            } else {
+                                "• MQ-2 (Khói/Gas): ĐANG BỎ QUA"
+                            },
+                            color = if (savedEspConfig.mq2Enabled) TextPrimary else TextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = if (savedEspConfig.tempEnabled) {
+                                "• Nhiệt độ: BẬT · Mức 1=${savedEspConfig.tempWarnC.roundToInt()}°C · Mức 2=${savedEspConfig.tempAlarmC.roundToInt()}°C"
+                            } else {
+                                "• Nhiệt độ: ĐANG BỎ QUA"
+                            },
+                            color = if (savedEspConfig.tempEnabled) TextPrimary else TextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = if (savedEspConfig.flameEnabled) {
+                                "• Cảm biến Lửa (IR): BẬT · Mức 1=${savedEspConfig.flameWarnMs}ms · Mức 2=${savedEspConfig.flameAlarmMs}ms"
+                            } else {
+                                "• Cảm biến Lửa (IR): ĐANG BỎ QUA"
+                            },
+                            color = if (savedEspConfig.flameEnabled) TextPrimary else TextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold
+                        )
                     }
 
-                    Slider(
-                        value = gasThreshold.toFloat(),
-                        onValueChange = { repository.updateGasThresholdAdc(it.roundToInt()) },
-                        valueRange = 1200f..2800f,
-                        steps = 15,
-                        colors = SliderDefaults.colors(
-                            thumbColor = CriticalAlarmRed,
-                            activeTrackColor = CriticalAlarmRed
-                        )
-                    )
+                    Spacer(modifier = Modifier.height(12.dp))
 
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -380,6 +406,15 @@ fun SettingsTabContent(
                     }
                 }
             }
+        }
+
+        // 2B. ESP32 REMOTE CONFIG & WI-FI OTA (SAVE + PUSH BUTTONS)
+        item {
+            com.example.ui.components.EspWifiConfigAndOtaCard(
+                repository = repository,
+                targetNode = null,
+                allNodes = nodes
+            )
         }
 
         // 3. PERFORMANCE, POLLING & STEP SENSOR CALIBRATION

@@ -79,4 +79,10 @@ class SmartFireNotificationManager(private val context: Context) {
             notificationManager.notify(NOTIFICATION_ID_ALARM, notification)
         } catch (_: Exception) {}
     }
+
+    fun cancelFireAlarmNotification() {
+        try {
+            notificationManager.cancel(NOTIFICATION_ID_ALARM)
+        } catch (_: Exception) {}
+    }
 }
