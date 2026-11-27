@@ -40,6 +40,7 @@ import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -76,6 +77,10 @@ import com.example.ui.theme.PrimaryBlueLight
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import kotlinx.coroutines.launch
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
+import java.util.UUID
 
 @Composable
 fun AddDeviceWizardDialog(
@@ -114,6 +119,12 @@ fun AddDeviceWizardDialog(
     val scanState by bleManager.scanState.collectAsState()
     val bleDevices by bleManager.discoveredDevices.collectAsState()
     val bleConnectionState by bleManager.connectionState.collectAsState()
+
+    DisposableEffect(bleManager) {
+        onDispose {
+            bleManager.disconnect()
+        }
+    }
 
     // Handle BLE Notification State Changes safely inside LaunchedEffect
     LaunchedEffect(bleConnectionState) {
@@ -214,7 +225,13 @@ fun AddDeviceWizardDialog(
                         }
                     }
 
-                    IconButton(onClick = onDismiss, modifier = Modifier.size(28.dp)) {
+                    IconButton(
+                        onClick = {
+                            bleManager.disconnect()
+                            onDismiss()
+                        },
+                        modifier = Modifier.size(28.dp)
+                    ) {
                         Icon(Icons.Default.Close, contentDescription = "Đóng", tint = TextSecondary)
                     }
                 }
@@ -227,7 +244,12 @@ fun AddDeviceWizardDialog(
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Button(
-                        onClick = { isDemoDevice = false },
+                        onClick = {
+                            isDemoDevice = false
+                            if (detectedDeviceId.startsWith("smartfire-demo-")) {
+                                detectedDeviceId = "smartfire-node-01"
+                            }
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .height(44.dp)
@@ -242,7 +264,12 @@ fun AddDeviceWizardDialog(
                     }
 
                     Button(
-                        onClick = { isDemoDevice = true },
+                        onClick = {
+                            isDemoDevice = true
+                            if (!detectedDeviceId.startsWith("smartfire-demo-")) {
+                                detectedDeviceId = "smartfire-demo-${UUID.randomUUID().toString().take(6)}"
+                            }
+                        },
                         modifier = Modifier
                             .weight(1f)
                             .height(44.dp)
@@ -523,8 +550,15 @@ fun AddDeviceWizardDialog(
                             httpTestResult = null
                             scope.launch {
                                 try {
-                                    val service = SmartFireHttpClientFactory.getService(targetIp.trim(), nodeToken.trim())
-                                    val resp = service.getStatus()
+                                    val cleanIp = targetIp.trim()
+                                    val resp = SmartFireHttpClientFactory.withDeviceLock(cleanIp) {
+                                        val service = SmartFireHttpClientFactory.getService(
+                                            ipAddress = cleanIp,
+                                            bearerToken = nodeToken.trim(),
+                                            timeoutSeconds = 5
+                                        )
+                                        service.getStatus()
+                                    }
                                     isTestingHttp = false
                                     if (resp.isSuccessful && resp.body() != null) {
                                         val b = resp.body()!!
@@ -533,12 +567,28 @@ fun AddDeviceWizardDialog(
                                         detectedDeviceId = b.deviceId
                                     } else {
                                         isHttpTestSuccess = false
-                                        httpTestResult = "Lỗi HTTP ${resp.code()} (Sai Token hoặc IP)"
+                                        httpTestResult = when (resp.code()) {
+                                            401, 403 -> "Sai Token bảo mật (HTTP ${resp.code()}). Kiểm tra lại mã Token của ESP32."
+                                            404 -> "Không tìm thấy API /v1/status (HTTP 404). Kiểm tra đúng thiết bị SmartFire."
+                                            else -> "ESP32 trả về lỗi HTTP ${resp.code()}. Vui lòng thử lại."
+                                        }
                                     }
+                                } catch (_: SocketTimeoutException) {
+                                    isTestingHttp = false
+                                    isHttpTestSuccess = false
+                                    httpTestResult = "Hết thời gian chờ (5s): ESP32 không phản hồi tại ${targetIp.trim()}."
+                                } catch (_: ConnectException) {
+                                    isTestingHttp = false
+                                    isHttpTestSuccess = false
+                                    httpTestResult = "Không thể kết nối tới ${targetIp.trim()}. Kiểm tra ESP32 đã bật và cùng mạng Wi-Fi."
+                                } catch (_: UnknownHostException) {
+                                    isTestingHttp = false
+                                    isHttpTestSuccess = false
+                                    httpTestResult = "Địa chỉ IP không hợp lệ hoặc không phân giải được."
                                 } catch (e: Exception) {
                                     isTestingHttp = false
                                     isHttpTestSuccess = false
-                                    httpTestResult = "Không phản hồi: ${e.localizedMessage ?: "Timeout"}"
+                                    httpTestResult = "Lỗi kết nối: ${e.localizedMessage ?: "Không xác định"}"
                                 }
                             }
                         },
@@ -626,8 +676,19 @@ fun AddDeviceWizardDialog(
                         isVerifying = true
                         errorMessage = null
                         scope.launch {
+                            val effectiveDeviceId = if (isDemoDevice) {
+                                if (detectedDeviceId.startsWith("smartfire-demo-")) {
+                                    detectedDeviceId
+                                } else {
+                                    "smartfire-demo-${UUID.randomUUID().toString().take(6)}".also {
+                                        detectedDeviceId = it
+                                    }
+                                }
+                            } else {
+                                detectedDeviceId.ifBlank { "smartfire-node-01" }
+                            }
                             val result = repository.registerDevice(
-                                deviceId = detectedDeviceId,
+                                deviceId = effectiveDeviceId,
                                 displayName = displayName.trim(),
                                 homeId = "home_main",
                                 floorId = "floor_1",

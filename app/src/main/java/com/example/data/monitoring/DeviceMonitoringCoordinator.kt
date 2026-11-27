@@ -9,6 +9,7 @@ import com.example.domain.model.DeviceConnectionState
 import com.example.domain.model.FirmwareState
 import com.example.domain.model.SmartFireTelemetry
 import com.example.service.notification.SmartFireNotificationManager
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -28,6 +29,7 @@ class DeviceMonitoringCoordinator(
     private val pollingJobs = ConcurrentHashMap<String, Job>()
     private val lastSeenTimestamp = ConcurrentHashMap<String, Long>()
     private val lastSeenUptime = ConcurrentHashMap<String, Long>()
+    private val consecutiveFailures = ConcurrentHashMap<String, Int>()
     private val rssiFilters = ConcurrentHashMap<String, com.example.domain.model.RssiKalmanFilter>()
 
     private var masterJob: Job? = null
@@ -36,13 +38,8 @@ class DeviceMonitoringCoordinator(
         if (masterJob?.isActive == true) return
 
         masterJob = coordinatorScope.launch {
-            // Monitor registered devices list from repository
+            // Monitor registered devices list from repository (real ESP32s always polled even in Demo Mode)
             repository.allDevices.collect { devices ->
-                if (repository.isDemoMode.value) {
-                    // Demo mode manages its own simulated ticks
-                    return@collect
-                }
-
                 val realDevices = devices.filterNot { d ->
                     d.isDemoSensor ||
                         d.displayName.contains("DEMO", ignoreCase = true) ||
@@ -54,6 +51,10 @@ class DeviceMonitoringCoordinator(
                 // Cancel jobs for removed or demo devices
                 pollingJobs.keys.filter { it !in currentDeviceIds }.forEach { id ->
                     pollingJobs.remove(id)?.cancel()
+                    consecutiveFailures.remove(id)
+                    lastSeenTimestamp.remove(id)
+                    lastSeenUptime.remove(id)
+                    rssiFilters.remove(id)
                 }
 
                 // Launch poller only for real ESP32 devices
@@ -72,11 +73,6 @@ class DeviceMonitoringCoordinator(
     private suspend fun pollDeviceLoop(deviceId: String) {
         while (coordinatorScope.isActive) {
             try {
-                if (repository.isDemoMode.value) {
-                    delay(2000L)
-                    continue
-                }
-
                 val currentDevices = repository.allDevices.firstOrNull() ?: emptyList()
                 val device = currentDevices.find { it.deviceId == deviceId }
 
@@ -95,24 +91,33 @@ class DeviceMonitoringCoordinator(
                 val timeoutSec = repository.httpTimeoutSeconds.value
                 val service = SmartFireHttpClientFactory.getService(device.ipAddress, token, timeoutSec)
 
-                var response = try {
-                    service.getStatus()
-                } catch (_: Exception) {
-                    null
-                }
-                // 1 fast retry on transient Wi-Fi packet loss to prevent false OFFLINE flickers
-                if (response == null || !response.isSuccessful) {
-                    delay(150L)
-                    response = try {
+                val response = SmartFireHttpClientFactory.withDeviceLock(device.ipAddress) {
+                    var resp = try {
                         service.getStatus()
+                    } catch (e: CancellationException) {
+                        throw e
                     } catch (_: Exception) {
                         null
                     }
+                    // 1 fast retry on transient Wi-Fi packet loss to prevent false OFFLINE flickers
+                    if (resp == null || !resp.isSuccessful) {
+                        delay(150L)
+                        resp = try {
+                            service.getStatus()
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                    resp
                 }
 
                 val now = System.currentTimeMillis()
 
                 if (response != null && response.isSuccessful && response.body() != null) {
+                    consecutiveFailures[deviceId] = 0
+
                     val body = response.body()!!
                     val status = body.status
                     val prevUptime = lastSeenUptime[deviceId] ?: -1L
@@ -172,29 +177,7 @@ class DeviceMonitoringCoordinator(
                         receivedAt = now
                     )
 
-                    val alertMode = repository.alertMode.value
-                    // Notify if ALARM (Level 2) or SUSPECTED (Level 1) newly detected AND local notifications not muted
-                    if (status.alarm && !device.lastKnownAlarm && !repository.isLocalNotificationMutedNow()) {
-                        notificationManager.showFireAlarmNotification(
-                            deviceName = device.displayName,
-                            roomName = device.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
-                            gasRaw = status.gasRaw,
-                            hasFlame = status.flame,
-                            alertMode = alertMode
-                        )
-                    } else if (!status.alarm &&
-                        telemetry.state.equals("SUSPECTED", ignoreCase = true) &&
-                        device.firmwareState != FirmwareState.SUSPECTED &&
-                        repository.level1PopupEnabled.value &&
-                        !repository.isLocalNotificationMutedNow()
-                    ) {
-                        notificationManager.showLevel1WarningNotification(
-                            deviceName = device.displayName,
-                            roomName = device.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
-                            detail = "Phát hiện vượt ngưỡng Mức 1 (Gas=${status.gasRaw} ADC, Lửa=${if (status.flame) "CÓ" else "Không"})",
-                            alertMode = alertMode
-                        )
-                    }
+                    val wasLatchedOfflineFire = deviceId in repository.offlineFireLatchedDevices.value
 
                     repository.updateTelemetryFromPoller(
                         deviceId = deviceId,
@@ -204,40 +187,124 @@ class DeviceMonitoringCoordinator(
                         latestSeq = body.latestSeq
                     )
 
+                    val savedConfig = repository.savedEspConfig.value
+                    val updatedEpisodeId = repository.getAlarmEpisodeId(deviceId)
+                    val updatedNode = device.copy(
+                        lastSeenAt = now,
+                        bootId = body.bootId,
+                        latestSeq = body.latestSeq,
+                        firmwareState = FirmwareState.fromString(telemetry.state),
+                        connectionState = connState,
+                        lastKnownAlarm = telemetry.alarm,
+                        telemetry = telemetry,
+                        suspectedBurnedOffline = false,
+                        isCachedOfflineData = false,
+                        alarmEpisodeId = updatedEpisodeId
+                    )
+
+                    val isEffectivelyAlarm = updatedNode.isEffectivelyAlarming(savedConfig)
+                    val isEffectivelyWarn1 = updatedNode.isEffectivelyWarningLevel1(savedConfig)
+                    val alreadyAlertedEpisode = repository.alertedAlarmEpisodeByDevice.value[deviceId] ?: 0L
+                    val isDeviceMuted = repository.isDeviceMutedNow(deviceId)
+                    val alertMode = repository.alertMode.value
+
+                    // Notify ONLY on a new alarm episode when not muted and not previously offline-fire-latched
+                    if (isEffectivelyAlarm &&
+                        updatedEpisodeId > 0L &&
+                        updatedEpisodeId != alreadyAlertedEpisode &&
+                        !wasLatchedOfflineFire &&
+                        !isDeviceMuted
+                    ) {
+                        repository.markAlarmEpisodeAlerted(deviceId, updatedEpisodeId)
+                        notificationManager.showFireAlarmNotification(
+                            deviceName = device.displayName,
+                            roomName = device.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
+                            gasRaw = status.gasRaw,
+                            hasFlame = status.flame,
+                            alertMode = alertMode,
+                            deviceId = deviceId,
+                            temperatureCelsius = status.temperatureCelsius
+                        )
+                        repository.emitNewlyTriggeredAlarm(updatedNode)
+                    } else if (isEffectivelyWarn1 &&
+                        device.firmwareState != FirmwareState.SUSPECTED &&
+                        repository.level1PopupEnabled.value &&
+                        !isDeviceMuted
+                    ) {
+                        notificationManager.showLevel1WarningNotification(
+                            deviceName = device.displayName,
+                            roomName = device.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
+                            detail = "Phát hiện vượt ngưỡng Mức 1 (Gas=${status.gasRaw} ADC, Lửa=${if (status.flame) "CÓ" else "Không"})",
+                            alertMode = alertMode,
+                            deviceId = deviceId
+                        )
+                    }
+
                     // If latest_seq changed or pending command exists, sync events
                     if (body.latestSeq > device.latestSeq || device.activeCommandStatus == CommandStatus.PENDING) {
-                        syncDeviceEvents(deviceId, body.bootId, device.latestSeq, service, device.lastCommandRequestId)
+                        syncDeviceEvents(
+                            deviceId = deviceId,
+                            ipAddress = device.ipAddress,
+                            bootId = body.bootId,
+                            currentSeq = device.latestSeq,
+                            service = service,
+                            pendingRequestId = device.lastCommandRequestId
+                        )
                     }
                 } else {
-                    // Node unreachable or timeout
-                    val lastSeen = lastSeenTimestamp[deviceId] ?: 0L
-                    val elapsed = now - lastSeen
+                    // Node unreachable or timeout: preserve cached telemetry and latch fire hazard if alarming
+                    consecutiveFailures[deviceId] = (consecutiveFailures[deviceId] ?: 0) + 1
+                    val lastSeen = lastSeenTimestamp[deviceId] ?: device.lastSeenAt
+                    val elapsed = if (lastSeen > 0L) now - lastSeen else Long.MAX_VALUE
                     val connState = if (elapsed > 10_000L || lastSeen == 0L) {
                         DeviceConnectionState.OFFLINE
                     } else {
                         DeviceConnectionState.STALE
                     }
                     repository.updateConnectionOnly(deviceId, connState)
+                    if (connState == DeviceConnectionState.OFFLINE &&
+                        (device.lastKnownAlarm || device.firmwareState == FirmwareState.ALARM)
+                    ) {
+                        repository.markDeviceOfflineDuringFire(deviceId)
+                    }
                 }
+            } catch (e: CancellationException) {
+                throw e
             } catch (_: Exception) {
+                consecutiveFailures[deviceId] = (consecutiveFailures[deviceId] ?: 0) + 1
                 repository.updateConnectionOnly(deviceId, DeviceConnectionState.OFFLINE)
+                val current = repository.allDevices.firstOrNull()?.find { it.deviceId == deviceId }
+                if (current != null && (current.lastKnownAlarm || current.firmwareState == FirmwareState.ALARM)) {
+                    repository.markDeviceOfflineDuringFire(deviceId)
+                }
             }
 
-            // Dynamic polling interval synchronized with SettingsScreen
-            val intervalMs = repository.pollingIntervalMs.value.coerceIn(800L, 10000L)
-            delay(intervalMs)
+            // Dynamic polling interval with adaptive offline backoff
+            val baseIntervalMs = repository.pollingIntervalMs.value.coerceIn(800L, 10000L)
+            val fails = consecutiveFailures[deviceId] ?: 0
+            val delayMs = when {
+                fails <= 0 -> baseIntervalMs
+                fails == 1 -> maxOf(baseIntervalMs, 1500L)
+                fails == 2 -> maxOf(baseIntervalMs, 2500L)
+                fails == 3 -> maxOf(baseIntervalMs, 4000L)
+                else -> maxOf(baseIntervalMs, 6000L)
+            }
+            delay(delayMs)
         }
     }
 
     private suspend fun syncDeviceEvents(
         deviceId: String,
+        ipAddress: String,
         bootId: String,
         currentSeq: Long,
         service: com.example.data.remote.api.SmartFireApiService,
         pendingRequestId: String
     ) {
         try {
-            val response = service.getEvents(since = currentSeq)
+            val response = SmartFireHttpClientFactory.withDeviceLock(ipAddress) {
+                service.getEvents(since = currentSeq)
+            }
             if (response.isSuccessful && response.body() != null) {
                 val body = response.body()!!
                 val eventEntities = body.events.map { item ->
@@ -276,6 +343,8 @@ class DeviceMonitoringCoordinator(
                     }
                 }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (_: Exception) {}
     }
 
@@ -284,5 +353,6 @@ class DeviceMonitoringCoordinator(
         masterJob = null
         pollingJobs.values.forEach { it.cancel() }
         pollingJobs.clear()
+        consecutiveFailures.clear()
     }
 }

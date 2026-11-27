@@ -124,9 +124,9 @@ object LocalAnalyticsEngine {
             insights.add(
                 AiInsight(
                     deviceId = deviceId,
-                    title = "Tín hiệu MQ-2 tăng đột biến (Z-Score $\\ge$ 2.5$\\sigma$)",
-                    explanation = "Giá trị đo ADC hiện tại (${latest.gasRaw}) vượt ngưỡng độ lệch chuẩn so với đường cơ sở trung bình động EWMA ($ewma ADC).",
-                    sourceMeasurements = "Hiện tại: ${latest.gasRaw} ADC, EWMA Baseline: ${ewma.toInt()} ADC, $\\sigma$: ${stdDev.toInt()}",
+                    title = "Tín hiệu MQ-2 tăng đột biến (Z-Score ≥ 2.5σ)",
+                    explanation = "Giá trị đo ADC hiện tại (${latest.gasRaw}) vượt ngưỡng độ lệch chuẩn so với đường cơ sở trung bình động EWMA (${ewma.toInt()} ADC).",
+                    sourceMeasurements = "Hiện tại: ${latest.gasRaw} ADC · EWMA Baseline: ${ewma.toInt()} ADC · σ: ${stdDev.toInt()}",
                     analysisMethod = "Phát hiện dị biệt thống kê Z-Score",
                     freshness = "Thời gian thực",
                     severity = if (latest.alarm) "CRITICAL" else "WARNING",

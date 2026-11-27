@@ -9,10 +9,10 @@ import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -21,21 +21,22 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ExitToApp
+import androidx.compose.material.icons.automirrored.filled.ExitToApp
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.FireExtinguisher
 import androidx.compose.material.icons.filled.LocalFireDepartment
-import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.NotificationsOff
-import androidx.compose.material.icons.filled.Thermostat
-import androidx.compose.material.icons.filled.VolumeUp
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -48,10 +49,11 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
@@ -62,8 +64,11 @@ import com.example.domain.model.SmartFireNode
 import com.example.service.audio.AlarmAudioPlayer
 import com.example.ui.theme.CriticalAlarmRed
 import com.example.ui.theme.PrimaryBlue
+import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import com.example.ui.theme.WarningAmber
 import java.util.Locale
+import kotlin.math.roundToInt
 
 /**
  * Forces Android STREAM_MUSIC, STREAM_ALARM, and STREAM_NOTIFICATION to 100% maximum volume
@@ -103,37 +108,44 @@ fun FireEmergencyPopupDialog(
     onRouteTwoStageExtinguisherToFire: () -> Unit = onRouteToExtinguisher,
     onRouteToExit: () -> Unit = onRouteToExtinguisher,
     onSilenceAllAlarms: () -> Unit,
-    onDisarmAllAlarms: () -> Unit = onSilenceAllAlarms
+    onDisarmAllAlarms: () -> Unit = onSilenceAllAlarms,
+    allAlarmNodes: List<SmartFireNode> = listOf(nearestAlarmNode),
+    isOfflineBurned: Boolean = false
 ) {
     val context = LocalContext.current
     var manualBoostCount by remember { mutableIntStateOf(0) }
 
-    // Screen flashing & huge icon pulsing animations
     val infiniteTransition = rememberInfiniteTransition(label = "emergency_popup_flash")
     val flashAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.25f,
-        targetValue = 0.88f,
+        initialValue = 0.30f,
+        targetValue = 0.86f,
         animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 320),
+            animation = tween(durationMillis = 360),
             repeatMode = RepeatMode.Reverse
         ),
         label = "screen_flash_alpha"
     )
 
     val iconScale by infiniteTransition.animateFloat(
-        initialValue = 0.92f,
-        targetValue = 1.22f,
+        initialValue = 0.94f,
+        targetValue = 1.14f,
         animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 320),
+            animation = tween(durationMillis = 360),
             repeatMode = RepeatMode.Reverse
         ),
-        label = "huge_icon_scale"
+        label = "compact_icon_scale"
     )
 
-    // Customizable Fire Siren / Beep / Ringtone + Vibration via AlarmAudioPlayer
-    // Stops immediately when Popup is closed (by pressing Navigation or Silence Alarm)
-    LaunchedEffect(soundEnabled, alertMode, soundType, volumePercent, nearestAlarmNode.deviceId, manualBoostCount) {
-        if (!soundEnabled || alertMode == AlertMode.SILENT) return@LaunchedEffect
+    LaunchedEffect(
+        soundEnabled,
+        isOfflineBurned,
+        alertMode,
+        soundType,
+        volumePercent,
+        nearestAlarmNode.deviceId,
+        manualBoostCount
+    ) {
+        if (!soundEnabled || isOfflineBurned || alertMode == AlertMode.SILENT) return@LaunchedEffect
         AlarmAudioPlayer.runAlertLoop(
             context = context,
             alertMode = alertMode,
@@ -144,296 +156,270 @@ fun FireEmergencyPopupDialog(
     }
 
     Dialog(
-        onDismissRequest = { /* Keep open until user chooses Extinguisher, Fire Sensor, or Silence */ },
+        onDismissRequest = { /* Keep open until user selects a route or silences/disarms */ },
         properties = DialogProperties(
             dismissOnBackPress = false,
             dismissOnClickOutside = false,
             usePlatformDefaultWidth = false
         )
     ) {
-        // Full-Screen Flashing Emergency Overlay
         Box(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color(0xFF991B1B).copy(alpha = flashAlpha))
-                .border(8.dp, Color.White.copy(alpha = flashAlpha))
-                .padding(18.dp)
+                .border(6.dp, Color.White.copy(alpha = flashAlpha))
+                .padding(16.dp)
                 .testTag("fire_emergency_popup"),
             contentAlignment = Alignment.Center
         ) {
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .clip(RoundedCornerShape(26.dp))
-                    .border(4.dp, CriticalAlarmRed, RoundedCornerShape(26.dp)),
+                    .clip(RoundedCornerShape(24.dp))
+                    .border(3.dp, CriticalAlarmRed, RoundedCornerShape(24.dp)),
                 colors = CardDefaults.cardColors(containerColor = Color.White),
                 elevation = CardDefaults.cardElevation(defaultElevation = 16.dp)
             ) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(20.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
+                        .padding(18.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    // HUGE Pulsing Fire Siren Icon
-                    Box(
-                        modifier = Modifier
-                            .size(96.dp)
-                            .scale(iconScale)
-                            .clip(CircleShape)
-                            .background(CriticalAlarmRed)
-                            .border(4.dp, Color(0xFFFEE2E2), CircleShape),
-                        contentAlignment = Alignment.Center
+                    // 1. Header Row: Compact Pulsing Icon + Bold Title + Speaker Boost IconButton
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
-                        Icon(
-                            imageVector = Icons.Default.LocalFireDepartment,
-                            contentDescription = "Báo động cháy khẩn cấp",
-                            tint = Color.White,
-                            modifier = Modifier.size(56.dp)
-                        )
-                    }
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .scale(iconScale)
+                                    .clip(CircleShape)
+                                    .background(CriticalAlarmRed),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Default.LocalFireDepartment,
+                                    contentDescription = "Báo cháy khẩn cấp",
+                                    tint = Color.White,
+                                    modifier = Modifier.size(26.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = "BÁO CHÁY KHẨN CẤP",
+                                color = CriticalAlarmRed,
+                                fontSize = 18.sp,
+                                fontWeight = FontWeight.Black,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
 
-                    Spacer(modifier = Modifier.height(12.dp))
-
-                    // Flashing Emergency Badge + Max Volume Boost Indicator
-                    Box(
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(50))
-                            .background(CriticalAlarmRed)
-                            .clickable {
+                        IconButton(
+                            onClick = {
                                 forceMaxSystemAlarmVolume(context)
                                 manualBoostCount++
-                            }
-                            .padding(horizontal = 14.dp, vertical = 6.dp)
-                            .testTag("btn_boost_alarm_volume")
-                    ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            },
+                            modifier = Modifier
+                                .size(38.dp)
+                                .clip(CircleShape)
+                                .background(Color(0xFFFEE2E2))
+                                .testTag("btn_boost_alarm_volume")
+                        ) {
                             Icon(
-                                Icons.Default.VolumeUp,
-                                contentDescription = null,
-                                tint = Color.White,
-                                modifier = Modifier.size(16.dp)
-                            )
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text(
-                                text = "CÒI HÚ CỰC ĐẠI 100% (+22dB BOOST) · CHẠM KÍCH LOA",
-                                color = Color.White,
-                                fontSize = 11.sp,
-                                fontWeight = FontWeight.ExtraBold
+                                imageVector = Icons.AutoMirrored.Filled.VolumeUp,
+                                contentDescription = "Tăng âm lượng còi",
+                                tint = CriticalAlarmRed,
+                                modifier = Modifier.size(20.dp)
                             )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                    // 2. Location Line + Distance Pill + Offline Burned Pill + Multi-room Chips
+                    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Text(
+                                text = nearestAlarmNode.displayName,
+                                color = TextPrimary,
+                                fontSize = 17.sp,
+                                fontWeight = FontWeight.ExtraBold,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                modifier = Modifier.weight(1f, fill = false)
+                            )
 
-                    Text(
-                        text = nearestAlarmNode.displayName,
-                        color = CriticalAlarmRed,
-                        fontSize = 20.sp,
-                        fontWeight = FontWeight.ExtraBold,
-                        textAlign = TextAlign.Center
-                    )
+                            val distText = if (distanceMeters < 10f) {
+                                String.format(Locale.US, "~%.1fm", distanceMeters)
+                            } else {
+                                "~${distanceMeters.roundToInt()}m"
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(50))
+                                    .background(Color(0xFFFEF2F2))
+                                    .border(1.dp, Color(0xFFFCA5A5), RoundedCornerShape(50))
+                                    .padding(horizontal = 8.dp, vertical = 3.dp)
+                            ) {
+                                Text(
+                                    text = distText,
+                                    color = CriticalAlarmRed,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                            }
 
-                    Text(
-                        text = String.format(
-                            Locale.US,
-                            "Điểm báo cháy gần bạn nhất (~%.1fm) · Tự động bật dẫn đường trên bản đồ",
-                            distanceMeters
-                        ),
-                        color = TextSecondary,
-                        fontSize = 12.sp,
-                        textAlign = TextAlign.Center,
-                        modifier = Modifier.padding(top = 4.dp)
-                    )
+                            if (isOfflineBurned) {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(Color(0xFFFFFBEB))
+                                        .border(1.dp, WarningAmber, RoundedCornerShape(50))
+                                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                                ) {
+                                    Text(
+                                        text = "Mất kết nối khi cháy",
+                                        color = Color(0xFFB45309),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
 
-                    Spacer(modifier = Modifier.height(14.dp))
+                        if (allAlarmNodes.size > 1) {
+                            LazyRow(
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                items(allAlarmNodes, key = { it.deviceId }) { node ->
+                                    val isNearest = node.deviceId == nearestAlarmNode.deviceId
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(50))
+                                            .background(if (isNearest) CriticalAlarmRed else Color(0xFFFEE2E2))
+                                            .padding(horizontal = 10.dp, vertical = 4.dp)
+                                    ) {
+                                        Text(
+                                            text = node.displayName,
+                                            color = if (isNearest) Color.White else CriticalAlarmRed,
+                                            fontSize = 11.sp,
+                                            fontWeight = FontWeight.Bold,
+                                            maxLines = 1
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
 
-                    // Live Temperature & Gas Telemetry Box inside Popup
+                    // 3. 3-Column Compact Telemetry Box: Nhiệt (°C) | Khói (ADC) | Lửa (CÓ / KHÔNG)
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
                             .clip(RoundedCornerShape(14.dp))
                             .background(Color(0xFFFEF2F2))
                             .border(1.dp, Color(0xFFFECACA), RoundedCornerShape(14.dp))
-                            .padding(12.dp),
+                            .padding(vertical = 10.dp, horizontal = 8.dp),
                         horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                Icon(
-                                    Icons.Default.Thermostat,
-                                    contentDescription = null,
-                                    tint = CriticalAlarmRed,
-                                    modifier = Modifier.size(18.dp)
-                                )
-                                Text(
-                                    text = nearestAlarmNode.telemetry.temperatureCelsius?.let { String.format(Locale.US, "%.1f°C", it) } ?: "N/A",
-                                    color = CriticalAlarmRed,
-                                    fontSize = 20.sp,
-                                    fontWeight = FontWeight.ExtraBold
-                                )
-                            }
-                            Text("Nhiệt độ điểm cháy", color = TextSecondary, fontSize = 11.sp)
-                        }
-
+                        TelemetryCell(
+                            value = nearestAlarmNode.telemetry.temperatureCelsius?.let {
+                                String.format(Locale.US, "%.1f°C", it)
+                            } ?: "N/A",
+                            label = "Nhiệt (°C)",
+                            valueColor = CriticalAlarmRed,
+                            modifier = Modifier.weight(1f)
+                        )
                         Box(
                             modifier = Modifier
                                 .width(1.dp)
-                                .height(34.dp)
+                                .height(30.dp)
                                 .background(Color(0xFFFECACA))
                         )
-
-                        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                            Text(
-                                text = "${nearestAlarmNode.telemetry.gasRaw} ADC",
-                                color = CriticalAlarmRed,
-                                fontSize = 20.sp,
-                                fontWeight = FontWeight.ExtraBold
-                            )
-                            Text("Nồng độ khói / gas", color = TextSecondary, fontSize = 11.sp)
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(16.dp))
-
-                    // HUGE BUTTON 0: DẪN ĐƯỜNG 2 CHẶNG (LẤY BÌNH CC -> ĐÁM CHÁY)
-                    Button(
-                        onClick = onRouteTwoStageExtinguisherToFire,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(56.dp)
-                            .testTag("btn_popup_route_two_stage"),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF7C3AED)),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.FireExtinguisher,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(22.dp)
+                        TelemetryCell(
+                            value = "${nearestAlarmNode.telemetry.gasRaw}",
+                            label = "Khói (ADC)",
+                            valueColor = CriticalAlarmRed,
+                            modifier = Modifier.weight(1f)
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Column(horizontalAlignment = Alignment.Start) {
-                            Text(
-                                text = "LỘ TRÌNH 2 CHẶNG: LẤY BÌNH CC ➔ ĐÁM CHÁY",
-                                color = Color.White,
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.ExtraBold
-                            )
-                            Text(
-                                text = "Tự động chỉ đường qua Bình CC gần nhất rồi tiến tới dập lửa",
-                                color = Color.White.copy(alpha = 0.9f),
-                                fontSize = 10.sp
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // HUGE BUTTON 1: DẪN TỚI BÌNH CHỮA CHÁY (Stops siren & routes to extinguisher)
-                    Button(
-                        onClick = onRouteToExtinguisher,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(52.dp)
-                            .testTag("btn_popup_route_extinguisher"),
-                        colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.FireExtinguisher,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(22.dp)
+                        Box(
+                            modifier = Modifier
+                                .width(1.dp)
+                                .height(30.dp)
+                                .background(Color(0xFFFECACA))
                         )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Column(horizontalAlignment = Alignment.Start) {
-                            Text(
-                                text = "CHỈ DẪN TỚI BÌNH CHỮA CHÁY",
-                                color = Color.White,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.ExtraBold
-                            )
-                            Text(
-                                text = "Ngừng hú màn hình & chỉ đường lấy bình chữa cháy",
-                                color = Color.White.copy(alpha = 0.9f),
-                                fontSize = 10.sp
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // HUGE BUTTON 2: DẪN TỚI BÁO CHÁY ĐANG CHÁY GẦN NHẤT
-                    Button(
-                        onClick = onRouteToNearestFireSensor,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(52.dp)
-                            .testTag("btn_popup_route_fire_sensor"),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFEA580C)),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.LocalFireDepartment,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(22.dp)
+                        TelemetryCell(
+                            value = if (nearestAlarmNode.telemetry.flame) "CÓ" else "KHÔNG",
+                            label = "Lửa (CÓ / KHÔNG)",
+                            valueColor = if (nearestAlarmNode.telemetry.flame) CriticalAlarmRed else TextPrimary,
+                            modifier = Modifier.weight(1f)
                         )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Column(horizontalAlignment = Alignment.Start) {
-                            Text(
-                                text = "DẪN TỚI BÁO CHÁY ĐANG CHÁY GẦN NHẤT",
-                                color = Color.White,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.ExtraBold
+                    }
+
+                    // 4. 2x2 Clean Grid of Navigation Buttons (concise 1-line labels)
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            EmergencyRouteButton(
+                                label = "Thoát Hiểm",
+                                icon = Icons.AutoMirrored.Filled.ExitToApp,
+                                containerColor = Color(0xFF0F766E),
+                                onClick = onRouteToExit,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("btn_popup_route_exit")
                             )
-                            Text(
-                                text = "Đi thẳng tới vị trí ${nearestAlarmNode.displayName}",
-                                color = Color.White.copy(alpha = 0.9f),
-                                fontSize = 10.sp
+                            EmergencyRouteButton(
+                                label = "Bình CC ➔ Lửa",
+                                icon = Icons.Default.FireExtinguisher,
+                                containerColor = Color(0xFF7C3AED),
+                                onClick = onRouteTwoStageExtinguisherToFire,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("btn_popup_route_two_stage")
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            EmergencyRouteButton(
+                                label = "Tìm Bình CC",
+                                icon = Icons.Default.FireExtinguisher,
+                                containerColor = PrimaryBlue,
+                                onClick = onRouteToExtinguisher,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("btn_popup_route_extinguisher")
+                            )
+                            EmergencyRouteButton(
+                                label = "Tới Điểm Cháy",
+                                icon = Icons.Default.LocalFireDepartment,
+                                containerColor = Color(0xFFEA580C),
+                                onClick = onRouteToNearestFireSensor,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .testTag("btn_popup_route_fire_sensor")
                             )
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // HUGE BUTTON 2B: DẪN TỚI CỬA THOÁT HIỂM (EXIT)
-                    Button(
-                        onClick = onRouteToExit,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(52.dp)
-                            .testTag("btn_popup_route_exit"),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF0F766E)),
-                        shape = RoundedCornerShape(14.dp)
-                    ) {
-                        Icon(
-                            Icons.Default.ExitToApp,
-                            contentDescription = null,
-                            tint = Color.White,
-                            modifier = Modifier.size(22.dp)
-                        )
-                        Spacer(modifier = Modifier.width(10.dp))
-                        Column(horizontalAlignment = Alignment.Start) {
-                            Text(
-                                text = "DẪN TỚI CỬA THOÁT HIỂM (EXIT)",
-                                color = Color.White,
-                                fontSize = 13.sp,
-                                fontWeight = FontWeight.ExtraBold
-                            )
-                            Text(
-                                text = "Tạm tắt còi máy này & hiện biển chỉ đường thoát nạn",
-                                color = Color.White.copy(alpha = 0.9f),
-                                fontSize = 10.sp
-                            )
-                        }
-                    }
-
-                    Spacer(modifier = Modifier.height(8.dp))
-
-                    // TWO BUTTONS: TẮT TẠM 30s vs TẮT HẲN (Giữ nút ESP32 5s hoặc Bật Lại trên app)
+                    // 5. Bottom Row: Im 30s (Red) | Tắt Hẳn (Dark Slate)
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -442,23 +428,25 @@ fun FireEmergencyPopupDialog(
                             onClick = onSilenceAllAlarms,
                             modifier = Modifier
                                 .weight(1f)
-                                .height(50.dp)
+                                .height(46.dp)
                                 .testTag("btn_popup_silence_alarm"),
                             colors = ButtonDefaults.buttonColors(containerColor = CriticalAlarmRed),
-                            shape = RoundedCornerShape(14.dp)
+                            shape = RoundedCornerShape(12.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp)
                         ) {
                             Icon(
-                                Icons.Default.NotificationsOff,
+                                imageVector = Icons.Default.NotificationsOff,
                                 contentDescription = null,
                                 tint = Color.White,
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(16.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = if (totalAlarmCount > 1) "TẮT 30s ($totalAlarmCount)" else "TẮT TẠM 30s",
+                                text = if (totalAlarmCount > 1) "Im 30s ($totalAlarmCount)" else "Im 30s",
                                 color = Color.White,
                                 fontSize = 13.sp,
-                                fontWeight = FontWeight.ExtraBold
+                                fontWeight = FontWeight.ExtraBold,
+                                maxLines = 1
                             )
                         }
 
@@ -466,36 +454,91 @@ fun FireEmergencyPopupDialog(
                             onClick = onDisarmAllAlarms,
                             modifier = Modifier
                                 .weight(1f)
-                                .height(50.dp)
+                                .height(46.dp)
                                 .testTag("btn_popup_disarm_alarm"),
                             colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF1E293B)),
-                            shape = RoundedCornerShape(14.dp)
+                            shape = RoundedCornerShape(12.dp),
+                            contentPadding = PaddingValues(horizontal = 10.dp)
                         ) {
                             Icon(
-                                Icons.Default.NotificationsOff,
+                                imageVector = Icons.Default.NotificationsOff,
                                 contentDescription = null,
                                 tint = Color.White,
-                                modifier = Modifier.size(18.dp)
+                                modifier = Modifier.size(16.dp)
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "TẮT HẲN",
+                                text = "Tắt Hẳn",
                                 color = Color.White,
                                 fontSize = 13.sp,
-                                fontWeight = FontWeight.ExtraBold
+                                fontWeight = FontWeight.ExtraBold,
+                                maxLines = 1
                             )
                         }
                     }
-
-                    Spacer(modifier = Modifier.height(6.dp))
-                    Text(
-                        text = "Tắt hẳn sẽ tắt còi & app hoàn toàn · Giữ nút ESP32 5s hoặc bấm Bật Lại trên app để bật",
-                        color = TextSecondary,
-                        fontSize = 10.sp,
-                        textAlign = TextAlign.Center
-                    )
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun TelemetryCell(
+    value: String,
+    label: String,
+    valueColor: Color,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Text(
+            text = value,
+            color = valueColor,
+            fontSize = 17.sp,
+            fontWeight = FontWeight.Black,
+            maxLines = 1
+        )
+        Text(
+            text = label,
+            color = TextSecondary,
+            fontSize = 10.sp,
+            fontWeight = FontWeight.Medium,
+            maxLines = 1
+        )
+    }
+}
+
+@Composable
+private fun EmergencyRouteButton(
+    label: String,
+    icon: ImageVector,
+    containerColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.height(48.dp),
+        colors = ButtonDefaults.buttonColors(containerColor = containerColor),
+        shape = RoundedCornerShape(12.dp),
+        contentPadding = PaddingValues(horizontal = 10.dp)
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = null,
+            tint = Color.White,
+            modifier = Modifier.size(18.dp)
+        )
+        Spacer(modifier = Modifier.width(6.dp))
+        Text(
+            text = label,
+            color = Color.White,
+            fontSize = 12.5.sp,
+            fontWeight = FontWeight.ExtraBold,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
     }
 }

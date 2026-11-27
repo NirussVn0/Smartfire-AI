@@ -80,6 +80,11 @@ class BleProvisioningManager(private val context: Context) {
     private var activeGatt: BluetoothGatt? = null
     private val handler = Handler(Looper.getMainLooper())
     private var isFallbackScanning = false
+    private var connectAttempt = 0
+    private var targetDevice: BluetoothDevice? = null
+    private var isUserDisconnected = false
+    private var activeConnectionWatchdog: Runnable? = null
+    private var activeDiscoveryWatchdog: Runnable? = null
 
     private val scanCallback = object : ScanCallback() {
         @SuppressLint("MissingPermission")
@@ -211,87 +216,180 @@ class BleProvisioningManager(private val context: Context) {
         }
     }
 
+    private fun cancelWatchdogs() {
+        activeConnectionWatchdog?.let { handler.removeCallbacks(it) }
+        activeConnectionWatchdog = null
+        activeDiscoveryWatchdog?.let { handler.removeCallbacks(it) }
+        activeDiscoveryWatchdog = null
+    }
+
+    private fun refreshGattCache(gatt: BluetoothGatt) {
+        runCatching {
+            val refreshMethod = gatt.javaClass.getMethod("refresh")
+            val refreshed = refreshMethod.invoke(gatt) as? Boolean ?: false
+            Log.d(TAG, "refreshGattCache returned: $refreshed")
+        }.onFailure { e ->
+            Log.w(TAG, "refreshGattCache failed: ${e.message}")
+        }
+    }
+
     @SuppressLint("MissingPermission")
     fun connect(device: BluetoothDevice) {
         stopScan()
+        cancelWatchdogs()
+        handler.removeCallbacksAndMessages(null)
         disconnectGattOnly()
+
+        isUserDisconnected = false
+        connectAttempt = 0
+        targetDevice = device
 
         val deviceName = try { device.name ?: device.address } catch (_: Exception) { device.address }
         _connectionState.value = BleConnectionState.Connecting(deviceName)
 
+        // Allow Android BLE stack 300ms after stopping scan & closing old GATT before connecting
+        handler.postDelayed({
+            if (!isUserDisconnected && targetDevice?.address == device.address) {
+                connectGattInternal(device)
+            }
+        }, 300L)
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun connectGattInternal(device: BluetoothDevice) {
+        if (isUserDisconnected || targetDevice?.address != device.address) return
+
+        cancelWatchdogs()
+        disconnectGattOnly()
+
+        val deviceName = try { device.name ?: device.address } catch (_: Exception) { device.address }
         var isConnectionCompleted = false
+        var isDiscoveryCompleted = false
 
         // 12-second connection watchdog timer to prevent UI hanging indefinitely
         val connectionWatchdog = Runnable {
-            if (!isConnectionCompleted && _connectionState.value is BleConnectionState.Connecting) {
+            if (!isConnectionCompleted && !isUserDisconnected && targetDevice?.address == device.address) {
                 Log.w(TAG, "Connection timeout to $deviceName (12s)")
-                _connectionState.value = BleConnectionState.Error("Hết thời gian kết nối BLE (12s). Vui lòng thử lại gần ESP32.")
-                disconnect()
+                activeGatt?.let { refreshGattCache(it) }
+                disconnectGattOnly()
+                if (!isUserDisconnected && connectAttempt < 2) {
+                    connectAttempt++
+                    _connectionState.value = BleConnectionState.Connecting("$deviceName (Thử lại $connectAttempt/2)...")
+                    handler.postDelayed({
+                        if (!isUserDisconnected && targetDevice?.address == device.address) {
+                            connectGattInternal(device)
+                        }
+                    }, 600L * connectAttempt)
+                } else {
+                    _connectionState.value = BleConnectionState.Error("Hết thời gian kết nối BLE (12s). Vui lòng thử lại gần ESP32.")
+                }
             }
         }
+        activeConnectionWatchdog = connectionWatchdog
         handler.postDelayed(connectionWatchdog, 12000L)
 
         val gattCallback = object : BluetoothGattCallback() {
-            private var servicesDiscovered = false
+            private var servicesDiscoveryStarted = false
 
             override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
                 Log.d(TAG, "onConnectionStateChange: status=$status, newState=$newState")
 
+                if (activeGatt != null && activeGatt != gatt) {
+                    Log.d(TAG, "Ignoring callback from stale BluetoothGatt instance")
+                    try { gatt.close() } catch (_: Exception) {}
+                    return
+                }
+
                 if (status != BluetoothGatt.GATT_SUCCESS) {
-                    handler.removeCallbacks(connectionWatchdog)
+                    cancelWatchdogs()
                     isConnectionCompleted = true
                     Log.e(TAG, "GATT connection failed with status $status")
-                    _connectionState.value = BleConnectionState.Error("Lỗi kết nối Bluetooth (Mã GATT: $status). Vui lòng thử lại.")
+                    refreshGattCache(gatt)
                     try { gatt.close() } catch (_: Exception) {}
                     if (activeGatt == gatt) activeGatt = null
+
+                    val currentTarget = targetDevice
+                    if (!isUserDisconnected && connectAttempt < 2 && currentTarget?.address == device.address) {
+                        connectAttempt++
+                        _connectionState.value = BleConnectionState.Connecting("$deviceName (Thử lại $connectAttempt/2)...")
+                        val retryDelayMs = 600L * connectAttempt
+                        handler.postDelayed({
+                            if (!isUserDisconnected && targetDevice?.address == currentTarget.address) {
+                                connectGattInternal(currentTarget)
+                            }
+                        }, retryDelayMs)
+                    } else if (!isUserDisconnected) {
+                        _connectionState.value = BleConnectionState.Error("Lỗi kết nối Bluetooth (Mã GATT: $status). Vui lòng thử lại.")
+                    }
                     return
                 }
 
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     handler.removeCallbacks(connectionWatchdog)
+                    if (activeConnectionWatchdog == connectionWatchdog) activeConnectionWatchdog = null
+                    isConnectionCompleted = true
                     _connectionState.value = BleConnectionState.Connected(deviceName)
-                    Log.d(TAG, "GATT connected to $deviceName, requesting MTU 512")
+                    Log.d(TAG, "GATT connected to $deviceName, starting 8s discovery watchdog and requesting MTU 512")
+
+                    // 8-second service discovery watchdog so discoverServices() cannot hang indefinitely
+                    val discoveryWatchdog = Runnable {
+                        if (activeGatt == gatt && !isUserDisconnected && !isDiscoveryCompleted) {
+                            Log.w(TAG, "GATT service discovery timeout (8s) on $deviceName")
+                            refreshGattCache(gatt)
+                            disconnectGattOnly()
+                            _connectionState.value = BleConnectionState.Error("Hết thời gian khám phá dịch vụ BLE (8s). Vui lòng thử lại gần ESP32.")
+                        }
+                    }
+                    activeDiscoveryWatchdog = discoveryWatchdog
+                    handler.postDelayed(discoveryWatchdog, 8000L)
 
                     // Delay slightly to allow Android GATT stack to stabilize
                     handler.postDelayed({
-                        if (activeGatt == gatt) {
-                            val requested = gatt.requestMtu(512)
+                        if (activeGatt == gatt && !isUserDisconnected) {
+                            val requested = try { gatt.requestMtu(512) } catch (_: Exception) { false }
                             Log.d(TAG, "requestMtu(512) returned: $requested")
 
                             // Fallback watchdog: If onMtuChanged is never triggered, discover services directly
                             handler.postDelayed({
-                                if (activeGatt == gatt && !servicesDiscovered) {
+                                if (activeGatt == gatt && !isUserDisconnected && !servicesDiscoveryStarted) {
                                     Log.w(TAG, "MTU callback timed out, proceeding to discoverServices()")
-                                    servicesDiscovered = true
-                                    gatt.discoverServices()
+                                    servicesDiscoveryStarted = true
+                                    try { gatt.discoverServices() } catch (_: Exception) {}
                                 }
                             }, 1000L)
                         }
                     }, 350L)
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                    handler.removeCallbacks(connectionWatchdog)
+                    cancelWatchdogs()
                     isConnectionCompleted = true
                     Log.d(TAG, "GATT disconnected from $deviceName")
                     try { gatt.close() } catch (_: Exception) {}
                     if (activeGatt == gatt) activeGatt = null
-                    _connectionState.value = BleConnectionState.Disconnected
+                    if (!isUserDisconnected) {
+                        _connectionState.value = BleConnectionState.Disconnected
+                    }
                 }
             }
 
             override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
                 Log.d(TAG, "onMtuChanged: mtu=$mtu, status=$status")
-                if (!servicesDiscovered) {
-                    servicesDiscovered = true
+                if (activeGatt == gatt && !isUserDisconnected && !servicesDiscoveryStarted) {
+                    servicesDiscoveryStarted = true
                     handler.postDelayed({
-                        if (activeGatt == gatt) {
-                            gatt.discoverServices()
+                        if (activeGatt == gatt && !isUserDisconnected) {
+                            try { gatt.discoverServices() } catch (_: Exception) {}
                         }
                     }, 150L)
                 }
             }
 
             override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+                if (activeGatt != null && activeGatt != gatt) return
+                isDiscoveryCompleted = true
+                activeDiscoveryWatchdog?.let { handler.removeCallbacks(it) }
+                activeDiscoveryWatchdog = null
                 isConnectionCompleted = true
+
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     val service = gatt.getService(SERVICE_UUID)
                     if (service != null) {
@@ -330,7 +428,7 @@ class BleProvisioningManager(private val context: Context) {
                 if (status == BluetoothGatt.GATT_SUCCESS && descriptor.characteristic.uuid == STATUS_CHAR_UUID) {
                     handler.postDelayed({
                         try {
-                            if (activeGatt == gatt) {
+                            if (activeGatt == gatt && !isUserDisconnected) {
                                 gatt.readCharacteristic(descriptor.characteristic)
                             }
                         } catch (e: Exception) {
@@ -380,11 +478,23 @@ class BleProvisioningManager(private val context: Context) {
             }
         }
 
-        activeGatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
-        } else {
-            device.connectGatt(context, false, gattCallback)
+        val gatt = try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                device.connectGatt(context, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
+            } else {
+                device.connectGatt(context, false, gattCallback)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "connectGatt threw exception: ${e.message}")
+            null
         }
+
+        if (gatt == null) {
+            cancelWatchdogs()
+            _connectionState.value = BleConnectionState.Error("Không thể khởi tạo kết nối GATT tới $deviceName")
+            return
+        }
+        activeGatt = gatt
     }
 
     private fun parseStatusNotification(rawJson: String) {
@@ -411,45 +521,58 @@ class BleProvisioningManager(private val context: Context) {
 
     @SuppressLint("MissingPermission")
     fun writeWifiConfig(ssid: String, pass: String): Boolean {
+        val cleanSsid = ssid.trim()
+        if (cleanSsid.isEmpty()) return false
+
         val gatt = activeGatt ?: return false
-        val service = gatt.getService(SERVICE_UUID) ?: return false
+        val service = runCatching { gatt.getService(SERVICE_UUID) }.getOrNull() ?: return false
         val configChar = service.getCharacteristic(CONFIG_CHAR_UUID) ?: return false
 
         val payload = JSONObject().apply {
-            put("ssid", ssid.trim())
+            put("ssid", cleanSsid)
             put("password", pass.trim())
         }.toString()
 
         val bytes = payload.toByteArray(Charsets.UTF_8)
-        Log.d(TAG, "Writing Wi-Fi config for SSID '${ssid.trim()}' (${bytes.size} bytes)")
+        Log.d(TAG, "Writing Wi-Fi config for SSID '$cleanSsid' (${bytes.size} bytes)")
 
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            gatt.writeCharacteristic(
-                configChar,
-                bytes,
-                BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            ) == BluetoothStatusCodes.SUCCESS
-        } else {
-            @Suppress("DEPRECATION")
-            configChar.value = bytes
-            @Suppress("DEPRECATION")
-            configChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
-            @Suppress("DEPRECATION")
-            gatt.writeCharacteristic(configChar)
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                gatt.writeCharacteristic(
+                    configChar,
+                    bytes,
+                    BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                ) == BluetoothStatusCodes.SUCCESS
+            } else {
+                @Suppress("DEPRECATION")
+                configChar.value = bytes
+                @Suppress("DEPRECATION")
+                configChar.writeType = BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT
+                @Suppress("DEPRECATION")
+                gatt.writeCharacteristic(configChar)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "writeWifiConfig failed: ${e.message}")
+            false
         }
     }
 
     @SuppressLint("MissingPermission")
     private fun disconnectGattOnly() {
-        try {
-            activeGatt?.disconnect()
-            activeGatt?.close()
-        } catch (_: Exception) {}
+        val gatt = activeGatt
         activeGatt = null
+        if (gatt != null) {
+            try { gatt.disconnect() } catch (_: Exception) {}
+            try { gatt.close() } catch (_: Exception) {}
+        }
     }
 
     @SuppressLint("MissingPermission")
     fun disconnect() {
+        isUserDisconnected = true
+        targetDevice = null
+        connectAttempt = 0
+        cancelWatchdogs()
         handler.removeCallbacksAndMessages(null)
         disconnectGattOnly()
         _connectionState.value = BleConnectionState.Disconnected

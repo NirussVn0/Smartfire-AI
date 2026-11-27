@@ -1,17 +1,15 @@
 package com.example.ui.screens.dashboard
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -34,13 +32,12 @@ import androidx.compose.material.icons.filled.LocalFireDepartment
 import androidx.compose.material.icons.filled.Navigation
 import androidx.compose.material.icons.filled.NotificationsActive
 import androidx.compose.material.icons.filled.NotificationsOff
-import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Science
 import androidx.compose.material.icons.filled.Sensors
 import androidx.compose.material.icons.filled.ShowChart
-import androidx.compose.material.icons.filled.Thermostat
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.filled.VolumeUp
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -55,22 +52,13 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.PathEffect
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
-import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
@@ -78,6 +66,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.domain.model.AiInsight
 import com.example.domain.model.DeviceConnectionState
+import com.example.domain.model.EspDeviceConfig
 import com.example.domain.model.FirmwareState
 import com.example.domain.model.HomeProfile
 import com.example.domain.model.SensorSnapshotPoint
@@ -87,6 +76,8 @@ import com.example.ui.components.ChartPoint
 import com.example.ui.components.CriticalAlarmOverlay
 import com.example.ui.components.DemoModeBanner
 import com.example.ui.components.FirmwareStateBadge
+import com.example.ui.components.MultiChartMode
+import com.example.ui.components.MultiMetricSensorChart
 import com.example.ui.components.SensorChart
 import com.example.ui.theme.CriticalAlarmBackground
 import com.example.ui.theme.CriticalAlarmBorder
@@ -100,11 +91,15 @@ import com.example.ui.theme.LightSurfaceVariant
 import com.example.ui.theme.NormalGreen
 import com.example.ui.theme.NormalGreenBackground
 import com.example.ui.theme.NormalGreenBorder
+import com.example.ui.theme.OfflineBackground
+import com.example.ui.theme.OfflineGray
 import com.example.ui.theme.PrimaryBlue
 import com.example.ui.theme.PrimaryBlueLight
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.WarningAmber
+import com.example.ui.theme.WarningBackground
+import com.example.ui.theme.WarningBorder
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -150,36 +145,40 @@ fun DashboardScreen(
     onDisarmClick: (String) -> Unit = {},
     onArmClick: (String) -> Unit = {},
     onAdjustMultiSensorParams: (String, Float, Float, Int, Int, Float, Float) -> Unit = { _, _, _, _, _, _, _ -> },
+    savedEspConfig: EspDeviceConfig = EspDeviceConfig(),
+    onResetOfflineBurnedClick: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    val alarmNodes = nodes.filter { node ->
-        val isDisarmed = node.telemetry.disarmed || node.firmwareState == FirmwareState.DISARMED
-        val isRealFaultOrWarming = !node.isDemoSensor &&
-            (node.firmwareState == FirmwareState.WARMING || node.firmwareState == FirmwareState.FAULT || node.telemetry.gasFault)
-        !isDisarmed && (node.lastKnownAlarm || node.firmwareState == FirmwareState.ALARM ||
-            (!isRealFaultOrWarming && node.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent >= 75f))
+    val alarmNodes = nodes.filter { it.isEffectivelyAlarming(savedEspConfig) }
+    val offlineCount = nodes.count { it.connectionState == DeviceConnectionState.OFFLINE }
+    val safeCount = nodes.count {
+        !it.isEffectivelyAlarming(savedEspConfig) && it.connectionState != DeviceConnectionState.OFFLINE
     }
-    val onlineCount = nodes.count { it.connectionState == DeviceConnectionState.ONLINE_FRESH }
     val totalCount = nodes.size
     val demoNodes = nodes.filter { it.isDemoSensor || it.displayName.contains("DEMO", ignoreCase = true) }
     val realNodes = nodes.filterNot { it.isDemoSensor || it.displayName.contains("DEMO", ignoreCase = true) }
 
     var selectedTimeRange by remember { mutableStateOf(ChartTimeRange.HOURLY) }
-    var selectedMetric by remember { mutableStateOf(ChartMetricType.GAS_ADC) }
+    var selectedChartMode by remember { mutableStateOf(MultiChartMode.ALL_THREE) }
+    var selectedChartDeviceId by remember { mutableStateOf<String?>(null) }
     var activeSensorTab by remember { mutableStateOf(SensorListFilterTab.ALL) }
     var isSensorListExpanded by remember { mutableStateOf(true) }
 
-    val peakNode = nodes.maxByOrNull { it.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent }
-    val maxProb = peakNode?.telemetry?.calculateFireProbability(gasThresholdAdc)?.totalProbabilityPercent ?: 3.5f
-    val maxTemp = nodes.mapNotNull { it.telemetry.temperatureCelsius }.maxOrNull() ?: 28.5f
-    val maxGas = nodes.maxOfOrNull { it.telemetry.gasRaw } ?: 920
-    val currentFlamePct = if (nodes.any { it.telemetry.flame }) {
-        100f
-    } else {
-        ((nodes.maxOfOrNull { it.telemetry.irFlameIntensity ?: 0f } ?: 0f) * 100f).coerceIn(0f, 100f)
+    val defaultChartNode = alarmNodes.firstOrNull() ?: realNodes.firstOrNull() ?: nodes.firstOrNull()
+    val selectedChartNode = nodes.find { it.deviceId == selectedChartDeviceId } ?: defaultChartNode
+
+    val highestRiskNode = nodes.maxByOrNull {
+        it.telemetry.calculateFireProbability(gasThresholdAdc, it.effectiveConfig(savedEspConfig)).totalProbabilityPercent
     }
-    val maxCo = nodes.mapNotNull { it.telemetry.coPpm }.maxOrNull() ?: 12
-    val avgHum = if (nodes.any { it.telemetry.humidityPercent != null }) nodes.mapNotNull { it.telemetry.humidityPercent }.average().toFloat() else 60f
+    val summaryFocusNode = if (selectedChartDeviceId != null) {
+        selectedChartNode
+    } else {
+        alarmNodes.firstOrNull() ?: highestRiskNode ?: selectedChartNode
+    }
+    val summaryCfg = summaryFocusNode?.effectiveConfig(savedEspConfig) ?: savedEspConfig
+    val summaryProb = summaryFocusNode?.telemetry?.calculateFireProbability(gasThresholdAdc, summaryCfg)?.totalProbabilityPercent ?: 0f
+    val summaryTemp = summaryFocusNode?.telemetry?.temperatureCelsius
+    val summaryGas = summaryFocusNode?.telemetry?.gasRaw ?: 0
 
     val displayedNodes = when (activeSensorTab) {
         SensorListFilterTab.ALL -> nodes
@@ -338,7 +337,7 @@ fun DashboardScreen(
                 Spacer(modifier = Modifier.height(10.dp))
             }
 
-            // 2. BẢNG OVERALL (OVERALL SUMMARY BOARD - GỌN, VUÔNG VỨC, RÕ RÀNG)
+            // 2. BẢNG OVERALL (INDEPENDENT PER-DEVICE SUMMARY BOARD)
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -372,7 +371,11 @@ fun DashboardScreen(
                             Spacer(modifier = Modifier.width(8.dp))
                             Column {
                                 Text(
-                                    text = if (alarmNodes.isNotEmpty()) "OVERALL: BÁO ĐỘNG (${alarmNodes.size} MÁY)" else "OVERALL: HỆ THỐNG AN TOÀN",
+                                    text = if (alarmNodes.isNotEmpty()) {
+                                        "BÁO ĐỘNG (${alarmNodes.size} ĐANG CHÁY)"
+                                    } else {
+                                        "HỆ THỐNG AN TOÀN"
+                                    },
                                     color = if (alarmNodes.isNotEmpty()) CriticalAlarmRed else NormalGreen,
                                     fontSize = 12.sp,
                                     fontWeight = FontWeight.ExtraBold,
@@ -380,9 +383,10 @@ fun DashboardScreen(
                                     overflow = TextOverflow.Ellipsis
                                 )
                                 Text(
-                                    text = String.format(Locale.US, "Xác suất P(Cháy) = %.1f%% · 5 thông số", maxProb),
+                                    text = "${alarmNodes.size} đang cháy · $safeCount an toàn · $offlineCount offline",
                                     color = TextPrimary,
-                                    fontSize = 10.sp,
+                                    fontSize = 10.5.sp,
+                                    fontWeight = FontWeight.SemiBold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
@@ -394,7 +398,7 @@ fun DashboardScreen(
                                 onClick = { alarmNodes.forEach { onSilenceClick(it.deviceId) } },
                                 colors = ButtonDefaults.buttonColors(containerColor = CriticalAlarmRed),
                                 shape = RoundedCornerShape(8.dp),
-                                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
                                 modifier = Modifier.height(30.dp)
                             ) {
                                 Text("Tắt còi", fontSize = 10.sp, fontWeight = FontWeight.Bold, maxLines = 1)
@@ -407,7 +411,7 @@ fun DashboardScreen(
                                     .padding(horizontal = 8.dp, vertical = 3.dp)
                             ) {
                                 Text(
-                                    text = "$onlineCount/$totalCount Online",
+                                    text = "$safeCount/$totalCount Sẵn sàng",
                                     color = NormalGreen,
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.Bold,
@@ -417,48 +421,130 @@ fun DashboardScreen(
                         }
                     }
 
-                    Spacer(modifier = Modifier.height(10.dp))
+                    if (nodes.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
 
-                    // 4 Square Overall KPI Tiles in 1 Row
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        OverallSquareKpiTile(
-                            label = "Thiết Bị",
-                            value = "$onlineCount/$totalCount",
-                            sub = if (realNodes.isNotEmpty()) "${realNodes.size} ESP32" else "Sẵn sàng",
-                            accentColor = PrimaryBlue,
-                            modifier = Modifier.weight(1f)
-                        )
-                        OverallSquareKpiTile(
-                            label = "Nhiệt Đỉnh",
-                            value = String.format(Locale.US, "%.1f°C", maxTemp),
-                            sub = if (maxTemp >= 50f) "Cao!" else "Ổn định",
-                            accentColor = if (maxTemp >= 50f) CriticalAlarmRed else NormalGreen,
-                            modifier = Modifier.weight(1f)
-                        )
-                        OverallSquareKpiTile(
-                            label = "Khói Đỉnh",
-                            value = "$maxGas",
-                            sub = "Ngưỡng $gasThresholdAdc",
-                            accentColor = if (maxGas >= gasThresholdAdc) CriticalAlarmRed else PrimaryBlue,
-                            modifier = Modifier.weight(1f)
-                        )
-                        OverallSquareKpiTile(
-                            label = "Nguy Cơ",
-                            value = String.format(Locale.US, "%.1f%%", maxProb),
-                            sub = if (maxProb >= 75f) "Báo cháy" else "An toàn",
-                            accentColor = if (maxProb >= 75f) CriticalAlarmRed else WarningAmber,
-                            modifier = Modifier.weight(1f)
-                        )
+                        // Per-device selector chips (tapping selects that device in the chart & focus strip)
+                        LazyRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            items(nodes, key = { it.deviceId }) { node ->
+                                val nodeCfg = node.effectiveConfig(savedEspConfig)
+                                val nodeProb = node.telemetry.calculateFireProbability(gasThresholdAdc, nodeCfg).totalProbabilityPercent
+                                val isNodeAlarm = node.isEffectivelyAlarming(savedEspConfig)
+                                val isNodeWarn = node.isEffectivelyWarningLevel1(savedEspConfig)
+                                val isNodeOffline = node.connectionState == DeviceConnectionState.OFFLINE
+                                val isSelected = selectedChartNode?.deviceId == node.deviceId
+                                val dotColor = when {
+                                    isNodeAlarm -> CriticalAlarmRed
+                                    isNodeWarn -> WarningAmber
+                                    isNodeOffline -> OfflineGray
+                                    else -> NormalGreen
+                                }
+                                val shortName = node.displayName.replace("[DEMO]", "").trim()
+
+                                Row(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(if (isSelected) PrimaryBlueLight else LightSurfaceVariant)
+                                        .border(
+                                            1.dp,
+                                            if (isSelected) PrimaryBlue else LightBorder,
+                                            RoundedCornerShape(50)
+                                        )
+                                        .clickable { selectedChartDeviceId = node.deviceId }
+                                        .padding(horizontal = 9.dp, vertical = 5.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .size(7.dp)
+                                            .clip(CircleShape)
+                                            .background(dotColor)
+                                    )
+                                    Spacer(modifier = Modifier.width(5.dp))
+                                    Text(
+                                        text = "$shortName · ${nodeProb.roundToInt()}%",
+                                        color = if (isSelected) PrimaryBlue else TextPrimary,
+                                        fontSize = 10.sp,
+                                        fontWeight = if (isSelected) FontWeight.ExtraBold else FontWeight.SemiBold,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+
+                        if (summaryFocusNode != null) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            val focusCleanName = summaryFocusNode.displayName.replace("[DEMO]", "").trim()
+                            val focusOfflineTag = if (summaryFocusNode.isCachedOfflineData) " · Offline" else ""
+
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(LightSurfaceVariant)
+                                    .border(1.dp, LightBorder, RoundedCornerShape(10.dp))
+                                    .padding(horizontal = 10.dp, vertical = 7.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "$focusCleanName$focusOfflineTag",
+                                        color = TextPrimary,
+                                        fontSize = 11.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        text = String.format(
+                                            Locale.US,
+                                            "Nhiệt: %s · Khói: %d ADC",
+                                            summaryTemp?.let { String.format(Locale.US, "%.1f°C", it) } ?: "N/A",
+                                            summaryGas
+                                        ),
+                                        color = TextSecondary,
+                                        fontSize = 10.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(
+                                            when {
+                                                summaryProb >= 75f -> CriticalAlarmBackground
+                                                summaryProb >= 45f -> WarningBackground
+                                                else -> NormalGreenBackground
+                                            }
+                                        )
+                                        .padding(horizontal = 8.dp, vertical = 4.dp)
+                                ) {
+                                    Text(
+                                        text = String.format(Locale.US, "P(Cháy) %.1f%%", summaryProb),
+                                        color = when {
+                                            summaryProb >= 75f -> CriticalAlarmRed
+                                            summaryProb >= 45f -> Color(0xFFB45309)
+                                            else -> NormalGreen
+                                        },
+                                        fontSize = 10.5.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
 
             Spacer(modifier = Modifier.height(10.dp))
 
-            // 3. BẢNG 2 CỘT: CỘT 1 BIỂU ĐỒ ĐƯỜNG + CỘT 2 BIỂU ĐỒ SỐ LIỆU VUÔNG VUÔNG + NÚT THEO GIỜ / THEO NGÀY
+            // 3. BIỂU ĐỒ CẢM BIẾN ĐỘC LẬP THEO THIẾT BỊ (FULL-WIDTH MULTIMETRIC CHART + 2x2 KPI TILES)
             Card(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -469,7 +555,7 @@ fun DashboardScreen(
                 elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
             ) {
                 Column(modifier = Modifier.padding(12.dp)) {
-                    // Header Row: Title + Segmented Toggle [Theo Giờ] | [Theo Ngày]
+                    // Top Row: Title + Segmented Toggle [Theo Giờ] | [Theo Ngày]
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.SpaceBetween,
@@ -484,7 +570,7 @@ fun DashboardScreen(
                             )
                             Spacer(modifier = Modifier.width(6.dp))
                             Text(
-                                text = "Biểu Đồ & Số Liệu",
+                                text = "Biểu Đồ Cảm Biến",
                                 color = TextPrimary,
                                 fontSize = 14.sp,
                                 fontWeight = FontWeight.ExtraBold,
@@ -536,196 +622,240 @@ fun DashboardScreen(
                         }
                     }
 
+                    // Device Selector Row
+                    if (nodes.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        LazyRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            items(nodes, key = { "chart_${it.deviceId}" }) { node ->
+                                val isSelected = selectedChartNode?.deviceId == node.deviceId
+                                val cleanLabel = node.displayName.replace("[DEMO]", "").trim()
+                                val isAlarmNode = node.isEffectivelyAlarming(savedEspConfig)
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(50))
+                                        .background(
+                                            when {
+                                                isSelected && isAlarmNode -> CriticalAlarmRed
+                                                isSelected -> PrimaryBlue
+                                                isAlarmNode -> CriticalAlarmBackground
+                                                else -> LightSurfaceVariant
+                                            }
+                                        )
+                                        .border(
+                                            1.dp,
+                                            when {
+                                                isSelected && isAlarmNode -> CriticalAlarmRed
+                                                isSelected -> PrimaryBlue
+                                                isAlarmNode -> CriticalAlarmBorder
+                                                else -> LightBorder
+                                            },
+                                            RoundedCornerShape(50)
+                                        )
+                                        .clickable { selectedChartDeviceId = node.deviceId }
+                                        .padding(horizontal = 10.dp, vertical = 5.dp)
+                                ) {
+                                    Text(
+                                        text = cleanLabel,
+                                        color = when {
+                                            isSelected -> Color.White
+                                            isAlarmNode -> CriticalAlarmRed
+                                            else -> TextPrimary
+                                        },
+                                        fontSize = 10.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+                        }
+                    }
+
                     Spacer(modifier = Modifier.height(8.dp))
 
-                    // Metric Selector Chips: Khói ADC | Nhiệt °C | Lửa (IR) | P(Cháy) %
+                    // Metric Selector Row: Cả 3 Thông Số (default) | Khói MQ-2 | Nhiệt Độ | Lửa (IR) | P(Cháy)
                     LazyRow(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        item {
+                        val chartModes = listOf(
+                            MultiChartMode.ALL_THREE to "Cả 3 Thông Số",
+                            MultiChartMode.GAS_ADC to "Khói MQ-2",
+                            MultiChartMode.TEMP_C to "Nhiệt Độ",
+                            MultiChartMode.FLAME_IR to "Lửa (IR)",
+                            MultiChartMode.PROB_PCT to "P(Cháy)"
+                        )
+                        items(chartModes) { (mode, label) ->
                             MetricFilterChip(
-                                label = "Khói MQ-2 (ADC)",
-                                selected = selectedMetric == ChartMetricType.GAS_ADC,
-                                onClick = { selectedMetric = ChartMetricType.GAS_ADC }
-                            )
-                        }
-                        item {
-                            MetricFilterChip(
-                                label = "Nhiệt Độ (°C)",
-                                selected = selectedMetric == ChartMetricType.TEMP_C,
-                                onClick = { selectedMetric = ChartMetricType.TEMP_C }
-                            )
-                        }
-                        item {
-                            MetricFilterChip(
-                                label = "Lửa (IR %)",
-                                selected = selectedMetric == ChartMetricType.FLAME_IR,
-                                onClick = { selectedMetric = ChartMetricType.FLAME_IR }
-                            )
-                        }
-                        item {
-                            MetricFilterChip(
-                                label = "P(Cháy) %",
-                                selected = selectedMetric == ChartMetricType.PROB_PCT,
-                                onClick = { selectedMetric = ChartMetricType.PROB_PCT }
+                                label = label,
+                                selected = selectedChartMode == mode,
+                                onClick = { selectedChartMode = mode }
                             )
                         }
                     }
 
                     Spacer(modifier = Modifier.height(10.dp))
 
-                    // 2-COLUMN LAYOUT:
-                    // Column 1 (Left): Biểu Đồ Đường (Line Chart)
-                    // Column 2 (Right): Biểu Đồ Số Liệu Vuông Vuông (2x2 Square Grid + Square Matrix)
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.spacedBy(10.dp),
-                        verticalAlignment = Alignment.Top
-                    ) {
-                        // CỘT 1: BIỂU ĐỒ ĐƯỜNG (LINE CHART)
-                        Column(
-                            modifier = Modifier
-                                .weight(1.12f)
-                                .clip(RoundedCornerShape(12.dp))
-                                .background(LightSurfaceVariant)
-                                .border(1.dp, LightBorder, RoundedCornerShape(12.dp))
-                                .padding(10.dp)
-                        ) {
-                            CompactLineChartColumn(
-                                timeRange = selectedTimeRange,
-                                metricType = selectedMetric,
-                                currentGas = maxGas,
-                                currentTemp = maxTemp,
-                                currentFlamePct = currentFlamePct,
-                                currentProb = maxProb,
-                                gasThresholdAdc = gasThresholdAdc,
-                                snapshots = snapshots
-                            )
+                    // Full-Width MultiMetricSensorChart for selectedChartNode ONLY
+                    val chartCfg = selectedChartNode?.effectiveConfig(savedEspConfig) ?: savedEspConfig
+                    val chartTemp = selectedChartNode?.telemetry?.temperatureCelsius
+                    val chartGas = selectedChartNode?.telemetry?.gasRaw ?: 0
+                    val chartCo = selectedChartNode?.telemetry?.coPpm
+                    val chartHum = selectedChartNode?.telemetry?.humidityPercent
+                    val chartRor = selectedChartNode?.telemetry?.tempRateOfRiseCPerMin
+                    val chartFlamePct = if (selectedChartNode?.telemetry?.flame == true) {
+                        100f
+                    } else {
+                        ((selectedChartNode?.telemetry?.irFlameIntensity ?: 0f) * 100f).coerceIn(0f, 100f)
+                    }
+                    val chartProb = selectedChartNode?.telemetry
+                        ?.calculateFireProbability(gasThresholdAdc, chartCfg)
+                        ?.totalProbabilityPercent ?: 0f
+
+                    val deviceChartSnapshots = remember(snapshots, selectedChartNode?.deviceId, selectedTimeRange) {
+                        val devId = selectedChartNode?.deviceId
+                        if (devId == null) {
+                            emptyList()
+                        } else {
+                            val filtered = snapshots
+                                .filter { it.deviceId == devId }
+                                .sortedBy { it.timestamp }
+                            if (selectedTimeRange == ChartTimeRange.HOURLY) {
+                                filtered.takeLast(40)
+                            } else {
+                                filtered.takeLast(120)
+                            }
+                        }
+                    }
+
+                    MultiMetricSensorChart(
+                        snapshots = deviceChartSnapshots,
+                        currentGas = chartGas,
+                        currentTemp = chartTemp,
+                        currentFlamePct = chartFlamePct,
+                        currentProb = chartProb,
+                        gasWarnThreshold = chartCfg.gasWarn,
+                        gasAlarmThreshold = chartCfg.gasOn,
+                        tempWarnC = chartCfg.tempWarnC,
+                        tempAlarmC = chartCfg.tempAlarmC,
+                        selectedMode = selectedChartMode,
+                        timeRangeLabel = if (selectedTimeRange == ChartTimeRange.HOURLY) "24h" else "7 ngày",
+                        isCachedOffline = selectedChartNode?.isCachedOfflineData == true,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+
+                    if (selectedChartNode != null) {
+                        Spacer(modifier = Modifier.height(10.dp))
+
+                        if (selectedChartNode.isCachedOfflineData) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(bottom = 6.dp)
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(WarningBackground)
+                                    .border(1.dp, WarningBorder, RoundedCornerShape(8.dp))
+                                    .padding(horizontal = 10.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Dữ liệu cũ (Offline) · Hiển thị thông số gần nhất của ${selectedChartNode.displayName.replace("[DEMO]", "").trim()}",
+                                    color = Color(0xFFB45309),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
                         }
 
-                        // CỘT 2: BIỂU ĐỒ SỐ LIỆU VUÔNG VUÔNG (2x2 SQUARE METRIC MATRIX)
-                        Column(
-                            modifier = Modifier.weight(0.95f),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            // Row 1 of Square Grid
+                        // Clean 2x2 KPI Tiles for selectedChartNode
+                        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 SquareMetricBlock(
                                     title = "Nhiệt Độ",
-                                    mainValue = String.format(Locale.US, "%.1f°", maxTemp),
-                                    subLabel = String.format(
-                                        Locale.US,
-                                        "+%.1f°/p",
-                                        peakNode?.telemetry?.tempRateOfRiseCPerMin ?: 0.3f
-                                    ),
-                                    progress = ((maxTemp - 20f) / 70f).coerceIn(0.08f, 1f),
-                                    color = if (maxTemp >= 50f) CriticalAlarmRed else NormalGreen,
+                                    mainValue = chartTemp?.let { String.format(Locale.US, "%.1f°C", it) } ?: "N/A",
+                                    subLabel = if (selectedChartNode.isCachedOfflineData) {
+                                        "Dữ liệu cũ (Offline)"
+                                    } else {
+                                        chartRor?.let { String.format(Locale.US, "+%.1f°/p · Ngưỡng %.0f°", it, chartCfg.tempAlarmC) }
+                                            ?: String.format(Locale.US, "Ngưỡng %.0f°C", chartCfg.tempAlarmC)
+                                    },
+                                    progress = if (chartTemp != null) ((chartTemp - 20f) / 70f).coerceIn(0.08f, 1f) else 0.08f,
+                                    color = if ((chartTemp ?: 0f) >= chartCfg.tempAlarmC) CriticalAlarmRed
+                                    else if ((chartTemp ?: 0f) >= chartCfg.tempWarnC) WarningAmber
+                                    else NormalGreen,
                                     modifier = Modifier.weight(1f)
                                 )
                                 SquareMetricBlock(
-                                    title = "Khói ADC",
-                                    mainValue = "$maxGas",
-                                    subLabel = "Ngưỡng $gasThresholdAdc",
-                                    progress = (maxGas / 3000f).coerceIn(0.08f, 1f),
-                                    color = if (maxGas >= gasThresholdAdc) CriticalAlarmRed else PrimaryBlue,
+                                    title = "Khói MQ-2",
+                                    mainValue = "$chartGas ADC",
+                                    subLabel = if (selectedChartNode.isCachedOfflineData) {
+                                        "Dữ liệu cũ (Offline)"
+                                    } else {
+                                        "Mức 1: ${chartCfg.gasWarn} · Mức 2: ${chartCfg.gasOn}"
+                                    },
+                                    progress = (chartGas / maxOf(3000f, chartCfg.gasOn * 1.2f)).coerceIn(0.08f, 1f),
+                                    color = when {
+                                        !selectedChartNode.isDemoSensor && (selectedChartNode.telemetry.gasFault || chartGas >= 4090) -> WarningAmber
+                                        chartGas >= chartCfg.gasOn -> CriticalAlarmRed
+                                        chartGas >= chartCfg.gasWarn -> WarningAmber
+                                        else -> PrimaryBlue
+                                    },
                                     modifier = Modifier.weight(1f)
                                 )
                             }
 
-                            // Row 2 of Square Grid
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 SquareMetricBlock(
-                                    title = "CO & Ẩm",
-                                    mainValue = "${maxCo}ppm",
-                                    subLabel = String.format(Locale.US, "Ẩm %.0f%%", avgHum),
-                                    progress = (maxCo / 200f).coerceIn(0.08f, 1f),
-                                    color = if (maxCo >= 80) CriticalAlarmRed else WarningAmber,
+                                    title = "Lửa IR / CO",
+                                    mainValue = if (selectedChartNode.telemetry.flame) {
+                                        "CÓ LỬA"
+                                    } else {
+                                        "${chartFlamePct.roundToInt()}%"
+                                    },
+                                    subLabel = when {
+                                        selectedChartNode.isCachedOfflineData -> "Dữ liệu cũ (Offline)"
+                                        chartCo != null && chartHum != null -> "CO ${chartCo}ppm · Ẩm ${chartHum.roundToInt()}%"
+                                        chartCo != null -> "CO ${chartCo} ppm"
+                                        else -> "Cảm biến quang IR"
+                                    },
+                                    progress = (chartFlamePct / 100f).coerceIn(0.08f, 1f),
+                                    color = if (selectedChartNode.telemetry.flame || chartFlamePct >= 70f) CriticalAlarmRed
+                                    else if (chartFlamePct >= 35f) WarningAmber
+                                    else PrimaryBlue,
                                     modifier = Modifier.weight(1f)
                                 )
                                 SquareMetricBlock(
-                                    title = "P(Cháy) / Lửa",
-                                    mainValue = String.format(Locale.US, "%.1f%%", maxProb),
-                                    subLabel = if (currentFlamePct >= 50f) "CÓ NGỌN LỬA!" else if (maxProb >= 75f) "Nguy hiểm" else "Lửa: Không",
-                                    progress = (maxProb / 100f).coerceIn(0.08f, 1f),
-                                    color = if (maxProb >= 75f || currentFlamePct >= 50f) CriticalAlarmRed else PrimaryBlue,
+                                    title = "P(Cháy)",
+                                    mainValue = String.format(Locale.US, "%.1f%%", chartProb),
+                                    subLabel = if (selectedChartNode.isCachedOfflineData) {
+                                        "Dữ liệu cũ (Offline)"
+                                    } else if (chartProb >= 75f) {
+                                        "Báo cháy khẩn cấp"
+                                    } else if (chartProb >= 45f) {
+                                        "Cảnh báo sớm"
+                                    } else {
+                                        "An toàn"
+                                    },
+                                    progress = (chartProb / 100f).coerceIn(0.08f, 1f),
+                                    color = when {
+                                        chartProb >= 75f -> CriticalAlarmRed
+                                        chartProb >= 45f -> WarningAmber
+                                        else -> NormalGreen
+                                    },
                                     modifier = Modifier.weight(1f)
                                 )
-                            }
-
-                            // Square Heatmap Matrix Row (Biểu đồ ô vuông theo giờ/ngày)
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(LightSurfaceVariant)
-                                    .border(1.dp, LightBorder, RoundedCornerShape(10.dp))
-                                    .padding(horizontal = 8.dp, vertical = 6.dp)
-                            ) {
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = if (selectedTimeRange == ChartTimeRange.HOURLY) "Ma trận Giờ" else "Ma trận Ngày",
-                                        color = TextSecondary,
-                                        fontSize = 9.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1
-                                    )
-                                    Text(
-                                        text = if (maxProb >= 75f) "Cảnh báo" else "Ổn định",
-                                        color = if (maxProb >= 75f) CriticalAlarmRed else NormalGreen,
-                                        fontSize = 9.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        maxLines = 1
-                                    )
-                                }
-                                Spacer(modifier = Modifier.height(4.dp))
-                                val blockLabels = if (selectedTimeRange == ChartTimeRange.HOURLY) {
-                                    listOf("0h", "4h", "8h", "12h", "16h", "20h", "Nay")
-                                } else {
-                                    listOf("T2", "T3", "T4", "T5", "T6", "T7", "CN")
-                                }
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.spacedBy(3.dp)
-                                ) {
-                                    blockLabels.forEachIndexed { idx, lbl ->
-                                        val isLast = idx == blockLabels.lastIndex
-                                        val sqColor = when {
-                                            isLast && maxProb >= 75f -> CriticalAlarmRed
-                                            isLast && maxProb >= 45f -> WarningAmber
-                                            idx % 3 == 0 -> PrimaryBlue.copy(alpha = 0.75f)
-                                            else -> NormalGreen.copy(alpha = 0.75f)
-                                        }
-                                        Column(
-                                            modifier = Modifier.weight(1f),
-                                            horizontalAlignment = Alignment.CenterHorizontally
-                                        ) {
-                                            Box(
-                                                modifier = Modifier
-                                                    .size(14.dp)
-                                                    .clip(RoundedCornerShape(3.dp))
-                                                    .background(sqColor)
-                                            )
-                                            Text(
-                                                text = lbl,
-                                                color = TextSecondary,
-                                                fontSize = 7.sp,
-                                                maxLines = 1
-                                            )
-                                        }
-                                    }
-                                }
                             }
                         }
                     }
@@ -948,6 +1078,8 @@ fun DashboardScreen(
                         onAdjustMultiSensorParams = { tempC, ror, gas, co, hum, ir ->
                             onAdjustMultiSensorParams(node.deviceId, tempC, ror, gas, co, hum, ir)
                         },
+                        savedEspConfig = savedEspConfig,
+                        onResetOfflineBurnedClick = { onResetOfflineBurnedClick(node.deviceId) },
                         modifier = Modifier.padding(vertical = 5.dp)
                     )
                 }
@@ -957,49 +1089,6 @@ fun DashboardScreen(
         item {
             Spacer(modifier = Modifier.height(28.dp))
         }
-    }
-}
-
-@Composable
-private fun OverallSquareKpiTile(
-    label: String,
-    value: String,
-    sub: String,
-    accentColor: Color,
-    modifier: Modifier = Modifier
-) {
-    Column(
-        modifier = modifier
-            .clip(RoundedCornerShape(12.dp))
-            .background(LightSurfaceVariant)
-            .border(1.dp, LightBorder, RoundedCornerShape(12.dp))
-            .padding(horizontal = 8.dp, vertical = 8.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Text(
-            text = label,
-            color = TextSecondary,
-            fontSize = 9.sp,
-            fontWeight = FontWeight.Medium,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Spacer(modifier = Modifier.height(2.dp))
-        Text(
-            text = value,
-            color = accentColor,
-            fontSize = 13.sp,
-            fontWeight = FontWeight.ExtraBold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Text(
-            text = sub,
-            color = TextSecondary,
-            fontSize = 8.sp,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
     }
 }
 
@@ -1139,8 +1228,8 @@ private fun AiInsightsEarlyWarningSection(
                 Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.weight(1f)) {
                     Box(
                         modifier = Modifier
-                            .size(28.dp)
-                            .clip(RoundedCornerShape(8.dp))
+                            .size(30.dp)
+                            .clip(RoundedCornerShape(9.dp))
                             .background(
                                 when {
                                     criticalCount > 0 -> CriticalAlarmBackground
@@ -1164,7 +1253,7 @@ private fun AiInsightsEarlyWarningSection(
                     Spacer(modifier = Modifier.width(8.dp))
                     Column {
                         Text(
-                            text = "Phân Tích Thông Minh & Cảnh Báo Sớm",
+                            text = "Cảnh Báo Sớm & Phân Tích",
                             color = TextPrimary,
                             fontSize = 13.sp,
                             fontWeight = FontWeight.ExtraBold,
@@ -1172,9 +1261,9 @@ private fun AiInsightsEarlyWarningSection(
                             overflow = TextOverflow.Ellipsis
                         )
                         Text(
-                            text = "LocalAnalyticsEngine · Tự động đối chiếu lịch sử & đa cảm biến",
+                            text = "Theo dõi xu hướng & cảnh báo sớm theo từng khu vực",
                             color = TextSecondary,
-                            fontSize = 9.sp,
+                            fontSize = 10.sp,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -1192,371 +1281,116 @@ private fun AiInsightsEarlyWarningSection(
             AnimatedVisibility(visible = expanded) {
                 Column(
                     modifier = Modifier.padding(top = 8.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     insights.forEach { insight ->
                         val nodeName = nodes.find { it.deviceId == insight.deviceId }?.displayName
-                        val sevColor = when (insight.severity.uppercase()) {
+                            ?.replace("[DEMO]", "")?.trim()
+                        val sevUpper = insight.severity.uppercase()
+                        val sevColor = when (sevUpper) {
                             "CRITICAL" -> CriticalAlarmRed
-                            "WARNING" -> WarningAmber
+                            "WARNING" -> Color(0xFFB45309)
                             else -> PrimaryBlue
                         }
-                        val sevBg = when (insight.severity.uppercase()) {
+                        val sevBg = when (sevUpper) {
                             "CRITICAL" -> CriticalAlarmBackground
-                            "WARNING" -> DemoGoldBackground
-                            else -> LightSurfaceVariant
+                            "WARNING" -> WarningBackground
+                            else -> PrimaryBlueLight
                         }
-                        Column(
+                        val sevLabel = when (sevUpper) {
+                            "CRITICAL" -> "KHẨN CẤP"
+                            "WARNING" -> "CẢNH BÁO"
+                            else -> "THÔNG TIN"
+                        }
+
+                        Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(sevBg)
-                                .border(1.dp, sevColor.copy(alpha = 0.35f), RoundedCornerShape(10.dp))
+                                .clip(RoundedCornerShape(12.dp))
+                                .background(LightSurfaceVariant)
+                                .border(1.dp, sevColor.copy(alpha = 0.28f), RoundedCornerShape(12.dp))
                                 .clickable { onInsightNodeClick(insight.deviceId) }
-                                .padding(horizontal = 10.dp, vertical = 8.dp)
+                                .padding(horizontal = 10.dp, vertical = 9.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
+                            Column(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .padding(end = 8.dp),
+                                verticalArrangement = Arrangement.spacedBy(3.dp)
                             ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(50))
+                                            .background(sevBg)
+                                            .border(1.dp, sevColor.copy(alpha = 0.4f), RoundedCornerShape(50))
+                                            .padding(horizontal = 7.dp, vertical = 2.dp)
+                                    ) {
+                                        Text(
+                                            text = sevLabel,
+                                            color = sevColor,
+                                            fontSize = 8.5.sp,
+                                            fontWeight = FontWeight.ExtraBold,
+                                            maxLines = 1
+                                        )
+                                    }
+                                    Text(
+                                        text = nodeName ?: insight.deviceId,
+                                        color = TextPrimary,
+                                        fontSize = 10.5.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        modifier = Modifier.weight(1f, fill = false)
+                                    )
+                                }
+
                                 Text(
                                     text = insight.title,
-                                    color = sevColor,
-                                    fontSize = 11.sp,
-                                    fontWeight = FontWeight.ExtraBold,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis,
-                                    modifier = Modifier.weight(1f)
-                                )
-                                Text(
-                                    text = insight.freshness,
-                                    color = TextSecondary,
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.Bold
-                                )
-                            }
-                            if (!nodeName.isNullOrBlank()) {
-                                Text(
-                                    text = "Thiết bị: $nodeName · ${insight.sourceMeasurements}",
                                     color = TextPrimary,
-                                    fontSize = 9.sp,
-                                    fontWeight = FontWeight.SemiBold,
+                                    fontSize = 11.5.sp,
+                                    fontWeight = FontWeight.Bold,
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis
                                 )
+
+                                if (insight.sourceMeasurements.isNotBlank()) {
+                                    Text(
+                                        text = insight.sourceMeasurements,
+                                        color = TextSecondary,
+                                        fontSize = 10.sp,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
-                            Text(
-                                text = "Khuyến nghị: ${insight.recommendation}",
-                                color = TextSecondary,
-                                fontSize = 10.sp,
-                                maxLines = 2,
-                                overflow = TextOverflow.Ellipsis
-                            )
+
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(sevColor)
+                                    .clickable { onInsightNodeClick(insight.deviceId) }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = "Kiểm tra",
+                                    color = Color.White,
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    maxLines = 1
+                                )
+                            }
                         }
                     }
                 }
             }
         }
     }
-}
-
-@Composable
-private fun CompactLineChartColumn(
-    timeRange: ChartTimeRange,
-    metricType: ChartMetricType,
-    currentGas: Int,
-    currentTemp: Float,
-    currentFlamePct: Float,
-    currentProb: Float,
-    gasThresholdAdc: Int = 1800,
-    snapshots: List<SensorSnapshotPoint> = emptyList()
-) {
-    var selectedIdx by remember(timeRange, metricType) { mutableStateOf<Int?>(null) }
-
-    val orderedSnapshots = remember(snapshots, timeRange) {
-        val sorted = snapshots.sortedBy { it.timestamp }
-        if (sorted.size >= 7) {
-            if (timeRange == ChartTimeRange.HOURLY) {
-                sorted.takeLast(7)
-            } else {
-                val step = (sorted.size / 7).coerceAtLeast(1)
-                (0 until 7).map { idx -> sorted[(idx * step).coerceAtMost(sorted.lastIndex)] }
-            }
-        } else {
-            emptyList()
-        }
-    }
-
-    val xLabels = remember(orderedSnapshots, timeRange) {
-        if (orderedSnapshots.size == 7 && timeRange == ChartTimeRange.HOURLY) {
-            val fmt = java.text.SimpleDateFormat("HH:mm", Locale.getDefault())
-            orderedSnapshots.mapIndexed { idx, s ->
-                if (idx == 6) "Nay" else fmt.format(java.util.Date(s.timestamp))
-            }
-        } else if (timeRange == ChartTimeRange.HOURLY) {
-            listOf("00h", "04h", "08h", "12h", "16h", "20h", "Nay")
-        } else {
-            listOf("T2", "T3", "T4", "T5", "T6", "T7", "CN")
-        }
-    }
-
-    val seriesValues: List<Float> = remember(orderedSnapshots, timeRange, metricType, currentGas, currentTemp, currentFlamePct, currentProb) {
-        if (orderedSnapshots.size == 7) {
-            val fromDb = orderedSnapshots.map { snap ->
-                when (metricType) {
-                    ChartMetricType.GAS_ADC -> snap.gasRaw.toFloat().coerceAtLeast(250f)
-                    ChartMetricType.TEMP_C -> snap.temperatureCelsius.coerceAtLeast(20f)
-                    ChartMetricType.FLAME_IR -> snap.flamePercent.coerceIn(0f, 100f)
-                    ChartMetricType.PROB_PCT -> snap.fireProbabilityPercent.coerceIn(1f, 99.9f)
-                }
-            }.toMutableList()
-            // Keep the last point synchronized with the live peak telemetry
-            fromDb[fromDb.lastIndex] = when (metricType) {
-                ChartMetricType.GAS_ADC -> maxOf(fromDb.last(), currentGas.toFloat())
-                ChartMetricType.TEMP_C -> maxOf(fromDb.last(), currentTemp)
-                ChartMetricType.FLAME_IR -> maxOf(fromDb.last(), currentFlamePct)
-                ChartMetricType.PROB_PCT -> maxOf(fromDb.last(), currentProb)
-            }
-            fromDb
-        } else {
-            when (metricType) {
-                ChartMetricType.GAS_ADC -> {
-                    val base = currentGas.toFloat().coerceAtLeast(400f)
-                    if (timeRange == ChartTimeRange.HOURLY) {
-                        listOf(base * 0.82f, base * 0.85f, base * 0.90f, base * 0.88f, base * 0.94f, base * 0.97f, base)
-                    } else {
-                        listOf(base * 0.78f, base * 0.84f, base * 0.81f, base * 0.89f, base * 0.92f, base * 0.95f, base)
-                    }
-                }
-                ChartMetricType.TEMP_C -> {
-                    val base = currentTemp.coerceAtLeast(24f)
-                    if (timeRange == ChartTimeRange.HOURLY) {
-                        listOf(base - 2.4f, base - 2.0f, base - 1.2f, base - 0.5f, base - 0.8f, base - 0.3f, base)
-                    } else {
-                        listOf(base - 3.0f, base - 2.2f, base - 1.8f, base - 1.4f, base - 0.9f, base - 0.4f, base)
-                    }
-                }
-                ChartMetricType.FLAME_IR -> {
-                    val base = currentFlamePct.coerceIn(0f, 100f)
-                    listOf(0f, 0f, 0f, 0f, (base * 0.25f), (base * 0.5f), base)
-                }
-                ChartMetricType.PROB_PCT -> {
-                    val base = currentProb.coerceIn(2f, 99f)
-                    if (timeRange == ChartTimeRange.HOURLY) {
-                        listOf(
-                            (base * 0.5f).coerceAtLeast(2f),
-                            (base * 0.6f).coerceAtLeast(2.2f),
-                            (base * 0.7f).coerceAtLeast(2.5f),
-                            (base * 0.75f).coerceAtLeast(2.8f),
-                            (base * 0.85f).coerceAtLeast(3.0f),
-                            (base * 0.92f).coerceAtLeast(3.2f),
-                            base
-                        )
-                    } else {
-                        listOf(
-                            (base * 0.45f).coerceAtLeast(2f),
-                            (base * 0.55f).coerceAtLeast(2.1f),
-                            (base * 0.62f).coerceAtLeast(2.4f),
-                            (base * 0.70f).coerceAtLeast(2.6f),
-                            (base * 0.80f).coerceAtLeast(2.9f),
-                            (base * 0.90f).coerceAtLeast(3.1f),
-                            base
-                        )
-                    }
-                }
-            }
-        }
-    }
-
-    val thresholdVal = when (metricType) {
-        ChartMetricType.GAS_ADC -> gasThresholdAdc.toFloat()
-        ChartMetricType.TEMP_C -> 55f
-        ChartMetricType.FLAME_IR -> 50f
-        ChartMetricType.PROB_PCT -> 75f
-    }
-
-    val unitStr = when (metricType) {
-        ChartMetricType.GAS_ADC -> "ADC"
-        ChartMetricType.TEMP_C -> "°C"
-        ChartMetricType.FLAME_IR -> "%"
-        ChartMetricType.PROB_PCT -> "%"
-    }
-
-    val minVal = 0f
-    val maxVal = if (metricType == ChartMetricType.FLAME_IR) {
-        110f
-    } else {
-        maxOf(thresholdVal * 1.15f, (seriesValues.maxOrNull() ?: 100f) * 1.15f)
-    }
-    val latestVal = seriesValues.lastOrNull() ?: 0f
-    val lineColor = when {
-        metricType == ChartMetricType.FLAME_IR && latestVal >= thresholdVal -> Color(0xFFEA580C)
-        metricType == ChartMetricType.FLAME_IR -> Color(0xFFF59E0B)
-        latestVal >= thresholdVal -> CriticalAlarmRed
-        else -> PrimaryBlue
-    }
-
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Text(
-            text = if (timeRange == ChartTimeRange.HOURLY) "Đường Xu Hướng (24h)" else "Đường Xu Hướng (7 Ngày)",
-            color = TextPrimary,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis
-        )
-        Text(
-            text = if (metricType == ChartMetricType.GAS_ADC) {
-                "${latestVal.roundToInt()} $unitStr"
-            } else {
-                String.format(Locale.US, "%.1f%s", latestVal, unitStr)
-            },
-            color = lineColor,
-            fontSize = 11.sp,
-            fontWeight = FontWeight.ExtraBold,
-            maxLines = 1
-        )
-    }
-
-    Spacer(modifier = Modifier.height(6.dp))
-
-    Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .height(148.dp)
-            .pointerInput(seriesValues) {
-                detectTapGestures { tap ->
-                    val w = size.width.toFloat().coerceAtLeast(1f)
-                    val idx = ((tap.x / w) * (seriesValues.size - 1)).roundToInt().coerceIn(0, seriesValues.lastIndex)
-                    selectedIdx = idx
-                }
-            }
-    ) {
-        Canvas(modifier = Modifier.fillMaxSize()) {
-            val padLeft = 6.dp.toPx()
-            val padRight = 6.dp.toPx()
-            val padTop = 8.dp.toPx()
-            val padBottom = 18.dp.toPx()
-            val chartW = (size.width - padLeft - padRight).coerceAtLeast(10f)
-            val chartH = (size.height - padTop - padBottom).coerceAtLeast(10f)
-            val range = (maxVal - minVal).coerceAtLeast(1f)
-
-            // 3 Horizontal Grid Lines
-            for (g in 0..2) {
-                val frac = g / 2f
-                val y = padTop + chartH * (1f - frac)
-                drawLine(
-                    color = Color(0xFFE2E8F0),
-                    start = Offset(padLeft, y),
-                    end = Offset(size.width - padRight, y),
-                    strokeWidth = 1f,
-                    pathEffect = PathEffect.dashPathEffect(floatArrayOf(6f, 6f), 0f)
-                )
-            }
-
-            // Threshold dashed line
-            val thFrac = ((thresholdVal - minVal) / range).coerceIn(0f, 1f)
-            val thY = padTop + chartH * (1f - thFrac)
-            drawLine(
-                color = CriticalAlarmRed.copy(alpha = 0.55f),
-                start = Offset(padLeft, thY),
-                end = Offset(size.width - padRight, thY),
-                strokeWidth = 1.8f,
-                pathEffect = PathEffect.dashPathEffect(floatArrayOf(10f, 5f), 0f)
-            )
-
-            val pts = seriesValues.mapIndexed { idx, v ->
-                val x = padLeft + (idx.toFloat() / (seriesValues.size - 1).coerceAtLeast(1)) * chartW
-                val yFrac = ((v - minVal) / range).coerceIn(0f, 1f)
-                val y = padTop + chartH * (1f - yFrac)
-                Offset(x, y)
-            }
-
-            if (pts.isNotEmpty()) {
-                val linePath = Path()
-                val fillPath = Path()
-                linePath.moveTo(pts.first().x, pts.first().y)
-                fillPath.moveTo(pts.first().x, padTop + chartH)
-                fillPath.lineTo(pts.first().x, pts.first().y)
-
-                for (i in 1 until pts.size) {
-                    val p0 = pts[i - 1]
-                    val p1 = pts[i]
-                    val cx = (p0.x + p1.x) / 2f
-                    linePath.cubicTo(cx, p0.y, cx, p1.y, p1.x, p1.y)
-                    fillPath.cubicTo(cx, p0.y, cx, p1.y, p1.x, p1.y)
-                }
-                fillPath.lineTo(pts.last().x, padTop + chartH)
-                fillPath.close()
-
-                drawPath(
-                    path = fillPath,
-                    brush = Brush.verticalGradient(
-                        colors = listOf(lineColor.copy(alpha = 0.25f), Color.Transparent),
-                        startY = padTop,
-                        endY = padTop + chartH
-                    )
-                )
-
-                drawPath(
-                    path = linePath,
-                    color = lineColor,
-                    style = Stroke(width = 2.5.dp.toPx(), cap = StrokeCap.Round)
-                )
-
-                pts.forEachIndexed { idx, pt ->
-                    drawCircle(Color.White, radius = 3.5.dp.toPx(), center = pt)
-                    drawCircle(lineColor, radius = 2.2.dp.toPx(), center = pt)
-
-                    // X-axis label
-                    val lbl = xLabels.getOrElse(idx) { "" }
-                    drawContext.canvas.nativeCanvas.drawText(
-                        lbl,
-                        pt.x,
-                        size.height - 2.dp.toPx(),
-                        android.graphics.Paint().apply {
-                            color = android.graphics.Color.rgb(100, 116, 139)
-                            textSize = 18f
-                            textAlign = android.graphics.Paint.Align.CENTER
-                        }
-                    )
-                }
-
-                selectedIdx?.let { sIdx ->
-                    if (sIdx in pts.indices) {
-                        val sp = pts[sIdx]
-                        drawLine(
-                            color = PrimaryBlue,
-                            start = Offset(sp.x, padTop),
-                            end = Offset(sp.x, padTop + chartH),
-                            strokeWidth = 1.5f
-                        )
-                        drawCircle(PrimaryBlue, radius = 4.5.dp.toPx(), center = sp)
-                    }
-                }
-            }
-        }
-    }
-
-    val activeIdx = selectedIdx ?: seriesValues.lastIndex
-    val activeLabel = xLabels.getOrElse(activeIdx) { "Nay" }
-    val activeVal = seriesValues.getOrElse(activeIdx) { latestVal }
-    Text(
-        text = if (metricType == ChartMetricType.GAS_ADC) {
-            "Mốc $activeLabel: ${activeVal.roundToInt()} ADC (Chạm điểm để xem)"
-        } else {
-            String.format(Locale.US, "Mốc %s: %.1f%s (Chạm điểm để xem)", activeLabel, activeVal, unitStr)
-        },
-        color = TextSecondary,
-        fontSize = 9.sp,
-        maxLines = 1,
-        overflow = TextOverflow.Ellipsis
-    )
 }
 
 @Composable
@@ -1573,14 +1407,15 @@ fun FriendlySensorCard(
     onArm: () -> Unit = {},
     onDelete: () -> Unit,
     onAdjustMultiSensorParams: (Float, Float, Int, Int, Float, Float) -> Unit = { _, _, _, _, _, _ -> },
+    savedEspConfig: EspDeviceConfig = EspDeviceConfig(),
+    onResetOfflineBurnedClick: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    val probBreakdown = node.telemetry.calculateFireProbability(gasThresholdAdc)
+    val effConfig = node.effectiveConfig(savedEspConfig)
+    val probBreakdown = node.telemetry.calculateFireProbability(gasThresholdAdc, effConfig)
     val probPercent = probBreakdown.totalProbabilityPercent
     val isDisarmed = node.telemetry.disarmed || node.firmwareState == FirmwareState.DISARMED
-    val isRealFaultOrWarming = !node.isDemoSensor &&
-        (node.firmwareState == FirmwareState.WARMING || node.firmwareState == FirmwareState.FAULT || node.telemetry.gasFault)
-    val isAlarm = !isDisarmed && (node.lastKnownAlarm || node.firmwareState == FirmwareState.ALARM || (!isRealFaultOrWarming && probPercent >= 75f))
+    val isAlarm = node.isEffectivelyAlarming(savedEspConfig)
     val isDemo = node.isDemoSensor || node.displayName.contains("DEMO", ignoreCase = true)
     var showChartDetail by remember { mutableStateOf(false) }
     var showMultiParamSimulator by remember { mutableStateOf(false) }
@@ -1664,7 +1499,8 @@ fun FriendlySensorCard(
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     FirmwareStateBadge(
                         firmwareState = node.firmwareState,
-                        connectionState = node.connectionState
+                        connectionState = node.connectionState,
+                        suspectedBurnedOffline = node.suspectedBurnedOffline
                     )
 
                     IconButton(
@@ -1682,6 +1518,69 @@ fun FriendlySensorCard(
                             modifier = Modifier.size(16.dp)
                         )
                     }
+                }
+            }
+
+            if (node.suspectedBurnedOffline) {
+                Spacer(modifier = Modifier.height(8.dp))
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(WarningBackground)
+                        .border(1.dp, WarningBorder, RoundedCornerShape(10.dp))
+                        .padding(horizontal = 10.dp, vertical = 7.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = null,
+                            tint = CriticalAlarmRed,
+                            modifier = Modifier.size(15.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = "Mất kết nối khi cháy (Nghi hư hại) · Đã ngừng hú lặp",
+                            color = Color(0xFF92400E),
+                            fontSize = 10.5.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = onResetOfflineBurnedClick,
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706)),
+                        shape = RoundedCornerShape(8.dp),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+                        modifier = Modifier
+                            .height(28.dp)
+                            .testTag("btn_reset_offline_burned_${node.deviceId}")
+                    ) {
+                        Text("Đặt lại", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            } else if (node.isCachedOfflineData) {
+                Spacer(modifier = Modifier.height(6.dp))
+                Box(
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(6.dp))
+                        .background(OfflineBackground)
+                        .border(1.dp, LightBorder, RoundedCornerShape(6.dp))
+                        .padding(horizontal = 8.dp, vertical = 3.dp)
+                ) {
+                    Text(
+                        text = "Dữ liệu cũ · Offline",
+                        color = OfflineGray,
+                        fontSize = 9.5.sp,
+                        fontWeight = FontWeight.Bold
+                    )
                 }
             }
 
@@ -1845,7 +1744,7 @@ fun FriendlySensorCard(
                     humidityPercent = simHum,
                     irFlameIntensity = simIr
                 )
-                val previewProb = previewTelem.calculateFireProbability(gasThresholdAdc)
+                val previewProb = previewTelem.calculateFireProbability(gasThresholdAdc, effConfig)
 
                 Column(
                     modifier = Modifier

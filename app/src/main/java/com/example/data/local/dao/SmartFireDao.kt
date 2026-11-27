@@ -116,6 +116,9 @@ interface SmartFireDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertSnapshot(snapshot: DeviceSnapshotEntity)
 
+    @Query("SELECT * FROM device_snapshots WHERE deviceId = :deviceId ORDER BY receivedAt DESC LIMIT 1")
+    suspend fun getLatestSnapshotForDevice(deviceId: String): DeviceSnapshotEntity?
+
     @Query("SELECT * FROM device_snapshots WHERE deviceId = :deviceId ORDER BY receivedAt DESC LIMIT :limit")
     fun getRecentSnapshots(deviceId: String, limit: Int = 100): Flow<List<DeviceSnapshotEntity>>
 

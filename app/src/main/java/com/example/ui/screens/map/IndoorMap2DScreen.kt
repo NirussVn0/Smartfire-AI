@@ -207,7 +207,8 @@ data class PlacedSensorPin(
     val rssiDbm: Int = -52,
     val alarmStartedAtMs: Long = 0L,
     val isDemoSensor: Boolean = false,
-    val isReferenceAnchor: Boolean = false
+    val isReferenceAnchor: Boolean = false,
+    val suspectedBurnedOffline: Boolean = false
 )
 
 enum class SelectedMapElementKind {
@@ -512,8 +513,8 @@ fun IndoorMap2DScreen(
     LaunchedEffect(nodes, hasSavedObjects, gasThresholdAdc) {
         if (placedSensorPins.isEmpty() && hasSavedObjects) {
             nodes.forEachIndexed { idx, n ->
-                val prob = n.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent
-                val isAlm = n.lastKnownAlarm || n.firmwareState == FirmwareState.ALARM || prob >= 75f
+                val prob = n.telemetry.calculateFireProbability(gasThresholdAdc, n.effectiveConfig()).totalProbabilityPercent
+                val isAlm = n.isEffectivelyAlarming() || n.suspectedBurnedOffline
                 placedSensorPins.add(
                     PlacedSensorPin(
                         deviceId = n.deviceId,
@@ -525,7 +526,8 @@ fun IndoorMap2DScreen(
                         rssiDbm = n.telemetry.rssiDbm,
                         alarmStartedAtMs = if (isAlm) (n.telemetry.alarmStartedAtMs.takeIf { it > 0L } ?: System.currentTimeMillis()) else 0L,
                         isDemoSensor = n.isDemoSensor || n.displayName.contains("DEMO", ignoreCase = true),
-                        isReferenceAnchor = (idx == 0)
+                        isReferenceAnchor = (idx == 0),
+                        suspectedBurnedOffline = n.suspectedBurnedOffline
                     )
                 )
             }
@@ -533,8 +535,8 @@ fun IndoorMap2DScreen(
             placedSensorPins.removeAll { pin -> nodes.none { it.deviceId == pin.deviceId } }
             nodes.forEachIndexed { idx, n ->
                 val existingIdx = placedSensorPins.indexOfFirst { it.deviceId == n.deviceId }
-                val prob = n.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent
-                val isAlm = n.lastKnownAlarm || n.firmwareState == FirmwareState.ALARM || prob >= 75f
+                val prob = n.telemetry.calculateFireProbability(gasThresholdAdc, n.effectiveConfig()).totalProbabilityPercent
+                val isAlm = n.isEffectivelyAlarming() || n.suspectedBurnedOffline
                 if (existingIdx >= 0) {
                     val prevStart = placedSensorPins[existingIdx].alarmStartedAtMs
                     placedSensorPins[existingIdx] = placedSensorPins[existingIdx].copy(
@@ -551,7 +553,8 @@ fun IndoorMap2DScreen(
                             }
                         } else 0L,
                         isDemoSensor = n.isDemoSensor || n.displayName.contains("DEMO", ignoreCase = true),
-                        isReferenceAnchor = (existingIdx == 0)
+                        isReferenceAnchor = (existingIdx == 0),
+                        suspectedBurnedOffline = n.suspectedBurnedOffline
                     )
                 }
             }
@@ -560,10 +563,7 @@ fun IndoorMap2DScreen(
 
     // Real-time 1-second clock tick for simulating circular fire spread radius as long as alarm rings
     var currentClockMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
-    val hazardNodes = nodes.filter {
-        it.lastKnownAlarm || it.firmwareState == FirmwareState.ALARM ||
-            it.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent >= 75f
-    }
+    val hazardNodes = nodes.filter { it.isEffectivelyAlarming() || it.suspectedBurnedOffline }
     val isFireActive = hazardNodes.isNotEmpty()
 
     LaunchedEffect(isFireActive) {
@@ -785,8 +785,8 @@ fun IndoorMap2DScreen(
             placedSensorPins.toList()
         } else {
             nodes.mapIndexed { idx, n ->
-                val prob = n.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent
-                val isAlm = n.lastKnownAlarm || n.firmwareState == FirmwareState.ALARM || prob >= 75f
+                val prob = n.telemetry.calculateFireProbability(gasThresholdAdc, n.effectiveConfig()).totalProbabilityPercent
+                val isAlm = n.isEffectivelyAlarming() || n.suspectedBurnedOffline
                 PlacedSensorPin(
                     deviceId = n.deviceId,
                     displayName = n.displayName,
@@ -797,7 +797,8 @@ fun IndoorMap2DScreen(
                     rssiDbm = n.telemetry.rssiDbm,
                     alarmStartedAtMs = if (isAlm) System.currentTimeMillis() else 0L,
                     isDemoSensor = n.isDemoSensor || n.displayName.contains("DEMO", ignoreCase = true),
-                    isReferenceAnchor = (idx == 0)
+                    isReferenceAnchor = (idx == 0),
+                    suspectedBurnedOffline = n.suspectedBurnedOffline
                 )
             }
         }
@@ -2307,8 +2308,8 @@ fun IndoorMap2DScreen(
                     placedSensorPins
                 } else {
                     nodes.mapIndexed { idx, n ->
-                        val prob = n.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent
-                        val isAlm = n.lastKnownAlarm || n.firmwareState == FirmwareState.ALARM || prob >= 75f
+                        val prob = n.telemetry.calculateFireProbability(gasThresholdAdc, n.effectiveConfig()).totalProbabilityPercent
+                        val isAlm = n.isEffectivelyAlarming() || n.suspectedBurnedOffline
                         PlacedSensorPin(
                             deviceId = n.deviceId,
                             displayName = n.displayName,
@@ -2319,7 +2320,8 @@ fun IndoorMap2DScreen(
                             rssiDbm = n.telemetry.rssiDbm,
                             alarmStartedAtMs = if (isAlm) (n.telemetry.alarmStartedAtMs.takeIf { it > 0L } ?: currentClockMs) else 0L,
                             isDemoSensor = n.isDemoSensor || n.displayName.contains("DEMO", ignoreCase = true),
-                            isReferenceAnchor = (idx == 0)
+                            isReferenceAnchor = (idx == 0),
+                            suspectedBurnedOffline = n.suspectedBurnedOffline
                         )
                     }
                 }
@@ -2358,9 +2360,10 @@ fun IndoorMap2DScreen(
                     } else {
                         String.format(Locale.US, "P=%.0f%%", pin.fireProbabilityPercent)
                     }
+                    val offlineSuffix = if (pin.suspectedBurnedOffline) " · MẤT KẾT NỐI" else ""
                     drawLargeFireSensorSymbol(
                         center = centerScreen,
-                        label = "$labelPrefix${pin.displayName} ($tempAndProb)",
+                        label = "$labelPrefix${pin.displayName}$offlineSuffix ($tempAndProb)",
                         isAlarm = pin.isAlarm,
                         isAnchor = (idx == 0),
                         pulseRadius = pulseRadius
@@ -2795,8 +2798,10 @@ fun IndoorMap2DScreen(
                                     val chosenNode = nodes.find { it.deviceId == selectedSavedNodeId } ?: nodes.firstOrNull()
                                     val devId = chosenNode?.deviceId ?: "smartfire-node-${placedSensorPins.size + 1}"
                                     val devName = chosenNode?.displayName ?: "Báo cháy #${placedSensorPins.size + 1}"
-                                    val prob = chosenNode?.telemetry?.calculateFireProbability(gasThresholdAdc)?.totalProbabilityPercent ?: 5.0f
-                                    val isAlm = chosenNode?.let { it.lastKnownAlarm || it.firmwareState == FirmwareState.ALARM || prob >= 75f } ?: false
+                                    val prob = chosenNode?.let {
+                                        it.telemetry.calculateFireProbability(gasThresholdAdc, it.effectiveConfig()).totalProbabilityPercent
+                                    } ?: 5.0f
+                                    val isAlm = chosenNode?.let { it.isEffectivelyAlarming() || it.suspectedBurnedOffline } ?: false
                                     val tempC = chosenNode?.telemetry?.temperatureCelsius ?: 28.5f
                                     val rssi = chosenNode?.telemetry?.rssiDbm ?: -52
                                     val isDemo = chosenNode?.isDemoSensor ?: true
@@ -2816,7 +2821,8 @@ fun IndoorMap2DScreen(
                                                 rssiDbm = rssi,
                                                 alarmStartedAtMs = if (isAlm) System.currentTimeMillis() else 0L,
                                                 isDemoSensor = isDemo,
-                                                isReferenceAnchor = placedSensorPins.isEmpty()
+                                                isReferenceAnchor = placedSensorPins.isEmpty(),
+                                                suspectedBurnedOffline = chosenNode?.suspectedBurnedOffline ?: false
                                             )
                                         )
                                     }
@@ -2967,11 +2973,12 @@ fun IndoorMap2DScreen(
                                         deviceId = firstNode.deviceId,
                                         displayName = firstNode.displayName,
                                         position = defaultAnchorPos,
-                                        isAlarm = firstNode.lastKnownAlarm,
+                                        isAlarm = firstNode.isEffectivelyAlarming() || firstNode.suspectedBurnedOffline,
                                         temperatureCelsius = firstNode.telemetry.temperatureCelsius,
-                                        fireProbabilityPercent = firstNode.telemetry.calculateFireProbability(gasThresholdAdc).totalProbabilityPercent,
+                                        fireProbabilityPercent = firstNode.telemetry.calculateFireProbability(gasThresholdAdc, firstNode.effectiveConfig()).totalProbabilityPercent,
                                         rssiDbm = firstNode.telemetry.rssiDbm,
-                                        isReferenceAnchor = true
+                                        isReferenceAnchor = true,
+                                        suspectedBurnedOffline = firstNode.suspectedBurnedOffline
                                     )
                                 )
                                 onBindSensorPosition(firstNode.deviceId, defaultAnchorPos.x, defaultAnchorPos.y)

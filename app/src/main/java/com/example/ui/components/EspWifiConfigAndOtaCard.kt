@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.CloudUpload
+import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.Save
 import androidx.compose.material.icons.filled.SystemUpdateAlt
@@ -52,6 +53,10 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.example.data.backup.EspConfigBackupManager
+import com.example.data.backup.ExportedAppSettings
+import com.example.data.backup.ExportedEspDevice
+import com.example.data.backup.SmartFireConfigBackup
 import com.example.data.repository.SmartFireRepository
 import com.example.domain.model.EspDeviceConfig
 import com.example.domain.model.SmartFireNode
@@ -184,6 +189,59 @@ fun EspWifiConfigAndOtaCard(
             txPower1m = txPowerDraft,
             pathLossN = (pathLossNDraft * 10f).roundToInt() / 10f
         )
+    }
+
+    val exportConfigLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val draftConfig = currentDraftConfig()
+            val devicesWithTokens = repository.getAllDeviceEntitiesWithTokens()
+            val exportedDevices = devicesWithTokens.map { (entity, token) ->
+                ExportedEspDevice(
+                    deviceId = entity.deviceId,
+                    displayName = entity.displayName,
+                    ipAddress = entity.lastKnownIp,
+                    bearerToken = token,
+                    homeId = entity.homeId,
+                    floorId = entity.floorId,
+                    roomId = entity.roomId,
+                    firmwareRoomId = entity.firmwareRoomId,
+                    xNormalized = entity.xNormalized,
+                    yNormalized = entity.yNormalized,
+                    isDemoSensor = entity.firmwareRoomId.startsWith("demo") ||
+                        entity.firmwareRoomId.startsWith("sov-") ||
+                        entity.displayName.contains("DEMO", ignoreCase = true)
+                )
+            }
+            val backup = SmartFireConfigBackup(
+                includeTokens = true,
+                devices = exportedDevices,
+                espConfig = draftConfig,
+                appSettings = ExportedAppSettings(
+                    pollingIntervalMs = repository.pollingIntervalMs.value,
+                    httpTimeoutSeconds = repository.httpTimeoutSeconds.value,
+                    alertMode = repository.alertMode.value.name,
+                    alarmSoundType = repository.alarmSoundType.value.name,
+                    alarmVolumePercent = repository.alarmVolumePercent.value,
+                    level1PopupEnabled = repository.level1PopupEnabled.value,
+                    autoRouteOnAlarm = repository.autoRouteOnAlarm.value,
+                    stepStrideMeters = repository.stepStrideMeters.value
+                )
+            )
+            val json = EspConfigBackupManager.toJson(backup)
+            val writeResult = withContext(Dispatchers.IO) {
+                EspConfigBackupManager.writeToUri(context, uri, json)
+            }
+            if (writeResult.isSuccess) {
+                statusMessage = "Đã xuất cấu hình ${exportedDevices.size} thiết bị ESP32 ra file JSON!"
+                statusIsError = false
+            } else {
+                statusMessage = writeResult.exceptionOrNull()?.message ?: "Xuất file cấu hình JSON thất bại."
+                statusIsError = true
+            }
+        }
     }
 
     Card(
@@ -568,6 +626,23 @@ fun EspWifiConfigAndOtaCard(
                     Spacer(modifier = Modifier.width(5.dp))
                     Text("ĐẨY LÊN ESP (PUSH)", fontSize = 11.sp, fontWeight = FontWeight.ExtraBold)
                 }
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            OutlinedButton(
+                onClick = {
+                    exportConfigLauncher.launch(EspConfigBackupManager.defaultFileName())
+                },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(38.dp)
+                    .testTag("btn_export_esp_config_inline"),
+                shape = RoundedCornerShape(10.dp)
+            ) {
+                Icon(Icons.Default.FileDownload, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(16.dp))
+                Spacer(modifier = Modifier.width(6.dp))
+                Text("Xuất JSON", color = PrimaryBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
             }
 
             Spacer(modifier = Modifier.height(12.dp))

@@ -2,9 +2,11 @@ package com.example.ui.screens.devices
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -14,6 +16,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -64,13 +67,14 @@ import com.example.domain.model.AiInsight
 import com.example.domain.model.CommandStatus
 import com.example.domain.model.DeviceConnectionState
 import com.example.domain.model.DeviceEvent
+import com.example.domain.model.EspDeviceConfig
 import com.example.domain.model.FirmwareState
 import com.example.domain.model.RoomSpace
 import com.example.domain.model.SensorSnapshotPoint
 import com.example.domain.model.SmartFireNode
-import com.example.ui.components.ChartPoint
 import com.example.ui.components.FirmwareStateBadge
-import com.example.ui.components.SensorChart
+import com.example.ui.components.MultiChartMode
+import com.example.ui.components.MultiMetricSensorChart
 import com.example.ui.theme.CriticalAlarmBackground
 import com.example.ui.theme.CriticalAlarmBorder
 import com.example.ui.theme.CriticalAlarmRed
@@ -85,6 +89,8 @@ import com.example.ui.theme.PrimaryBlueLight
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import com.example.ui.theme.WarningAmber
+import com.example.ui.theme.WarningBackground
+import com.example.ui.theme.WarningBorder
 import com.example.ui.theme.WarmingPurple
 import kotlinx.coroutines.launch
 
@@ -103,6 +109,7 @@ fun DeviceDetailScreen(
     val deviceEvents by repository.getEventsForDevice(deviceId).collectAsState(initial = emptyList())
     val deviceSnapshots by repository.getDeviceSnapshots(deviceId).collectAsState(initial = emptyList())
     val gasThresholdAdc by repository.gasThresholdAdc.collectAsState()
+    val savedEspConfig by repository.savedEspConfig.collectAsState()
     val allInsights by repository.allInsights.collectAsState(initial = emptyList())
     val deviceInsights = remember(allInsights, deviceId) {
         allInsights.filter { it.deviceId == deviceId || it.deviceId == null }.take(5)
@@ -157,7 +164,8 @@ fun DeviceDetailScreen(
             }
             FirmwareStateBadge(
                 firmwareState = node.firmwareState,
-                connectionState = node.connectionState
+                connectionState = node.connectionState,
+                suspectedBurnedOffline = node.suspectedBurnedOffline
             )
         }
 
@@ -202,13 +210,16 @@ fun DeviceDetailScreen(
                     node = node,
                     gasThresholdAdc = gasThresholdAdc,
                     snapshots = deviceSnapshots,
-                    insights = deviceInsights
+                    insights = deviceInsights,
+                    savedEspConfig = savedEspConfig
                 )
                 2 -> AlarmControlsTab(
                     node = node,
                     onAck = { scope.launch { repository.sendCommand(node.deviceId, "ack") } },
                     onSilence = { scope.launch { repository.sendCommand(node.deviceId, "silence") } },
-                    onTest = { scope.launch { repository.sendCommand(node.deviceId, "test") } }
+                    onTest = { scope.launch { repository.sendCommand(node.deviceId, "test") } },
+                    onResetOfflineBurned = { scope.launch { repository.clearOfflineBurnedAlarm(node.deviceId) } },
+                    savedEspConfig = savedEspConfig
                 )
                 3 -> HistoryTab(deviceEvents)
                 4 -> SettingsTab(
@@ -394,26 +405,75 @@ fun SensorsTab(
     node: SmartFireNode,
     gasThresholdAdc: Int = 1800,
     snapshots: List<SensorSnapshotPoint> = emptyList(),
-    insights: List<AiInsight> = emptyList()
+    insights: List<AiInsight> = emptyList(),
+    savedEspConfig: EspDeviceConfig = EspDeviceConfig()
 ) {
+    var selectedChartMode by remember { mutableStateOf(MultiChartMode.ALL_THREE) }
+    val effConfig = node.effectiveConfig(savedEspConfig)
+    val currentProb = node.telemetry.calculateFireProbability(gasThresholdAdc, effConfig).totalProbabilityPercent
+    val currentFlamePct = if (node.telemetry.flame) {
+        100f
+    } else {
+        ((node.telemetry.irFlameIntensity ?: 0f) * 100f).coerceIn(0f, 100f)
+    }
+
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item {
-            val now = System.currentTimeMillis()
-            val points = remember(snapshots, node.telemetry.gasRaw) {
-                val sorted = snapshots.sortedBy { it.timestamp }.takeLast(16)
-                if (sorted.size >= 3) {
-                    sorted.map { ChartPoint(it.timestamp, it.gasRaw) }
-                } else {
-                    listOf(
-                        ChartPoint(now - 60000, (node.telemetry.gasRaw * 0.90).toInt()),
-                        ChartPoint(now - 45000, (node.telemetry.gasRaw * 0.94).toInt()),
-                        ChartPoint(now - 30000, (node.telemetry.gasRaw * 0.97).toInt()),
-                        ChartPoint(now - 15000, (node.telemetry.gasRaw * 1.01).toInt()),
-                        ChartPoint(now, node.telemetry.gasRaw)
-                    )
+            val modeOptions = listOf(
+                MultiChartMode.ALL_THREE to "Cả 3 Thông Số",
+                MultiChartMode.GAS_ADC to "Khói MQ-2",
+                MultiChartMode.TEMP_C to "Nhiệt Độ",
+                MultiChartMode.FLAME_IR to "Lửa IR"
+            )
+            LazyRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                items(modeOptions) { (mode, label) ->
+                    val isSelected = selectedChartMode == mode
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(if (isSelected) PrimaryBlue else LightCard)
+                            .border(
+                                1.dp,
+                                if (isSelected) PrimaryBlue else LightBorder,
+                                RoundedCornerShape(50)
+                            )
+                            .clickable { selectedChartMode = mode }
+                            .padding(horizontal = 12.dp, vertical = 6.dp)
+                    ) {
+                        Text(
+                            text = label,
+                            color = if (isSelected) Color.White else TextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            maxLines = 1
+                        )
+                    }
                 }
             }
-            SensorChart(points = points, thresholdValue = gasThresholdAdc)
+        }
+
+        item {
+            val sortedSnapshots = remember(snapshots) {
+                snapshots.sortedBy { it.timestamp }.takeLast(40)
+            }
+            MultiMetricSensorChart(
+                snapshots = sortedSnapshots,
+                currentGas = node.telemetry.gasRaw,
+                currentTemp = node.telemetry.temperatureCelsius,
+                currentFlamePct = currentFlamePct,
+                currentProb = currentProb,
+                gasWarnThreshold = effConfig.gasWarn,
+                gasAlarmThreshold = effConfig.gasOn,
+                tempWarnC = effConfig.tempWarnC,
+                tempAlarmC = effConfig.tempAlarmC,
+                selectedMode = selectedChartMode,
+                timeRangeLabel = "Trực tiếp",
+                isCachedOffline = node.isCachedOfflineData,
+                modifier = Modifier.fillMaxWidth()
+            )
         }
 
         item {
@@ -481,11 +541,68 @@ fun AlarmControlsTab(
     node: SmartFireNode,
     onAck: () -> Unit,
     onSilence: () -> Unit,
-    onTest: () -> Unit
+    onTest: () -> Unit,
+    onResetOfflineBurned: () -> Unit = {},
+    savedEspConfig: EspDeviceConfig = EspDeviceConfig()
 ) {
-    val isAlarm = node.lastKnownAlarm || node.firmwareState == FirmwareState.ALARM
+    val isAlarm = node.isEffectivelyAlarming(savedEspConfig)
 
     LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        if (node.suspectedBurnedOffline) {
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .border(1.5.dp, WarningBorder, RoundedCornerShape(16.dp)),
+                    colors = CardDefaults.cardColors(containerColor = WarningBackground),
+                    shape = RoundedCornerShape(16.dp)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = WarningAmber,
+                                modifier = Modifier.size(20.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "Cảm biến mất kết nối trong lúc báo cháy",
+                                color = Color(0xFF92400E),
+                                fontSize = 13.sp,
+                                fontWeight = FontWeight.ExtraBold
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(6.dp))
+                        Text(
+                            text = "Thiết bị có thể đã bị ngắt nguồn hoặc hư hại do nhiệt. Còi lặp trên điện thoại đã tạm dừng; khu vực vẫn được giữ cảnh báo trên bản đồ thoát hiểm.",
+                            color = TextPrimary,
+                            fontSize = 11.5.sp,
+                            lineHeight = 16.sp
+                        )
+                        Spacer(modifier = Modifier.height(10.dp))
+                        Button(
+                            onClick = onResetOfflineBurned,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(40.dp)
+                                .testTag("btn_reset_offline_burned_${node.deviceId}"),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706)),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(horizontal = 12.dp)
+                        ) {
+                            Text(
+                                text = "Đặt lại trạng thái cháy Offline",
+                                color = Color.White,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         item {
             Card(
                 modifier = Modifier.fillMaxWidth(),

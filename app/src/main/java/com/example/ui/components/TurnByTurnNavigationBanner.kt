@@ -5,6 +5,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -64,8 +65,6 @@ private fun iconForTurn(dir: TurnDirection): ImageVector = when (dir) {
 
 /**
  * Google Maps-style Turn-by-Turn Floating Navigation Sign Banner.
- * Shows primary maneuver ("50m phía trước rẽ trái" / "Vị trí cửa thoát hiểm: 500m phía trước"),
- * upcoming next-step bar ("Lượt chờ: Đi thẳng"), local mute badge, and a button to open/toggle the 2D Map.
  */
 @Composable
 fun TurnByTurnNavigationBanner(
@@ -77,10 +76,10 @@ fun TurnByTurnNavigationBanner(
     modifier: Modifier = Modifier
 ) {
     val primaryBg = when (guidance.targetType) {
-        "EXIT" -> Color(0xFF0F766E)         // Google Maps teal-green
-        "FIRE_SENSOR" -> Color(0xFFB91C1C)  // Urgent fire red
-        "TWO_STAGE" -> Color(0xFF6D28D9)    // Two-stage purple
-        else -> Color(0xFF1D4ED8)           // Extinguisher blue
+        "EXIT" -> Color(0xFF0F766E)
+        "FIRE_SENSOR" -> Color(0xFFB91C1C)
+        "TWO_STAGE" -> Color(0xFF6D28D9)
+        else -> Color(0xFF1D4ED8)
     }
     val subBarBg = when (guidance.targetType) {
         "EXIT" -> Color(0xFF115E59)
@@ -93,56 +92,63 @@ fun TurnByTurnNavigationBanner(
         modifier = modifier
             .fillMaxWidth()
             .testTag("turn_by_turn_navigation_banner"),
-        shape = RoundedCornerShape(20.dp),
+        shape = RoundedCornerShape(18.dp),
         colors = CardDefaults.cardColors(containerColor = primaryBg),
-        elevation = CardDefaults.cardElevation(defaultElevation = 10.dp)
+        elevation = CardDefaults.cardElevation(defaultElevation = 8.dp)
     ) {
         Column(modifier = Modifier.fillMaxWidth()) {
-            // Main Google Maps-style Direction Header
+            // Top Row: 48.dp Maneuver Box + Distance + Compact Env/ETA Pill + Primary Text + X Stop Button
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 14.dp, vertical = 12.dp),
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Box(
                     modifier = Modifier
-                        .size(54.dp)
-                        .clip(RoundedCornerShape(14.dp))
+                        .size(48.dp)
+                        .clip(RoundedCornerShape(12.dp))
                         .background(Color.White.copy(alpha = 0.18f))
-                        .border(1.5.dp, Color.White.copy(alpha = 0.35f), RoundedCornerShape(14.dp)),
+                        .border(1.dp, Color.White.copy(alpha = 0.32f), RoundedCornerShape(12.dp)),
                     contentAlignment = Alignment.Center
                 ) {
                     Icon(
                         imageVector = iconForTurn(guidance.currentStep.direction),
                         contentDescription = guidance.currentStep.shortAction,
                         tint = Color.White,
-                        modifier = Modifier.size(34.dp)
+                        modifier = Modifier.size(30.dp)
                     )
                 }
 
                 Spacer(modifier = Modifier.width(12.dp))
 
                 Column(modifier = Modifier.weight(1f)) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
                         Text(
                             text = TurnByTurnNavigator.formatDistanceVietnamese(guidance.currentStep.distanceMeters),
                             color = Color.White,
-                            fontSize = 22.sp,
+                            fontSize = 21.sp,
                             fontWeight = FontWeight.Black
                         )
-                        Spacer(modifier = Modifier.width(8.dp))
                         Box(
                             modifier = Modifier
-                                .clip(RoundedCornerShape(6.dp))
-                                .background(Color.Black.copy(alpha = 0.25f))
-                                .padding(horizontal = 6.dp, vertical = 2.dp)
+                                .clip(RoundedCornerShape(50))
+                                .background(Color.Black.copy(alpha = 0.24f))
+                                .padding(horizontal = 8.dp, vertical = 2.dp)
                         ) {
                             Text(
-                                text = if (guidance.isOutsideHouse) "NGOÀI NHÀ · ~${guidance.etaSeconds}s" else "TRONG NHÀ · ~${guidance.etaSeconds}s",
+                                text = if (guidance.isOutsideHouse) {
+                                    "Ngoài nhà · ~${guidance.etaSeconds}s"
+                                } else {
+                                    "Trong nhà · ~${guidance.etaSeconds}s"
+                                },
                                 color = Color.White,
                                 fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
                             )
                         }
                     }
@@ -155,57 +161,64 @@ fun TurnByTurnNavigationBanner(
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
-
-                    Text(
-                        text = "Đích: ${guidance.targetName} (Tổng ${TurnByTurnNavigator.formatDistanceVietnamese(guidance.totalRemainingMeters)})",
-                        color = Color.White.copy(alpha = 0.85f),
-                        fontSize = 11.sp,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
                 }
+
+                Spacer(modifier = Modifier.width(6.dp))
 
                 IconButton(
                     onClick = onStopNavigation,
                     modifier = Modifier
-                        .size(34.dp)
+                        .size(32.dp)
                         .clip(CircleShape)
-                        .background(Color.Black.copy(alpha = 0.22f))
+                        .background(Color.Black.copy(alpha = 0.24f))
                         .testTag("btn_stop_turn_by_turn")
                 ) {
                     Icon(
                         imageVector = Icons.Default.Close,
                         contentDescription = "Dừng dẫn đường",
                         tint = Color.White,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
 
-            // Next Step ("Lượt chờ / Tiếp theo") + Action Bar
-            Column(
+            // Slim Bottom Bar: Concise Next-Step + "Đã im" Badge + White Pill Toggle Button
+            Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .background(subBarBg)
-                    .padding(horizontal = 14.dp, vertical = 8.dp),
-                verticalArrangement = Arrangement.spacedBy(6.dp)
+                    .padding(horizontal = 12.dp, vertical = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
-                guidance.nextStep?.let { next ->
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
+                Row(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(end = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    val next = guidance.nextStep
+                    if (next != null) {
                         Icon(
                             imageVector = iconForTurn(next.direction),
                             contentDescription = null,
                             tint = Color(0xFFA7F3D0),
-                            modifier = Modifier.size(16.dp)
+                            modifier = Modifier.size(14.dp)
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
+                        Spacer(modifier = Modifier.width(5.dp))
                         Text(
-                            text = next.primaryText,
-                            color = Color.White.copy(alpha = 0.95f),
-                            fontSize = 12.sp,
+                            text = "Tiếp: ${next.primaryText}",
+                            color = Color.White.copy(alpha = 0.92f),
+                            fontSize = 11.5.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    } else {
+                        Text(
+                            text = "Đích: ${guidance.targetName}",
+                            color = Color.White.copy(alpha = 0.90f),
+                            fontSize = 11.5.sp,
                             fontWeight = FontWeight.SemiBold,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
@@ -214,34 +227,32 @@ fun TurnByTurnNavigationBanner(
                 }
 
                 Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceBetween,
-                    verticalAlignment = Alignment.CenterVertically
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     if (isLocalAlarmMuted) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
                             modifier = Modifier
-                                .clip(RoundedCornerShape(8.dp))
+                                .clip(RoundedCornerShape(50))
                                 .background(Color.Black.copy(alpha = 0.25f))
-                                .padding(horizontal = 8.dp, vertical = 4.dp)
+                                .padding(horizontal = 7.dp, vertical = 3.dp)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.NotificationsOff,
                                 contentDescription = null,
                                 tint = Color(0xFFFDE68A),
-                                modifier = Modifier.size(13.dp)
+                                modifier = Modifier.size(11.dp)
                             )
-                            Spacer(modifier = Modifier.width(4.dp))
+                            Spacer(modifier = Modifier.width(3.dp))
                             Text(
-                                text = "Đã tạm tắt báo động máy này",
+                                text = "Đã im",
                                 color = Color(0xFFFDE68A),
                                 fontSize = 10.sp,
-                                fontWeight = FontWeight.Bold
+                                fontWeight = FontWeight.Bold,
+                                maxLines = 1
                             )
                         }
-                    } else {
-                        Spacer(modifier = Modifier.width(4.dp))
                     }
 
                     Button(
@@ -250,21 +261,23 @@ fun TurnByTurnNavigationBanner(
                             containerColor = Color.White,
                             contentColor = primaryBg
                         ),
-                        shape = RoundedCornerShape(10.dp),
+                        shape = RoundedCornerShape(50),
+                        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
                         modifier = Modifier
-                            .height(32.dp)
+                            .height(28.dp)
                             .testTag("btn_toggle_2d_map_from_banner")
                     ) {
                         Icon(
                             imageVector = if (isMapCurrentlyVisible) Icons.AutoMirrored.Filled.ArrowForward else Icons.Default.Map,
                             contentDescription = null,
-                            modifier = Modifier.size(14.dp)
+                            modifier = Modifier.size(13.dp)
                         )
-                        Spacer(modifier = Modifier.width(5.dp))
+                        Spacer(modifier = Modifier.width(4.dp))
                         Text(
-                            text = if (isMapCurrentlyVisible) "Quay lại Tổng quan" else "Xem Bản Đồ 2D",
+                            text = if (isMapCurrentlyVisible) "Tổng quan" else "Bản đồ 2D",
                             fontSize = 11.sp,
-                            fontWeight = FontWeight.ExtraBold
+                            fontWeight = FontWeight.ExtraBold,
+                            maxLines = 1
                         )
                     }
                 }

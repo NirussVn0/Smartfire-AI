@@ -1,10 +1,16 @@
 package com.example.ui.screens.settings
 
+import android.app.NotificationManager
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.net.Uri
+import android.os.Build
+import android.provider.Settings
 import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -23,11 +29,16 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.DirectionsWalk
+import androidx.compose.material.icons.filled.FileDownload
+import androidx.compose.material.icons.filled.FolderOpen
+import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.NotificationsActive
+import androidx.compose.material.icons.filled.OpenInNew
 import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Science
 import androidx.compose.material.icons.filled.Share
@@ -53,6 +64,7 @@ import androidx.compose.material3.TabRowDefaults
 import androidx.compose.material3.TabRowDefaults.tabIndicatorOffset
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
@@ -70,6 +82,14 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import com.example.data.backup.EspConfigBackupManager
+import com.example.data.backup.ExportedAppSettings
+import com.example.data.backup.ExportedEspDevice
+import com.example.data.backup.SmartFireConfigBackup
+import com.example.data.local.entity.DeviceEntity
 import com.example.data.repository.SmartFireRepository
 import com.example.domain.model.AlarmSoundType
 import com.example.domain.model.AlertMode
@@ -90,7 +110,11 @@ import com.example.ui.theme.PrimaryBlue
 import com.example.ui.theme.PrimaryBlueLight
 import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.math.roundToInt
 
 @Composable
@@ -182,19 +206,171 @@ fun SettingsTabContent(
     val level1PopupEnabled by repository.level1PopupEnabled.collectAsState()
 
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
+
     var previewLevel by remember { mutableStateOf<Int?>(null) }
-    LaunchedEffect(previewLevel, alertMode, alarmSoundType, alarmVolumePercent) {
+    var previewSessionNonce by remember { mutableIntStateOf(0) }
+    LaunchedEffect(previewLevel, previewSessionNonce, alertMode, alarmSoundType, alarmVolumePercent) {
         val lvl = previewLevel ?: return@LaunchedEffect
-        kotlinx.coroutines.withTimeoutOrNull(2500L) {
-            AlarmAudioPlayer.runAlertLoop(
-                context = context,
-                alertMode = alertMode,
-                soundType = alarmSoundType,
-                volumePercent = alarmVolumePercent,
-                isLevel1Warning = (lvl == 1)
+        val myNonce = previewSessionNonce
+        try {
+            withTimeoutOrNull(2500L) {
+                AlarmAudioPlayer.runAlertLoop(
+                    context = context,
+                    alertMode = alertMode,
+                    soundType = alarmSoundType,
+                    volumePercent = alarmVolumePercent,
+                    isLevel1Warning = (lvl == 1)
+                )
+            }
+        } finally {
+            if (isActive && previewSessionNonce == myNonce) {
+                previewLevel = null
+            }
+        }
+    }
+
+    fun hasOverlayPermission(): Boolean = Settings.canDrawOverlays(context)
+    fun hasFullScreenIntentPermission(): Boolean {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            val nm = context.getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+            nm?.canUseFullScreenIntent() == true
+        } else {
+            true
+        }
+    }
+
+    var canDrawOverlays by remember { mutableStateOf(hasOverlayPermission()) }
+    var canUseFullScreenIntent by remember { mutableStateOf(hasFullScreenIntentPermission()) }
+    DisposableEffect(lifecycleOwner, context) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                canDrawOverlays = hasOverlayPermission()
+                canUseFullScreenIntent = hasFullScreenIntentPermission()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    var includeTokensInExport by remember { mutableStateOf(true) }
+    var backupStatusMessage by remember { mutableStateOf<String?>(null) }
+    var backupStatusIsError by remember { mutableStateOf(false) }
+
+    suspend fun buildBackupJson(includeTokens: Boolean): Pair<String, Int> {
+        val entitiesWithTokens = repository.getAllDeviceEntitiesWithTokens()
+        val exportedDevices = entitiesWithTokens.map { (entity, token) ->
+            ExportedEspDevice(
+                deviceId = entity.deviceId,
+                displayName = entity.displayName,
+                ipAddress = entity.lastKnownIp,
+                bearerToken = if (includeTokens) token else null,
+                homeId = entity.homeId,
+                floorId = entity.floorId,
+                roomId = entity.roomId,
+                firmwareRoomId = entity.firmwareRoomId,
+                xNormalized = entity.xNormalized,
+                yNormalized = entity.yNormalized,
+                isDemoSensor = entity.firmwareRoomId.startsWith("demo") ||
+                    entity.firmwareRoomId.startsWith("sov-") ||
+                    entity.displayName.contains("DEMO", ignoreCase = true)
             )
         }
-        previewLevel = null
+        val backup = SmartFireConfigBackup(
+            includeTokens = includeTokens,
+            devices = exportedDevices,
+            espConfig = repository.savedEspConfig.value,
+            appSettings = ExportedAppSettings(
+                pollingIntervalMs = repository.pollingIntervalMs.value,
+                httpTimeoutSeconds = repository.httpTimeoutSeconds.value,
+                alertMode = repository.alertMode.value.name,
+                alarmSoundType = repository.alarmSoundType.value.name,
+                alarmVolumePercent = repository.alarmVolumePercent.value,
+                level1PopupEnabled = repository.level1PopupEnabled.value,
+                autoRouteOnAlarm = repository.autoRouteOnAlarm.value,
+                stepStrideMeters = repository.stepStrideMeters.value
+            )
+        )
+        return EspConfigBackupManager.toJson(backup) to exportedDevices.size
+    }
+
+    val exportBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.CreateDocument("application/json")
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val (json, deviceCount) = buildBackupJson(includeTokensInExport)
+            val result = withContext(Dispatchers.IO) {
+                EspConfigBackupManager.writeToUri(context, uri, json)
+            }
+            if (result.isSuccess) {
+                backupStatusMessage = "Đã xuất cấu hình $deviceCount thiết bị ESP32 ra file JSON!"
+                backupStatusIsError = false
+            } else {
+                backupStatusMessage = result.exceptionOrNull()?.message ?: "Không thể xuất file cấu hình JSON."
+                backupStatusIsError = true
+            }
+        }
+    }
+
+    val importBackupLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val readResult = withContext(Dispatchers.IO) {
+                EspConfigBackupManager.readFromUri(context, uri)
+            }
+            val rawJson = readResult.getOrElse { err ->
+                backupStatusMessage = err.message ?: "Không thể đọc file cấu hình JSON."
+                backupStatusIsError = true
+                return@launch
+            }
+            val parsedResult = EspConfigBackupManager.fromJson(rawJson)
+            val backup = parsedResult.getOrElse { err ->
+                backupStatusMessage = err.message ?: "Tệp JSON không hợp lệ."
+                backupStatusIsError = true
+                return@launch
+            }
+
+            try {
+                repository.saveEspConfigLocally(backup.espConfig)
+                repository.updatePollingIntervalMs(backup.appSettings.pollingIntervalMs)
+                repository.updateHttpTimeoutSeconds(backup.appSettings.httpTimeoutSeconds)
+                runCatching { AlertMode.valueOf(backup.appSettings.alertMode) }.getOrNull()
+                    ?.let { repository.updateAlertMode(it) }
+                runCatching { AlarmSoundType.valueOf(backup.appSettings.alarmSoundType) }.getOrNull()
+                    ?.let { repository.updateAlarmSoundType(it) }
+                repository.updateAlarmVolumePercent(backup.appSettings.alarmVolumePercent)
+                repository.updateLevel1PopupEnabled(backup.appSettings.level1PopupEnabled)
+                repository.updateAutoRouteOnAlarm(backup.appSettings.autoRouteOnAlarm)
+                repository.updateStepStrideMeters(backup.appSettings.stepStrideMeters)
+
+                var importedCount = 0
+                backup.devices.forEach { exported ->
+                    val entity = DeviceEntity(
+                        deviceId = exported.deviceId,
+                        displayName = exported.displayName,
+                        homeId = exported.homeId,
+                        floorId = exported.floorId,
+                        roomId = exported.roomId,
+                        firmwareRoomId = exported.firmwareRoomId,
+                        lastKnownIp = exported.ipAddress,
+                        xNormalized = exported.xNormalized,
+                        yNormalized = exported.yNormalized
+                    )
+                    repository.importDeviceFromBackup(entity, exported.bearerToken)
+                    importedCount++
+                }
+                backupStatusMessage = "Đã nhập $importedCount thiết bị ESP32 và cấu hình hệ thống!"
+                backupStatusIsError = false
+            } catch (e: Exception) {
+                backupStatusMessage = e.message ?: "Lỗi khi khôi phục cấu hình từ tệp JSON."
+                backupStatusIsError = true
+            }
+        }
     }
 
     LazyColumn(verticalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -214,7 +390,12 @@ fun SettingsTabContent(
                         horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .weight(1f)
+                                .padding(end = 8.dp)
+                        ) {
                             Box(
                                 modifier = Modifier
                                     .size(34.dp)
@@ -243,6 +424,14 @@ fun SettingsTabContent(
                             modifier = Modifier.testTag("switch_demo_mode")
                         )
                     }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+                    Text(
+                        text = "Bật Demo sẽ thêm node mô phỏng mà KHÔNG làm mất cảm biến ESP32 thật.",
+                        color = TextSecondary,
+                        fontSize = 11.sp,
+                        fontWeight = FontWeight.Medium
+                    )
 
                     if (isDemoMode) {
                         Spacer(modifier = Modifier.height(12.dp))
@@ -474,7 +663,14 @@ fun SettingsTabContent(
                         horizontalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
                         OutlinedButton(
-                            onClick = { previewLevel = if (previewLevel == 1) null else 1 },
+                            onClick = {
+                                if (previewLevel == 1) {
+                                    previewLevel = null
+                                } else {
+                                    previewSessionNonce++
+                                    previewLevel = 1
+                                }
+                            },
                             modifier = Modifier.weight(1f).height(38.dp).testTag("btn_test_sound_l1"),
                             shape = RoundedCornerShape(10.dp)
                         ) {
@@ -486,7 +682,14 @@ fun SettingsTabContent(
                             )
                         }
                         OutlinedButton(
-                            onClick = { previewLevel = if (previewLevel == 2) null else 2 },
+                            onClick = {
+                                if (previewLevel == 2) {
+                                    previewLevel = null
+                                } else {
+                                    previewSessionNonce++
+                                    previewLevel = 2
+                                }
+                            },
                             modifier = Modifier.weight(1f).height(38.dp).testTag("btn_test_sound_l2"),
                             shape = RoundedCornerShape(10.dp)
                         ) {
@@ -557,6 +760,154 @@ fun SettingsTabContent(
             }
         }
 
+        // 2A. EXTERNAL FIRE POPUP & FULL-SCREEN PERMISSIONS
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = LightCard),
+                shape = RoundedCornerShape(16.dp),
+                border = CardDefaults.outlinedCardBorder()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(Color(0xFFFEF3C7)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Default.Layers, contentDescription = null, tint = Color(0xFFD97706), modifier = Modifier.size(20.dp))
+                        }
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text("Popup Báo Cháy Bên Ngoài Ứng Dụng", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                            Text("Hiển thị cảnh báo khẩn cấp khi đang mở app khác hoặc khóa màn hình", color = TextSecondary, fontSize = 11.sp)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(12.dp))
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(LightSurfaceVariant)
+                            .padding(10.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = "Popup nổi trên app khác: ${if (canDrawOverlays) "Đã cấp" else "Chưa cấp"}",
+                                color = if (canDrawOverlays) Color(0xFF047857) else CriticalAlarmRed,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Icon(
+                                imageVector = if (canDrawOverlays) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                contentDescription = null,
+                                tint = if (canDrawOverlays) NormalGreen else CriticalAlarmRed,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        }
+
+                        if (Build.VERSION.SDK_INT >= 34) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Toàn màn hình khi khóa máy: ${if (canUseFullScreenIntent) "Đã cấp" else "Chưa cấp"}",
+                                    color = if (canUseFullScreenIntent) Color(0xFF047857) else CriticalAlarmRed,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                Icon(
+                                    imageVector = if (canUseFullScreenIntent) Icons.Default.CheckCircle else Icons.Default.Warning,
+                                    contentDescription = null,
+                                    tint = if (canUseFullScreenIntent) NormalGreen else CriticalAlarmRed,
+                                    modifier = Modifier.size(16.dp)
+                                )
+                            }
+                        } else {
+                            Text(
+                                text = "Toàn màn hình khi khóa máy: Đã cấp (mặc định < Android 14)",
+                                color = Color(0xFF047857),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            try {
+                                val intent = Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}")
+                                )
+                                context.startActivity(intent)
+                            } catch (_: Exception) {
+                                Toast.makeText(context, "Không thể mở cài đặt Popup nổi trên thiết bị này", Toast.LENGTH_SHORT).show()
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(40.dp)
+                            .testTag("btn_grant_overlay_permission"),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.OpenInNew, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(15.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = if (canDrawOverlays) "Cài đặt quyền Popup nổi (Đã bật)" else "Cấp quyền Popup nổi trên app khác",
+                            color = PrimaryBlue,
+                            fontSize = 12.sp,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    if (Build.VERSION.SDK_INT >= 34) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        OutlinedButton(
+                            onClick = {
+                                try {
+                                    val intent = Intent(
+                                        Settings.ACTION_MANAGE_APP_USE_FULL_SCREEN_INTENT,
+                                        Uri.parse("package:${context.packageName}")
+                                    )
+                                    context.startActivity(intent)
+                                } catch (_: Exception) {
+                                    Toast.makeText(context, "Không thể mở cài đặt Toàn màn hình trên thiết bị này", Toast.LENGTH_SHORT).show()
+                                }
+                            },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(40.dp)
+                                .testTag("btn_grant_fullscreen_intent"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.OpenInNew, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(
+                                text = if (canUseFullScreenIntent) "Cài đặt Toàn màn hình (Đã bật)" else "Cấp quyền Toàn màn hình khi khóa máy",
+                                color = PrimaryBlue,
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
         // 2B. ESP32 REMOTE CONFIG & WI-FI OTA (SAVE + PUSH BUTTONS)
         item {
             com.example.ui.components.EspWifiConfigAndOtaCard(
@@ -564,6 +915,146 @@ fun SettingsTabContent(
                 targetNode = null,
                 allNodes = nodes
             )
+        }
+
+        // 2C. EXPORT / IMPORT ESP32 CONFIG BACKUP (.JSON)
+        item {
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = LightCard),
+                shape = RoundedCornerShape(16.dp),
+                border = CardDefaults.outlinedCardBorder()
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(34.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(PrimaryBlueLight),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Icon(Icons.Default.FileDownload, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(20.dp))
+                        }
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Column {
+                            Text("Xuất / Nhập Cấu Hình Báo Cháy ESP32 (.json)", color = TextPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                            Text("Sao lưu danh sách thiết bị ESP32, ngưỡng báo cháy & cài đặt ứng dụng", color = TextSecondary, fontSize = 11.sp)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f).padding(end = 8.dp)) {
+                            Text("Bao gồm mã API Token bảo mật", color = TextPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                            Text("Tắt tùy chọn này nếu bạn muốn chia sẻ file cấu hình công khai", color = TextSecondary, fontSize = 10.sp)
+                        }
+                        Switch(
+                            checked = includeTokensInExport,
+                            onCheckedChange = { includeTokensInExport = it },
+                            colors = SwitchDefaults.colors(checkedTrackColor = PrimaryBlue),
+                            modifier = Modifier.testTag("switch_include_tokens_export")
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.height(10.dp))
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Button(
+                            onClick = {
+                                exportBackupLauncher.launch(EspConfigBackupManager.defaultFileName())
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(40.dp)
+                                .testTag("btn_export_esp_config_file"),
+                            colors = ButtonDefaults.buttonColors(containerColor = PrimaryBlue),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.FileDownload, contentDescription = null, modifier = Modifier.size(16.dp))
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text("Xuất File", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    val (json, deviceCount) = buildBackupJson(includeTokensInExport)
+                                    val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                                        type = "text/plain"
+                                        putExtra(Intent.EXTRA_SUBJECT, "Cấu hình SmartFire ESP32")
+                                        putExtra(Intent.EXTRA_TEXT, json)
+                                    }
+                                    try {
+                                        context.startActivity(Intent.createChooser(sendIntent, "Chia sẻ cấu hình SmartFire ESP32"))
+                                        backupStatusMessage = "Đã chuẩn bị chia sẻ cấu hình $deviceCount thiết bị ESP32."
+                                        backupStatusIsError = false
+                                    } catch (_: Exception) {
+                                        Toast.makeText(context, "Không tìm thấy ứng dụng chia sẻ", Toast.LENGTH_SHORT).show()
+                                    }
+                                }
+                            },
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(40.dp)
+                                .testTag("btn_share_esp_config"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Icon(Icons.Default.Share, contentDescription = null, tint = PrimaryBlue, modifier = Modifier.size(15.dp))
+                            Spacer(modifier = Modifier.width(5.dp))
+                            Text("Chia sẻ", color = PrimaryBlue, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            importBackupLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(40.dp)
+                            .testTag("btn_import_esp_config_file"),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(Icons.Default.FolderOpen, contentDescription = null, tint = NormalGreen, modifier = Modifier.size(16.dp))
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Nhập Cấu Hình Từ File (.json)", color = NormalGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+
+                    backupStatusMessage?.let { msg ->
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(if (backupStatusIsError) Color(0xFFFEF2F2) else Color(0xFFECFDF5))
+                                .border(
+                                    1.dp,
+                                    if (backupStatusIsError) CriticalAlarmRed else NormalGreen,
+                                    RoundedCornerShape(8.dp)
+                                )
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Text(
+                                text = msg,
+                                color = if (backupStatusIsError) CriticalAlarmRed else Color(0xFF047857),
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold
+                            )
+                        }
+                    }
+                }
+            }
         }
 
         // 3. PERFORMANCE, POLLING & STEP SENSOR CALIBRATION

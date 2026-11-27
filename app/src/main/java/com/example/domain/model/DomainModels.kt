@@ -438,8 +438,56 @@ data class SmartFireNode(
     val activeCommandStatus: CommandStatus = CommandStatus.IDLE,
     val lastCommandRequestId: String = "",
     val lastCommandType: String = "",
-    val isDemoSensor: Boolean = false
-)
+    val isDemoSensor: Boolean = false,
+    val suspectedBurnedOffline: Boolean = false,
+    val isCachedOfflineData: Boolean = false,
+    val alarmEpisodeId: Long = 0L
+) {
+    fun effectiveConfig(fallback: EspDeviceConfig? = null): EspDeviceConfig {
+        return if (telemetry.receivedAt > 0L) {
+            EspDeviceConfig(
+                mq2Enabled = telemetry.mq2Enabled,
+                gasWarn = telemetry.gasWarnThreshold,
+                gasOn = telemetry.gasOnThreshold,
+                gasOff = telemetry.gasOffThreshold,
+                tempEnabled = telemetry.tempEnabled,
+                tempWarnC = telemetry.tempWarnC,
+                tempAlarmC = telemetry.tempAlarmC,
+                flameEnabled = telemetry.flameEnabled,
+                flameWarnMs = telemetry.flameWarnMs,
+                flameAlarmMs = telemetry.flameAlarmMs,
+                hornEnabled = telemetry.hornEnabled,
+                gasCommissioned = telemetry.gasCommissioned,
+                txPower1m = telemetry.txPower1m,
+                pathLossN = telemetry.pathLossN,
+                firmwareVersion = telemetry.firmwareVersion
+            )
+        } else {
+            fallback ?: EspDeviceConfig()
+        }
+    }
+
+    fun isEffectivelyAlarming(fallbackConfig: EspDeviceConfig? = null): Boolean {
+        val isDisarmed = telemetry.disarmed || firmwareState == FirmwareState.DISARMED
+        val isRealFaultOrWarming = !isDemoSensor &&
+            (firmwareState == FirmwareState.WARMING || firmwareState == FirmwareState.FAULT || telemetry.gasFault)
+        return !isDisarmed && (
+            lastKnownAlarm ||
+                firmwareState == FirmwareState.ALARM ||
+                (!isRealFaultOrWarming && telemetry.evaluateTwoLevelStatus(effectiveConfig(fallbackConfig)) == SensorAlertLevel.ALARM_LEVEL_2)
+            )
+    }
+
+    fun isEffectivelyWarningLevel1(fallbackConfig: EspDeviceConfig? = null): Boolean {
+        val isDisarmed = telemetry.disarmed || firmwareState == FirmwareState.DISARMED
+        val isRealFaultOrWarming = !isDemoSensor &&
+            (firmwareState == FirmwareState.WARMING || firmwareState == FirmwareState.FAULT || telemetry.gasFault)
+        return !isDisarmed && !isEffectivelyAlarming(fallbackConfig) && (
+            firmwareState == FirmwareState.SUSPECTED ||
+                (!isRealFaultOrWarming && telemetry.evaluateTwoLevelStatus(effectiveConfig(fallbackConfig)) == SensorAlertLevel.WARNING_LEVEL_1)
+            )
+    }
+}
 
 data class DeviceEvent(
     val id: Long = 0L,

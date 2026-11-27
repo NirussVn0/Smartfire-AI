@@ -6,6 +6,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -15,6 +16,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Dashboard
@@ -45,14 +47,17 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.SmartFireApplication
@@ -76,11 +81,15 @@ import com.example.ui.screens.devices.DeviceDetailScreen
 import com.example.ui.screens.map.IndoorMap2DScreen
 import com.example.ui.screens.settings.SettingsScreen
 import com.example.ui.theme.LightBackground
+import com.example.ui.theme.LightBorder
 import com.example.ui.theme.LightSurface
+import com.example.ui.theme.LightSurfaceVariant
 import com.example.ui.theme.PrimaryBlue
 import com.example.ui.theme.PrimaryBlueLight
+import com.example.ui.theme.TextPrimary
 import com.example.ui.theme.TextSecondary
 import kotlin.math.hypot
+import kotlin.math.roundToInt
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -143,19 +152,23 @@ fun AppNavigation(modifier: Modifier = Modifier) {
     val alarmVolumePercent by repository.alarmVolumePercent.collectAsState()
     val level1PopupEnabled by repository.level1PopupEnabled.collectAsState()
     val localAlarmMutedUntilMs by repository.localAlarmMutedUntilMs.collectAsState()
-    var isLocalAlarmMuted by remember(localAlarmMutedUntilMs) {
-        mutableStateOf(System.currentTimeMillis() < localAlarmMutedUntilMs)
-    }
-    LaunchedEffect(localAlarmMutedUntilMs) {
-        val remaining = localAlarmMutedUntilMs - System.currentTimeMillis()
-        if (remaining > 0L) {
-            isLocalAlarmMuted = true
-            delay(remaining)
-            isLocalAlarmMuted = false
-        } else {
-            isLocalAlarmMuted = false
+    val mutedUntilByDevice by repository.mutedUntilByDevice.collectAsState()
+    val dismissedByDevice by repository.dismissedAlarmEpisodeByDevice.collectAsState()
+    val offlineFireLatched by repository.offlineFireLatchedDevices.collectAsState()
+
+    var nowMs by remember { mutableLongStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(mutedUntilByDevice, localAlarmMutedUntilMs) {
+        val current = System.currentTimeMillis()
+        nowMs = current
+        val nextExpiry = (mutedUntilByDevice.values + localAlarmMutedUntilMs)
+            .filter { it > current }
+            .minOrNull()
+        if (nextExpiry != null) {
+            delay((nextExpiry - current + 50L).coerceAtLeast(50L))
+            nowMs = System.currentTimeMillis()
         }
     }
+    val isAnyLocalMuteActive = mutedUntilByDevice.values.any { it > nowMs } || nowMs < localAlarmMutedUntilMs
 
     // Shared app-wide movement tracker so live compass heading & outdoor GPS distance power
     // the floating Google Maps-style Turn-by-Turn popup even while on Dashboard/Settings
@@ -219,7 +232,7 @@ fun AppNavigation(modifier: Modifier = Modifier) {
             }
             MapNavigationTargetType.TWO_STAGE_EXTINGUISHER_TO_FIRE -> {
                 val ext = extinguishers.minByOrNull { hypot((it.position.x - uPos.x).toDouble(), (it.position.y - uPos.y).toDouble()) }
-                val fireN = nodes.filter { it.lastKnownAlarm || it.firmwareState == FirmwareState.ALARM }.firstOrNull() ?: nodes.firstOrNull()
+                val fireN = nodes.filter { it.isEffectivelyAlarming(savedEspConfig) }.firstOrNull() ?: nodes.firstOrNull()
                 Triple(
                     fireN?.let { Point2D(it.xNormalized, it.yNormalized) } ?: Point2D(0.45f, 0.35f),
                     "Bình CC ➔ ${fireN?.displayName ?: "Đám Cháy"}",
@@ -227,7 +240,7 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                 )
             }
             MapNavigationTargetType.NEAREST_FIRE_SENSOR -> {
-                val fireN = nodes.filter { it.lastKnownAlarm || it.firmwareState == FirmwareState.ALARM }
+                val fireN = nodes.filter { it.isEffectivelyAlarming(savedEspConfig) }
                     .minByOrNull { hypot((it.xNormalized - uPos.x).toDouble(), (it.yNormalized - uPos.y).toDouble()) }
                     ?: nodes.firstOrNull()
                 Triple(
@@ -278,8 +291,14 @@ fun AppNavigation(modifier: Modifier = Modifier) {
     }
 
     fun startNavigationWithLocalSilence(req: MapNavigationRequest, openMapDirectly: Boolean = false) {
-        // Always temporarily silence notifications & alarm on THIS phone first!
-        repository.muteLocalNotificationsTemporarily()
+        // Silence only the relevant device(s) on THIS phone without muting unrelated rooms
+        val targetId = req.targetDeviceId
+        if (!targetId.isNullOrBlank()) {
+            repository.muteDeviceLocally(targetId, 180_000L)
+        } else {
+            repository.muteLocalNotificationsTemporarily(180_000L)
+        }
+        com.example.service.audio.AlarmAudioPlayer.stopManagedAlert()
         activeGuidanceRequest = req
         repository.requestMapNavigation(req)
         if (openMapDirectly) {
@@ -289,30 +308,25 @@ fun AppNavigation(modifier: Modifier = Modifier) {
         }
     }
 
-    // Track active fire alarms (Level 2) and early warnings (Level 1) cleanly, excluding DISARMED and hardware FAULT/WARMING
-    val alarmNodes = nodes.filter { node ->
-        val t = node.telemetry
-        val isDisarmed = t.disarmed || node.firmwareState == FirmwareState.DISARMED
-        val isRealFaultOrWarming = !node.isDemoSensor &&
-            (node.firmwareState == FirmwareState.WARMING || node.firmwareState == FirmwareState.FAULT || t.gasFault)
-        !isDisarmed && (node.lastKnownAlarm || node.firmwareState == FirmwareState.ALARM ||
-            (!isRealFaultOrWarming && t.evaluateTwoLevelStatus(savedEspConfig) == com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2))
-    }
-    val warningLevel1Nodes = nodes.filter { node ->
-        val t = node.telemetry
-        val isDisarmed = t.disarmed || node.firmwareState == FirmwareState.DISARMED
-        val isRealFaultOrWarming = !node.isDemoSensor &&
-            (node.firmwareState == FirmwareState.WARMING || node.firmwareState == FirmwareState.FAULT || t.gasFault)
-        !isDisarmed && node !in alarmNodes &&
-            (node.firmwareState == FirmwareState.SUSPECTED ||
-                (!isRealFaultOrWarming && t.evaluateTwoLevelStatus(savedEspConfig) == com.example.domain.model.SensorAlertLevel.WARNING_LEVEL_1))
-    }
-    val userPos = userLocation?.position ?: Point2D(0.50f, 0.78f)
-    val nearestAlarmNode = alarmNodes.minByOrNull { n ->
-        hypot((n.xNormalized - userPos.x).toDouble(), (n.yNormalized - userPos.y).toDouble())
-    } ?: alarmNodes.firstOrNull()
+    // Track active fire alarms (Level 2) and early warnings (Level 1) independently per device
+    val alarmNodes = nodes.filter { it.isEffectivelyAlarming(savedEspConfig) }
+    val warningLevel1Nodes = nodes.filter { it.isEffectivelyWarningLevel1(savedEspConfig) && it !in alarmNodes }
 
-    val nearestAlarmDistMeters = nearestAlarmNode?.let { n ->
+    val activePopupAlarmNodes = alarmNodes.filter { n ->
+        !n.suspectedBurnedOffline &&
+            n.deviceId !in offlineFireLatched &&
+            dismissedByDevice[n.deviceId] != n.alarmEpisodeId
+    }
+    val shouldPlayAlarmSound = phoneAlarmSoundEnabled && activePopupAlarmNodes.any {
+        (mutedUntilByDevice[it.deviceId] ?: 0L) <= nowMs
+    }
+
+    val userPos = userLocation?.position ?: Point2D(0.50f, 0.78f)
+    val primaryPopupNode = activePopupAlarmNodes.minByOrNull { n ->
+        hypot((n.xNormalized - userPos.x).toDouble(), (n.yNormalized - userPos.y).toDouble())
+    } ?: activePopupAlarmNodes.firstOrNull()
+
+    val primaryPopupDistMeters = primaryPopupNode?.let { n ->
         val wM = (currentFloor?.widthMeters ?: 12f).coerceAtLeast(5f)
         val lM = (currentFloor?.lengthMeters ?: 16f).coerceAtLeast(5f)
         val dx = (n.xNormalized - userPos.x) * wM
@@ -321,31 +335,28 @@ fun AppNavigation(modifier: Modifier = Modifier) {
     } ?: 3.5f
 
     val notificationHelper = remember { com.example.service.notification.SmartFireNotificationManager(context.applicationContext) }
-    var popupDismissedForCurrentAlarm by remember { mutableStateOf(false) }
-    var level1DismissedForCurrentWarning by remember { mutableStateOf(false) }
-    var hadActiveAlarmBefore by remember { mutableStateOf(false) }
-    var hadActiveWarningBefore by remember { mutableStateOf(false) }
+    var dismissedWarningByDevice by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var lastAlertedPopupKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
+    var lastAlertedWarningIds by remember { mutableStateOf<Set<String>>(emptySet()) }
 
-    LaunchedEffect(alarmNodes.size, autoRouteOnAlarm, isLocalAlarmMuted, alertMode) {
-        if (alarmNodes.isEmpty()) {
-            popupDismissedForCurrentAlarm = false
-            hadActiveAlarmBefore = false
-        } else {
-            if (!hadActiveAlarmBefore) {
-                hadActiveAlarmBefore = true
-                if (!isLocalAlarmMuted) {
-                    val firstAlarm = alarmNodes.first()
-                    notificationHelper.showFireAlarmNotification(
-                        deviceName = firstAlarm.displayName,
-                        roomName = firstAlarm.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
-                        gasRaw = firstAlarm.telemetry.gasRaw,
-                        hasFlame = firstAlarm.telemetry.flame,
-                        alertMode = alertMode
-                    )
-                }
+    LaunchedEffect(activePopupAlarmNodes, autoRouteOnAlarm, mutedUntilByDevice, alertMode) {
+        val currentKeys = activePopupAlarmNodes.map { "${it.deviceId}:${it.alarmEpisodeId}" }.toSet()
+        val newNodes = activePopupAlarmNodes.filter { "${it.deviceId}:${it.alarmEpisodeId}" !in lastAlertedPopupKeys }
+        lastAlertedPopupKeys = currentKeys
+        if (newNodes.isNotEmpty()) {
+            val unmutedNew = newNodes.firstOrNull { (mutedUntilByDevice[it.deviceId] ?: 0L) <= System.currentTimeMillis() }
+            if (unmutedNew != null) {
+                notificationHelper.showFireAlarmNotification(
+                    deviceName = unmutedNew.displayName,
+                    roomName = unmutedNew.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
+                    gasRaw = unmutedNew.telemetry.gasRaw,
+                    hasFlame = unmutedNew.telemetry.flame,
+                    alertMode = alertMode,
+                    deviceId = unmutedNew.deviceId,
+                    temperatureCelsius = unmutedNew.telemetry.temperatureCelsius
+                )
             }
             if (autoRouteOnAlarm) {
-                // Auto-activate 2-stage route (Extinguisher -> Fire) when autoRouteOnAlarm is enabled
                 repository.requestMapNavigation(
                     MapNavigationRequest(targetType = MapNavigationTargetType.TWO_STAGE_EXTINGUISHER_TO_FIRE)
                 )
@@ -353,24 +364,27 @@ fun AppNavigation(modifier: Modifier = Modifier) {
         }
     }
 
-    LaunchedEffect(warningLevel1Nodes.size, alarmNodes.size, level1PopupEnabled, isLocalAlarmMuted, alertMode) {
-        if (warningLevel1Nodes.isEmpty() || alarmNodes.isNotEmpty()) {
-            level1DismissedForCurrentWarning = false
-            hadActiveWarningBefore = false
-        } else if (!hadActiveWarningBefore) {
-            hadActiveWarningBefore = true
-            level1DismissedForCurrentWarning = false
-            if (level1PopupEnabled && !isLocalAlarmMuted) {
-                val firstWarn = warningLevel1Nodes.first()
+    LaunchedEffect(warningLevel1Nodes, activePopupAlarmNodes.size, level1PopupEnabled, mutedUntilByDevice, alertMode) {
+        val activeWarnIds = warningLevel1Nodes.map { it.deviceId }.toSet()
+        dismissedWarningByDevice = dismissedWarningByDevice intersect activeWarnIds
+        if (activePopupAlarmNodes.isEmpty() && level1PopupEnabled) {
+            val newWarn = warningLevel1Nodes.firstOrNull {
+                it.deviceId !in lastAlertedWarningIds && (mutedUntilByDevice[it.deviceId] ?: 0L) <= System.currentTimeMillis()
+            }
+            if (newWarn != null) {
                 notificationHelper.showLevel1WarningNotification(
-                    deviceName = firstWarn.displayName,
-                    roomName = firstWarn.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
-                    detail = "Gas=${firstWarn.telemetry.gasRaw} ADC · Nhiệt=${firstWarn.telemetry.temperatureCelsius?.let { String.format(java.util.Locale.US, "%.1f°C", it) } ?: "N/A"}",
-                    alertMode = alertMode
+                    deviceName = newWarn.displayName,
+                    roomName = newWarn.firmwareRoomId.ifBlank { "Khu vực cảm biến" },
+                    detail = "Gas=${newWarn.telemetry.gasRaw} ADC · Nhiệt=${newWarn.telemetry.temperatureCelsius?.let { String.format(java.util.Locale.US, "%.1f°C", it) } ?: "N/A"}",
+                    alertMode = alertMode,
+                    deviceId = newWarn.deviceId
                 )
             }
         }
+        lastAlertedWarningIds = activeWarnIds
     }
+
+    val activeWarningNodes = warningLevel1Nodes.filter { it.deviceId !in dismissedWarningByDevice }
 
     BackHandler(enabled = selectedDeviceId != null) {
         selectedDeviceId = null
@@ -519,7 +533,9 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                             scope.launch { repository.removeDevice(id) }
                         },
                         onRouteToNodeOnMapClick = { id ->
-                            popupDismissedForCurrentAlarm = true
+                            nodes.find { it.deviceId == id }?.let { n ->
+                                repository.dismissAlarmPopupForDevice(id, n.alarmEpisodeId)
+                            }
                             startNavigationWithLocalSilence(
                                 MapNavigationRequest(
                                     targetType = MapNavigationTargetType.SPECIFIC_FIRE_SENSOR,
@@ -535,14 +551,18 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                         onOpenSettingsClick = { currentTab = StreamlinedTab.SETTINGS },
                         onLogoutClick = { repository.logoutSimulated() },
                         onSilenceClick = { id ->
-                            popupDismissedForCurrentAlarm = true
-                            level1DismissedForCurrentWarning = true
-                            repository.muteLocalNotificationsTemporarily(30_000L)
+                            val nodeEpisode = nodes.find { it.deviceId == id }?.alarmEpisodeId
+                                ?: repository.getAlarmEpisodeId(id)
+                            repository.muteDeviceLocally(id, 30_000L)
+                            repository.dismissAlarmPopupForDevice(id, nodeEpisode)
+                            dismissedWarningByDevice = dismissedWarningByDevice + id
                             scope.launch { repository.sendCommand(id, "silence") }
                         },
                         onDisarmClick = { id ->
-                            popupDismissedForCurrentAlarm = true
-                            level1DismissedForCurrentWarning = true
+                            val nodeEpisode = nodes.find { it.deviceId == id }?.alarmEpisodeId
+                                ?: repository.getAlarmEpisodeId(id)
+                            repository.dismissAlarmPopupForDevice(id, nodeEpisode)
+                            dismissedWarningByDevice = dismissedWarningByDevice + id
                             scope.launch { repository.sendCommand(id, "disarm") }
                         },
                         onArmClick = { id ->
@@ -552,14 +572,17 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                             scope.launch { repository.sendCommand(id, "ack") }
                         },
                         onTestClick = { id ->
-                            popupDismissedForCurrentAlarm = false
+                            repository.unmuteDeviceLocally(id)
                             scope.launch { repository.sendCommand(id, "test") }
                         },
                         onAdjustMultiSensorParams = { id, tempC, ror, gas, co, hum, ir ->
-                            popupDismissedForCurrentAlarm = false
                             scope.launch {
                                 repository.simulateMultiSensorParameters(id, tempC, ror, gas, co, hum, ir)
                             }
+                        },
+                        savedEspConfig = savedEspConfig,
+                        onResetOfflineBurnedClick = { id ->
+                            scope.launch { repository.clearOfflineBurnedAlarm(id) }
                         }
                     )
 
@@ -658,7 +681,7 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                             repository.muteLocalNotificationsTemporarily()
                         },
                         sharedMovementTracker = sharedMovementTracker,
-                        isLocalAlarmMuted = isLocalAlarmMuted,
+                        isLocalAlarmMuted = isAnyLocalMuteActive,
                         onBackToDashboardWithNav = {
                             currentTab = StreamlinedTab.DASHBOARD
                         },
@@ -697,7 +720,7 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                 TurnByTurnNavigationBanner(
                     guidance = overlayGuidance,
                     isMapCurrentlyVisible = false,
-                    isLocalAlarmMuted = isLocalAlarmMuted,
+                    isLocalAlarmMuted = mutedUntilByDevice.values.any { it > nowMs } || nowMs < localAlarmMutedUntilMs,
                     onToggleMapView = {
                         selectedDeviceId = null
                         mapInSetupMode = false
@@ -714,10 +737,16 @@ fun AppNavigation(modifier: Modifier = Modifier) {
             }
 
             // Level 1 Early Warning Popup (Mức 1 Cảnh Báo Sớm)
-            if (warningLevel1Nodes.isNotEmpty() && alarmNodes.isEmpty() && level1PopupEnabled && !level1DismissedForCurrentWarning) {
-                val warnNode = warningLevel1Nodes.first()
-                LaunchedEffect(warnNode.deviceId, phoneAlarmSoundEnabled, isLocalAlarmMuted, alertMode, alarmSoundType, alarmVolumePercent) {
-                    if (phoneAlarmSoundEnabled && !isLocalAlarmMuted && alertMode != com.example.domain.model.AlertMode.SILENT) {
+            if (activeWarningNodes.isNotEmpty() && activePopupAlarmNodes.isEmpty() && level1PopupEnabled) {
+                val warnNode = activeWarningNodes.first()
+                val warnMuted = (mutedUntilByDevice[warnNode.deviceId] ?: 0L) > nowMs
+                val warnFlamePct = if (warnNode.telemetry.flame) {
+                    100
+                } else {
+                    ((warnNode.telemetry.irFlameIntensity ?: 0f) * 100f).roundToInt().coerceIn(0, 100)
+                }
+                LaunchedEffect(warnNode.deviceId, phoneAlarmSoundEnabled, warnMuted, alertMode, alarmSoundType, alarmVolumePercent) {
+                    if (phoneAlarmSoundEnabled && !warnMuted && alertMode != com.example.domain.model.AlertMode.SILENT) {
                         com.example.service.audio.AlarmAudioPlayer.runAlertLoop(
                             context = context,
                             alertMode = alertMode,
@@ -728,7 +757,9 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                     }
                 }
                 Dialog(
-                    onDismissRequest = { level1DismissedForCurrentWarning = true },
+                    onDismissRequest = {
+                        dismissedWarningByDevice = dismissedWarningByDevice + warnNode.deviceId
+                    },
                     properties = DialogProperties(usePlatformDefaultWidth = false)
                 ) {
                     Card(
@@ -743,57 +774,134 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                         Column(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .border(3.dp, Color(0xFFD97706), RoundedCornerShape(22.dp))
+                                .border(2.5.dp, Color(0xFFD97706), RoundedCornerShape(22.dp))
                                 .padding(18.dp),
-                            horizontalAlignment = Alignment.CenterHorizontally
+                            verticalArrangement = Arrangement.spacedBy(12.dp)
                         ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(58.dp)
-                                    .background(Color(0xFFFEF3C7), RoundedCornerShape(16.dp)),
-                                contentAlignment = Alignment.Center
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Icon(Icons.Default.Warning, contentDescription = null, tint = Color(0xFFD97706), modifier = Modifier.size(34.dp))
+                                Box(
+                                    modifier = Modifier
+                                        .size(44.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFFFEF3C7)),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Icon(
+                                        Icons.Default.Warning,
+                                        contentDescription = null,
+                                        tint = Color(0xFFD97706),
+                                        modifier = Modifier.size(24.dp)
+                                    )
+                                }
+                                Spacer(modifier = Modifier.width(10.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        text = "MỨC 1 · CẢNH BÁO SỚM",
+                                        color = Color(0xFFB45309),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        maxLines = 1
+                                    )
+                                    Text(
+                                        text = warnNode.displayName,
+                                        color = TextPrimary,
+                                        fontSize = 16.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
-                            Spacer(modifier = Modifier.height(10.dp))
-                            Text(
-                                text = "MỨC 1 · CẢNH BÁO SỚM",
-                                color = Color(0xFFB45309),
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.ExtraBold
-                            )
-                            Text(
-                                text = warnNode.displayName,
-                                color = Color(0xFF1E293B),
-                                fontSize = 17.sp,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Spacer(modifier = Modifier.height(6.dp))
-                            Text(
-                                text = "Khí MQ-2: ${warnNode.telemetry.gasRaw} ADC · Nhiệt: ${warnNode.telemetry.temperatureCelsius?.let { String.format(java.util.Locale.US, "%.1f°C", it) } ?: "N/A"} · Lửa: ${if (warnNode.telemetry.flame) "CÓ" else "Không"}",
-                                color = TextSecondary,
-                                fontSize = 12.sp
-                            )
-                            Spacer(modifier = Modifier.height(14.dp))
+
+                            // 3 Compact Metric Pills: Nhiệt | Khói | Lửa IR
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clip(RoundedCornerShape(14.dp))
+                                    .background(Color(0xFFFFFBEB))
+                                    .border(1.dp, Color(0xFFFDE68A), RoundedCornerShape(14.dp))
+                                    .padding(horizontal = 8.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Text("Nhiệt Độ", color = TextSecondary, fontSize = 10.sp)
+                                    Text(
+                                        text = warnNode.telemetry.temperatureCelsius?.let {
+                                            String.format(java.util.Locale.US, "%.1f°C", it)
+                                        } ?: "N/A",
+                                        color = Color(0xFFB45309),
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        maxLines = 1
+                                    )
+                                }
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Text("Khói MQ-2", color = TextSecondary, fontSize = 10.sp)
+                                    Text(
+                                        text = "${warnNode.telemetry.gasRaw} ADC",
+                                        color = Color(0xFFB45309),
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        maxLines = 1
+                                    )
+                                }
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Text("Lửa IR", color = TextSecondary, fontSize = 10.sp)
+                                    Text(
+                                        text = if (warnNode.telemetry.flame) "CÓ" else "$warnFlamePct%",
+                                        color = Color(0xFFB45309),
+                                        fontSize = 14.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        maxLines = 1
+                                    )
+                                }
+                            }
+
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
                                 horizontalArrangement = Arrangement.spacedBy(8.dp)
                             ) {
                                 OutlinedButton(
                                     onClick = {
-                                        level1DismissedForCurrentWarning = true
-                                        repository.muteLocalNotificationsTemporarily()
+                                        dismissedWarningByDevice = dismissedWarningByDevice + warnNode.deviceId
+                                        repository.muteDeviceLocally(warnNode.deviceId, 30_000L)
                                     },
-                                    modifier = Modifier.weight(1f).height(44.dp),
-                                    shape = RoundedCornerShape(12.dp)
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .height(44.dp),
+                                    shape = RoundedCornerShape(12.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp)
                                 ) {
-                                    Icon(Icons.Default.NotificationsOff, contentDescription = null, tint = Color(0xFFB45309), modifier = Modifier.size(16.dp))
+                                    Icon(
+                                        Icons.Default.NotificationsOff,
+                                        contentDescription = null,
+                                        tint = Color(0xFFB45309),
+                                        modifier = Modifier.size(16.dp)
+                                    )
                                     Spacer(modifier = Modifier.width(4.dp))
-                                    Text("Tạm Tắt", color = Color(0xFFB45309), fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                                    Text(
+                                        "Tạm Tắt",
+                                        color = Color(0xFFB45309),
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.Bold,
+                                        maxLines = 1
+                                    )
                                 }
                                 Button(
                                     onClick = {
-                                        level1DismissedForCurrentWarning = true
+                                        dismissedWarningByDevice = dismissedWarningByDevice + warnNode.deviceId
                                         startNavigationWithLocalSilence(
                                             MapNavigationRequest(
                                                 targetType = MapNavigationTargetType.SPECIFIC_FIRE_SENSOR,
@@ -802,11 +910,20 @@ fun AppNavigation(modifier: Modifier = Modifier) {
                                             openMapDirectly = false
                                         )
                                     },
-                                    modifier = Modifier.weight(1.2f).height(44.dp),
+                                    modifier = Modifier
+                                        .weight(1.25f)
+                                        .height(44.dp),
                                     colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD97706)),
-                                    shape = RoundedCornerShape(12.dp)
+                                    shape = RoundedCornerShape(12.dp),
+                                    contentPadding = PaddingValues(horizontal = 10.dp)
                                 ) {
-                                    Text("Chỉ Đường Kiểm Tra", color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.ExtraBold)
+                                    Text(
+                                        "Kiểm Tra Ngay",
+                                        color = Color.White,
+                                        fontSize = 12.sp,
+                                        fontWeight = FontWeight.ExtraBold,
+                                        maxLines = 1
+                                    )
                                 }
                             }
                         }
@@ -815,61 +932,76 @@ fun AppNavigation(modifier: Modifier = Modifier) {
             }
 
             // Full-Screen Flashing & Beeping Emergency Popup when Fire Alarm (Level 2) triggers
-            if (alarmNodes.isNotEmpty() && nearestAlarmNode != null && !popupDismissedForCurrentAlarm) {
+            if (activePopupAlarmNodes.isNotEmpty() && primaryPopupNode != null) {
+                val dismissAllActivePopups = {
+                    activePopupAlarmNodes.forEach { n ->
+                        repository.dismissAlarmPopupForDevice(n.deviceId, n.alarmEpisodeId)
+                    }
+                }
                 FireEmergencyPopupDialog(
-                    nearestAlarmNode = nearestAlarmNode,
-                    totalAlarmCount = alarmNodes.size,
-                    distanceMeters = nearestAlarmDistMeters,
-                    soundEnabled = phoneAlarmSoundEnabled && !isLocalAlarmMuted,
+                    nearestAlarmNode = primaryPopupNode,
+                    totalAlarmCount = activePopupAlarmNodes.size,
+                    distanceMeters = primaryPopupDistMeters,
+                    soundEnabled = shouldPlayAlarmSound,
                     alertMode = alertMode,
                     soundType = alarmSoundType,
                     volumePercent = alarmVolumePercent,
                     onRouteToExtinguisher = {
-                        popupDismissedForCurrentAlarm = true
+                        dismissAllActivePopups()
                         startNavigationWithLocalSilence(
                             MapNavigationRequest(targetType = MapNavigationTargetType.NEAREST_EXTINGUISHER),
                             openMapDirectly = false
                         )
                     },
                     onRouteToNearestFireSensor = {
-                        popupDismissedForCurrentAlarm = true
+                        dismissAllActivePopups()
                         startNavigationWithLocalSilence(
                             MapNavigationRequest(targetType = MapNavigationTargetType.NEAREST_FIRE_SENSOR),
                             openMapDirectly = false
                         )
                     },
                     onRouteTwoStageExtinguisherToFire = {
-                        popupDismissedForCurrentAlarm = true
+                        dismissAllActivePopups()
                         startNavigationWithLocalSilence(
                             MapNavigationRequest(targetType = MapNavigationTargetType.TWO_STAGE_EXTINGUISHER_TO_FIRE),
                             openMapDirectly = false
                         )
                     },
                     onRouteToExit = {
-                        popupDismissedForCurrentAlarm = true
+                        dismissAllActivePopups()
                         startNavigationWithLocalSilence(
                             MapNavigationRequest(targetType = MapNavigationTargetType.NEAREST_EXIT),
                             openMapDirectly = false
                         )
                     },
                     onSilenceAllAlarms = {
-                        popupDismissedForCurrentAlarm = true
-                        repository.muteLocalNotificationsTemporarily(30_000L)
+                        com.example.service.audio.AlarmAudioPlayer.stopManagedAlert()
+                        activePopupAlarmNodes.forEach { n ->
+                            repository.muteDeviceLocally(n.deviceId, 30_000L)
+                            repository.dismissAlarmPopupForDevice(n.deviceId, n.alarmEpisodeId)
+                            notificationHelper.cancelFireAlarmNotification(n.deviceId)
+                        }
                         scope.launch {
-                            alarmNodes.forEach { n ->
+                            activePopupAlarmNodes.forEach { n ->
                                 repository.sendCommand(n.deviceId, "silence")
                             }
                         }
                     },
                     onDisarmAllAlarms = {
-                        popupDismissedForCurrentAlarm = true
-                        level1DismissedForCurrentWarning = true
+                        com.example.service.audio.AlarmAudioPlayer.stopManagedAlert()
+                        dismissAllActivePopups()
+                        activePopupAlarmNodes.forEach { n ->
+                            notificationHelper.cancelFireAlarmNotification(n.deviceId)
+                        }
+                        dismissedWarningByDevice = dismissedWarningByDevice + activePopupAlarmNodes.map { it.deviceId }
                         scope.launch {
-                            alarmNodes.forEach { n ->
+                            activePopupAlarmNodes.forEach { n ->
                                 repository.sendCommand(n.deviceId, "disarm")
                             }
                         }
-                    }
+                    },
+                    allAlarmNodes = activePopupAlarmNodes,
+                    isOfflineBurned = primaryPopupNode.suspectedBurnedOffline
                 )
             }
         }

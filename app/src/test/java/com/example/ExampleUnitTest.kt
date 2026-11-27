@@ -590,4 +590,78 @@ class ExampleUnitTest {
         assertEquals(0f, prob.totalProbabilityPercent, 0.01f)
         assertTrue(prob.riskLevelLabel.contains("TẮT HẲN", ignoreCase = true))
     }
+
+    @Test
+    fun testMultiNodeIndependence_perDeviceThresholdsAndOfflineBurnedState() {
+        val room1 = SmartFireNode(
+            deviceId = "esp-room-1",
+            displayName = "Phòng Bếp",
+            homeId = "home_main",
+            floorId = "floor_1",
+            roomId = "room_kitchen",
+            ipAddress = "192.168.1.150",
+            firmwareState = FirmwareState.ALARM,
+            connectionState = DeviceConnectionState.OFFLINE,
+            lastKnownAlarm = true,
+            suspectedBurnedOffline = true,
+            isCachedOfflineData = true,
+            alarmEpisodeId = 1001L,
+            telemetry = com.example.domain.model.SmartFireTelemetry(
+                gasRaw = 2600,
+                temperatureCelsius = 72.0f,
+                flame = true,
+                alarm = true,
+                receivedAt = 1000L
+            )
+        )
+        val room2 = SmartFireNode(
+            deviceId = "esp-room-2",
+            displayName = "Phòng Ngủ",
+            homeId = "home_main",
+            floorId = "floor_1",
+            roomId = "room_bed",
+            ipAddress = "192.168.1.151",
+            firmwareState = FirmwareState.NORMAL,
+            connectionState = DeviceConnectionState.ONLINE_FRESH,
+            lastKnownAlarm = false,
+            alarmEpisodeId = 0L,
+            telemetry = com.example.domain.model.SmartFireTelemetry(
+                gasRaw = 850,
+                temperatureCelsius = 28.0f,
+                flame = false,
+                alarm = false,
+                gasWarnThreshold = 1800,
+                gasOnThreshold = 2400,
+                receivedAt = 1000L
+            )
+        )
+        val room3 = SmartFireNode(
+            deviceId = "esp-room-3",
+            displayName = "Kho Hóa Chất",
+            homeId = "home_main",
+            floorId = "floor_1",
+            roomId = "room_storage",
+            ipAddress = "192.168.1.152",
+            firmwareState = FirmwareState.SUSPECTED,
+            connectionState = DeviceConnectionState.ONLINE_FRESH,
+            lastKnownAlarm = false,
+            alarmEpisodeId = 0L,
+            telemetry = com.example.domain.model.SmartFireTelemetry(
+                gasRaw = 1900,
+                temperatureCelsius = 47.0f,
+                flame = false,
+                alarm = false,
+                gasWarnThreshold = 1800,
+                gasOnThreshold = 2400,
+                receivedAt = 1000L
+            )
+        )
+
+        assertTrue(room1.isEffectivelyAlarming())
+        assertTrue(room1.suspectedBurnedOffline)
+        assertFalse(room2.isEffectivelyAlarming())
+        assertFalse(room2.isEffectivelyWarningLevel1())
+        assertFalse(room3.isEffectivelyAlarming())
+        assertTrue(room3.isEffectivelyWarningLevel1())
+    }
 }

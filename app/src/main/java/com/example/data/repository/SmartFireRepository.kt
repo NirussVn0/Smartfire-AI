@@ -39,8 +39,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.firstOrNull
@@ -50,6 +53,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.IOException
 import java.util.UUID
 
 class SmartFireRepository(context: Context) {
@@ -66,6 +70,10 @@ class SmartFireRepository(context: Context) {
     private val repositoryScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val prefs = context.getSharedPreferences("smartfire_settings", Context.MODE_PRIVATE)
+
+    init {
+        SmartFireHttpClientFactory.init(appContext)
+    }
 
     // --- SIMULATED LOGIN STATE (Giả lập đăng nhập đàng hoàng cho STEM của SOV labs.) ---
     private val _isLoggedIn = MutableStateFlow(prefs.getBoolean("is_logged_in_session", false))
@@ -110,7 +118,7 @@ class SmartFireRepository(context: Context) {
     private val _pollingIntervalMs = MutableStateFlow(prefs.getLong("polling_interval_ms", 1500L))
     val pollingIntervalMs: StateFlow<Long> = _pollingIntervalMs.asStateFlow()
 
-    private val _httpTimeoutSeconds = MutableStateFlow(prefs.getInt("http_timeout_sec", 2))
+    private val _httpTimeoutSeconds = MutableStateFlow(prefs.getInt("http_timeout_sec", 5).coerceIn(3, 15))
     val httpTimeoutSeconds: StateFlow<Int> = _httpTimeoutSeconds.asStateFlow()
 
     private val _phoneAlarmSoundEnabled = MutableStateFlow(prefs.getBoolean("phone_alarm_sound", true))
@@ -170,17 +178,181 @@ class SmartFireRepository(context: Context) {
         prefs.edit().putBoolean("level1_popup_enabled", enabled).apply()
     }
 
+    // --- PER-DEVICE MUTE, POPUP DISMISS, ALARM EPISODE & OFFLINE-DURING-FIRE STATE ---
+    private val _mutedUntilByDevice = MutableStateFlow<Map<String, Long>>(emptyMap())
+    val mutedUntilByDevice: StateFlow<Map<String, Long>> = _mutedUntilByDevice.asStateFlow()
+
+    private val _dismissedAlarmEpisodeByDevice = MutableStateFlow<Map<String, Long>>(emptyMap())
+    val dismissedAlarmEpisodeByDevice: StateFlow<Map<String, Long>> = _dismissedAlarmEpisodeByDevice.asStateFlow()
+
+    private val _offlineFireLatchedDevices = MutableStateFlow<Set<String>>(emptySet())
+    val offlineFireLatchedDevices: StateFlow<Set<String>> = _offlineFireLatchedDevices.asStateFlow()
+
+    private val _alertedAlarmEpisodeByDevice = MutableStateFlow<Map<String, Long>>(emptyMap())
+    val alertedAlarmEpisodeByDevice: StateFlow<Map<String, Long>> = _alertedAlarmEpisodeByDevice.asStateFlow()
+
+    private val _newlyTriggeredAlarmEvent = MutableSharedFlow<SmartFireNode>(extraBufferCapacity = 16)
+    val newlyTriggeredAlarmEvent: SharedFlow<SmartFireNode> = _newlyTriggeredAlarmEvent.asSharedFlow()
+
+    private val _cachedOfflineDevices = MutableStateFlow<Set<String>>(emptySet())
+    private val _alarmEpisodeByDevice = MutableStateFlow<Map<String, Long>>(emptyMap())
+
+    private val episodeLock = Any()
+    private var lastEpisodeId = 0L
+
+    private fun nextMonotonicEpisodeId(): Long = synchronized(episodeLock) {
+        val now = System.currentTimeMillis()
+        val next = if (now > lastEpisodeId) now else lastEpisodeId + 1L
+        lastEpisodeId = next
+        next
+    }
+
+    private fun updateAlarmEpisodeForDevice(
+        deviceId: String,
+        isAlarming: Boolean,
+        forceNewEpisode: Boolean = false
+    ): Long {
+        if (!isAlarming) {
+            if (_alarmEpisodeByDevice.value.containsKey(deviceId)) {
+                _alarmEpisodeByDevice.value = _alarmEpisodeByDevice.value - deviceId
+            }
+            if (_dismissedAlarmEpisodeByDevice.value.containsKey(deviceId)) {
+                _dismissedAlarmEpisodeByDevice.value = _dismissedAlarmEpisodeByDevice.value - deviceId
+            }
+            if (_alertedAlarmEpisodeByDevice.value.containsKey(deviceId)) {
+                _alertedAlarmEpisodeByDevice.value = _alertedAlarmEpisodeByDevice.value - deviceId
+            }
+            return 0L
+        }
+        val existing = _alarmEpisodeByDevice.value[deviceId] ?: 0L
+        if (!forceNewEpisode && existing > 0L) return existing
+        val nextId = nextMonotonicEpisodeId()
+        _alarmEpisodeByDevice.value = _alarmEpisodeByDevice.value + (deviceId to nextId)
+        return nextId
+    }
+
+    fun getAlarmEpisodeId(deviceId: String): Long = _alarmEpisodeByDevice.value[deviceId] ?: 0L
+
+    fun emitNewlyTriggeredAlarm(node: SmartFireNode) {
+        _newlyTriggeredAlarmEvent.tryEmit(node)
+    }
+
     // --- LOCAL DEVICE NOTIFICATION MUTE (auto-muted when user starts Fire/Exit Navigation) ---
     private val _localAlarmMutedUntilMs = MutableStateFlow(0L)
     val localAlarmMutedUntilMs: StateFlow<Long> = _localAlarmMutedUntilMs.asStateFlow()
 
+    fun muteDeviceLocally(deviceId: String, durationMs: Long = 30_000L) {
+        val until = System.currentTimeMillis() + durationMs.coerceIn(5_000L, 600_000L)
+        _mutedUntilByDevice.value = _mutedUntilByDevice.value + (deviceId to until)
+    }
+
+    fun unmuteDeviceLocally(deviceId: String) {
+        _mutedUntilByDevice.value = _mutedUntilByDevice.value - deviceId
+    }
+
+    fun isDeviceMutedNow(deviceId: String): Boolean {
+        val now = System.currentTimeMillis()
+        val deviceUntil = _mutedUntilByDevice.value[deviceId] ?: 0L
+        return now < deviceUntil
+    }
+
+    fun dismissAlarmPopupForDevice(deviceId: String, episodeId: Long) {
+        if (episodeId > 0L) {
+            _dismissedAlarmEpisodeByDevice.value = _dismissedAlarmEpisodeByDevice.value + (deviceId to episodeId)
+        }
+    }
+
+    fun markAlarmEpisodeAlerted(deviceId: String, episodeId: Long) {
+        if (episodeId > 0L) {
+            _alertedAlarmEpisodeByDevice.value = _alertedAlarmEpisodeByDevice.value + (deviceId to episodeId)
+        }
+    }
+
+    fun markDeviceOfflineDuringFire(deviceId: String) {
+        _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value + deviceId
+    }
+
+    suspend fun clearOfflineBurnedAlarm(deviceId: String) = withContext(Dispatchers.IO) {
+        _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - deviceId
+        _alarmEpisodeByDevice.value = _alarmEpisodeByDevice.value - deviceId
+        _dismissedAlarmEpisodeByDevice.value = _dismissedAlarmEpisodeByDevice.value - deviceId
+        _alertedAlarmEpisodeByDevice.value = _alertedAlarmEpisodeByDevice.value - deviceId
+
+        val currentTelem = _liveTelemetry.value[deviceId] ?: SmartFireTelemetry()
+        _liveTelemetry.value = _liveTelemetry.value + (
+            deviceId to currentTelem.copy(
+                state = "OFFLINE_RESET",
+                alarm = false,
+                flame = false,
+                hornRequested = false,
+                alarmStartedAtMs = 0L
+            )
+        )
+
+        val entity = dao.getDeviceById(deviceId)
+        if (entity != null) {
+            dao.updateDeviceTelemetryState(
+                deviceId = deviceId,
+                lastSeenAt = entity.lastSeenAt,
+                bootId = entity.bootId,
+                latestSeq = entity.latestSeq,
+                state = "OFFLINE_RESET",
+                alarm = false
+            )
+        }
+
+        _demoNodes.value = _demoNodes.value.map { n ->
+            if (n.deviceId == deviceId) {
+                n.copy(
+                    firmwareState = FirmwareState.UNKNOWN,
+                    lastKnownAlarm = false,
+                    suspectedBurnedOffline = false,
+                    alarmEpisodeId = 0L,
+                    telemetry = n.telemetry.copy(
+                        state = "OFFLINE_RESET",
+                        alarm = false,
+                        flame = false,
+                        hornRequested = false,
+                        alarmStartedAtMs = 0L
+                    )
+                )
+            } else n
+        }
+
+        notificationManager.cancelFireAlarmNotification(deviceId)
+    }
+
     fun muteLocalNotificationsTemporarily(durationMs: Long = 180_000L) {
-        _localAlarmMutedUntilMs.value = System.currentTimeMillis() + durationMs.coerceIn(15_000L, 600_000L)
+        val until = System.currentTimeMillis() + durationMs.coerceIn(15_000L, 600_000L)
+        _localAlarmMutedUntilMs.value = until
+
+        val activeIds = buildSet {
+            addAll(_alarmEpisodeByDevice.value.keys)
+            _liveTelemetry.value.forEach { (id, telem) ->
+                if (telem.alarm || telem.state.equals("ALARM", ignoreCase = true) || telem.state.equals("SUSPECTED", ignoreCase = true)) {
+                    add(id)
+                }
+            }
+            _demoNodes.value.forEach { node ->
+                if (node.lastKnownAlarm || node.telemetry.alarm || node.firmwareState == FirmwareState.ALARM || node.firmwareState == FirmwareState.SUSPECTED) {
+                    add(node.deviceId)
+                }
+            }
+        }
+        if (activeIds.isNotEmpty()) {
+            val updatedMap = _mutedUntilByDevice.value.toMutableMap()
+            activeIds.forEach { id ->
+                updatedMap[id] = until
+                notificationManager.cancelFireAlarmNotification(id)
+            }
+            _mutedUntilByDevice.value = updatedMap
+        }
         notificationManager.cancelFireAlarmNotification()
     }
 
     fun unmuteLocalNotifications() {
         _localAlarmMutedUntilMs.value = 0L
+        _mutedUntilByDevice.value = emptyMap()
     }
 
     fun isLocalNotificationMutedNow(): Boolean {
@@ -259,7 +431,8 @@ class SmartFireRepository(context: Context) {
         val node = devices.find { it.deviceId == deviceId }
             ?: return@withContext Result.failure(IllegalArgumentException("Không tìm thấy thiết bị $deviceId"))
 
-        if (_isDemoMode.value || node.isDemoSensor) {
+        val isDemoTarget = node.isDemoSensor || _demoNodes.value.any { it.deviceId == deviceId }
+        if (isDemoTarget) {
             _demoNodes.value = _demoNodes.value.map { n ->
                 if (n.deviceId == deviceId) {
                     val updatedTelem = n.telemetry.copy(
@@ -285,9 +458,11 @@ class SmartFireRepository(context: Context) {
                         com.example.domain.model.SensorAlertLevel.WARNING_LEVEL_1 -> "SUSPECTED"
                         com.example.domain.model.SensorAlertLevel.NORMAL -> "NORMAL"
                     }
+                    val ep = updateAlarmEpisodeForDevice(deviceId, isAlarm)
                     n.copy(
                         firmwareState = FirmwareState.fromString(newState),
                         lastKnownAlarm = isAlarm,
+                        alarmEpisodeId = ep,
                         telemetry = updatedTelem.copy(
                             state = newState,
                             alarm = isAlarm,
@@ -322,8 +497,30 @@ class SmartFireRepository(context: Context) {
                 txPower1m = normalized.txPower1m,
                 pathLossN = normalized.pathLossN
             )
-            val resp = service.pushConfig(dto)
+            val resp = SmartFireHttpClientFactory.withDeviceLock(node.ipAddress) {
+                service.pushConfig(dto)
+            }
             if (resp.isSuccessful && resp.body()?.applied == true) {
+                _liveTelemetry.value[deviceId]?.let { cur ->
+                    _liveTelemetry.value = _liveTelemetry.value + (
+                        deviceId to cur.copy(
+                            mq2Enabled = normalized.mq2Enabled,
+                            gasWarnThreshold = normalized.gasWarn,
+                            gasOnThreshold = normalized.gasOn,
+                            gasOffThreshold = normalized.gasOff,
+                            tempEnabled = normalized.tempEnabled,
+                            tempWarnC = normalized.tempWarnC,
+                            tempAlarmC = normalized.tempAlarmC,
+                            flameEnabled = normalized.flameEnabled,
+                            flameWarnMs = normalized.flameWarnMs,
+                            flameAlarmMs = normalized.flameAlarmMs,
+                            hornEnabled = normalized.hornEnabled,
+                            gasCommissioned = normalized.gasCommissioned,
+                            txPower1m = normalized.txPower1m,
+                            pathLossN = normalized.pathLossN
+                        )
+                    )
+                }
                 Result.success("Đã push cấu hình 2 mức lên ${node.displayName} (${node.ipAddress}) qua Wi-Fi")
             } else {
                 Result.failure(RuntimeException("ESP32 từ chối cấu hình (HTTP ${resp.code()}): ${resp.body()?.error ?: resp.message()}"))
@@ -368,7 +565,7 @@ class SmartFireRepository(context: Context) {
         val node = devices.find { it.deviceId == deviceId }
             ?: return@withContext Result.failure(IllegalArgumentException("Không tìm thấy thiết bị $deviceId"))
 
-        if (_isDemoMode.value || node.isDemoSensor) {
+        if (node.isDemoSensor || _demoNodes.value.any { it.deviceId == deviceId }) {
             delay(600L)
             return@withContext Result.success("OTA thành công lên ${node.displayName} [DEMO] ($fileName · ${firmwareBytes.size / 1024} KB)")
         }
@@ -383,7 +580,9 @@ class SmartFireRepository(context: Context) {
             val mediaType = okhttp3.MediaType.Companion.run { "application/octet-stream".toMediaTypeOrNull() }
             val reqBody = okhttp3.RequestBody.Companion.run { firmwareBytes.toRequestBody(mediaType) }
             val part = okhttp3.MultipartBody.Part.createFormData("firmware", fileName, reqBody)
-            val resp = service.uploadOtaFirmware(part)
+            val resp = SmartFireHttpClientFactory.withDeviceLock(node.ipAddress) {
+                service.uploadOtaFirmware(part)
+            }
             if (resp.isSuccessful && resp.body()?.ota == "ok") {
                 Result.success("OTA thành công (${firmwareBytes.size / 1024} KB)! ${node.displayName} đang khởi động lại...")
             } else {
@@ -407,7 +606,7 @@ class SmartFireRepository(context: Context) {
     }
 
     fun updateHttpTimeoutSeconds(value: Int) {
-        val clamped = value.coerceIn(1, 10)
+        val clamped = value.coerceIn(3, 15)
         _httpTimeoutSeconds.value = clamped
         prefs.edit().putInt("http_timeout_sec", clamped).apply()
     }
@@ -445,8 +644,68 @@ class SmartFireRepository(context: Context) {
     init {
         repositoryScope.launch {
             seedDefaultStructureIfEmpty()
+            hydrateCachedDeviceState()
             startDynamicMultiSensorEngine()
         }
+    }
+
+    private suspend fun hydrateCachedDeviceState() {
+        val dbDevices = dao.getAllDevices().firstOrNull() ?: emptyList()
+        if (dbDevices.isEmpty()) return
+
+        val hydratedTelem = _liveTelemetry.value.toMutableMap()
+        val hydratedConn = _liveConnectionState.value.toMutableMap()
+        val cachedOffline = _cachedOfflineDevices.value.toMutableSet()
+        val latchedOfflineFire = _offlineFireLatchedDevices.value.toMutableSet()
+
+        for (entity in dbDevices) {
+            val latestSnap = dao.getLatestSnapshotForDevice(entity.deviceId)
+            if (latestSnap != null && !hydratedTelem.containsKey(entity.deviceId)) {
+                val isDisarmed = latestSnap.state.equals("DISARMED", ignoreCase = true) ||
+                    entity.lastKnownState.equals("DISARMED", ignoreCase = true)
+                val isAlarm = (latestSnap.alarm || entity.lastKnownAlarm) && !isDisarmed
+                hydratedTelem[entity.deviceId] = SmartFireTelemetry(
+                    uptimeMs = latestSnap.uptimeMs,
+                    state = latestSnap.state.ifBlank { entity.lastKnownState.ifBlank { "NORMAL" } },
+                    gasRaw = latestSnap.gasRaw,
+                    flame = latestSnap.flame,
+                    gasReady = latestSnap.gasReady,
+                    gasFault = latestSnap.gasFault,
+                    alarm = isAlarm,
+                    muted = latestSnap.muted,
+                    acknowledged = latestSnap.acknowledged,
+                    testing = latestSnap.testing,
+                    disarmed = isDisarmed,
+                    hornRequested = latestSnap.hornRequested,
+                    hornEnabled = latestSnap.hornEnabled,
+                    gasCommissioned = latestSnap.gasCommissioned,
+                    alarmStartedAtMs = if (isAlarm) latestSnap.receivedAt else 0L,
+                    receivedAt = latestSnap.receivedAt
+                )
+            }
+
+            if (!hydratedConn.containsKey(entity.deviceId)) {
+                hydratedConn[entity.deviceId] = if (entity.lastSeenAt > 0L || latestSnap != null) {
+                    DeviceConnectionState.OFFLINE
+                } else {
+                    DeviceConnectionState.UNVERIFIED
+                }
+            }
+
+            if (entity.lastSeenAt > 0L || latestSnap != null) {
+                cachedOffline.add(entity.deviceId)
+            }
+
+            if (entity.lastKnownAlarm) {
+                latchedOfflineFire.add(entity.deviceId)
+                updateAlarmEpisodeForDevice(entity.deviceId, isAlarming = true)
+            }
+        }
+
+        _liveTelemetry.value = hydratedTelem
+        _liveConnectionState.value = hydratedConn
+        _cachedOfflineDevices.value = cachedOffline
+        _offlineFireLatchedDevices.value = latchedOfflineFire
     }
 
     /**
@@ -460,6 +719,9 @@ class SmartFireRepository(context: Context) {
             val now = System.currentTimeMillis()
             if (_isDemoMode.value) {
                 val updatedDemo = _demoNodes.value.map { node ->
+                    if (node.connectionState == DeviceConnectionState.OFFLINE) {
+                        return@map node
+                    }
                     val cur = node.telemetry
                     val isCurrentlyAlarm = node.lastKnownAlarm || cur.alarm
                     val jitterTemp = ((-3..4).random() * 0.1f)
@@ -522,18 +784,19 @@ class SmartFireRepository(context: Context) {
                         alarmStartedAtMs = alarmStart,
                         receivedAt = now
                     )
-                    val activeCfg = _savedEspConfig.value
+                    val activeCfg = node.effectiveConfig(_savedEspConfig.value)
                     val prob = candidateTelem.calculateFireProbability(_gasThresholdAdc.value, activeCfg).totalProbabilityPercent
                     val level = candidateTelem.evaluateTwoLevelStatus(activeCfg)
-                    val probAlarm = level == com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2 || prob >= 75f
+                    val probAlarm = !candidateTelem.disarmed && (level == com.example.domain.model.SensorAlertLevel.ALARM_LEVEL_2 || prob >= 75f)
                     val probState = when {
+                        candidateTelem.disarmed -> "DISARMED"
                         probAlarm -> "ALARM"
                         level == com.example.domain.model.SensorAlertLevel.WARNING_LEVEL_1 || prob >= 45f -> "SUSPECTED"
                         else -> "NORMAL"
                     }
                     val finalTelem = candidateTelem.copy(
                         alarm = probAlarm,
-                        flame = activeCfg.flameEnabled && (probAlarm || nextIr >= 0.65f),
+                        flame = activeCfg.flameEnabled && !candidateTelem.disarmed && (probAlarm || nextIr >= 0.65f),
                         hornRequested = probAlarm && !candidateTelem.muted,
                         state = probState,
                         alarmStartedAtMs = if (probAlarm) (if (alarmStart > 0L) alarmStart else now) else 0L
@@ -558,9 +821,11 @@ class SmartFireRepository(context: Context) {
                             gasCommissioned = true
                         )
                     )
+                    val epId = updateAlarmEpisodeForDevice(node.deviceId, probAlarm)
                     node.copy(
                         firmwareState = FirmwareState.fromString(probState),
                         lastKnownAlarm = probAlarm,
+                        alarmEpisodeId = epId,
                         telemetry = finalTelem
                     )
                 }
@@ -685,12 +950,15 @@ class SmartFireRepository(context: Context) {
             )
         )
 
-        if (_isDemoMode.value) {
+        val ep = updateAlarmEpisodeForDevice(deviceId, isAlarm)
+        val isDemoTarget = _isDemoMode.value && _demoNodes.value.any { it.deviceId == deviceId }
+        if (isDemoTarget) {
             _demoNodes.value = _demoNodes.value.map { n ->
                 if (n.deviceId == deviceId) {
                     n.copy(
                         firmwareState = FirmwareState.fromString(newState),
                         lastKnownAlarm = isAlarm,
+                        alarmEpisodeId = ep,
                         telemetry = finalTelem
                     )
                 } else n
@@ -879,61 +1147,138 @@ class SmartFireRepository(context: Context) {
     }
 
     // --- DEVICES ---
-    val allDevices: Flow<List<SmartFireNode>> = combine(
-        dao.getAllDevices(),
+    private data class NodeRuntimeOverlay(
+        val offlineLatched: Set<String>,
+        val cachedOffline: Set<String>,
+        val episodes: Map<String, Long>,
+        val cmdStatus: Map<String, CommandStatus>,
+        val cmdReqIds: Map<String, String>
+    )
+
+    private data class LiveRuntimeState(
+        val telemetryMap: Map<String, SmartFireTelemetry>,
+        val connMap: Map<String, DeviceConnectionState>,
+        val overlay: NodeRuntimeOverlay
+    )
+
+    private val runtimeOverlayFlow = combine(
+        _offlineFireLatchedDevices,
+        _cachedOfflineDevices,
+        _alarmEpisodeByDevice,
+        _liveCommandStatus,
+        _liveCommandRequestIds
+    ) { offlineLatched, cachedOffline, episodes, cmdStatus, cmdReqIds ->
+        NodeRuntimeOverlay(offlineLatched, cachedOffline, episodes, cmdStatus, cmdReqIds)
+    }
+
+    private val liveRuntimeStateFlow = combine(
         _liveTelemetry,
         _liveConnectionState,
+        runtimeOverlayFlow
+    ) { telemetryMap, connMap, overlay ->
+        LiveRuntimeState(telemetryMap, connMap, overlay)
+    }
+
+    val allDevices: Flow<List<SmartFireNode>> = combine(
+        dao.getAllDevices(),
+        liveRuntimeStateFlow,
         _isDemoMode,
         _demoNodes
-    ) { dbDevices, telemetryMap, connMap, isDemo, demoNodesList ->
+    ) { dbDevices, runtime, isDemo, demoNodesList ->
+        val telemetryMap = runtime.telemetryMap
+        val connMap = runtime.connMap
+        val overlay = runtime.overlay
+
+        val realDbNodes = dbDevices.map { entity ->
+            val isDemoFlag = entity.firmwareRoomId.startsWith("demo") ||
+                entity.firmwareRoomId.startsWith("sov-") ||
+                entity.displayName.contains("DEMO", ignoreCase = true)
+
+            val isDisarmedState = entity.lastKnownState.equals("DISARMED", ignoreCase = true)
+            val telem = telemetryMap[entity.deviceId] ?: SmartFireTelemetry(
+                gasRaw = if (entity.lastKnownAlarm) 2350 else 960,
+                temperatureCelsius = if (entity.lastKnownAlarm) 74.8f else 28.6f,
+                flame = entity.lastKnownAlarm,
+                gasReady = true,
+                alarm = entity.lastKnownAlarm && !isDisarmedState,
+                disarmed = isDisarmedState,
+                hornRequested = entity.lastKnownAlarm && !isDisarmedState,
+                hornEnabled = true,
+                state = entity.lastKnownState.ifBlank { "NORMAL" },
+                receivedAt = entity.lastSeenAt
+            )
+            val conn = connMap[entity.deviceId] ?: if (entity.lastSeenAt > 0L) {
+                DeviceConnectionState.OFFLINE
+            } else {
+                DeviceConnectionState.UNVERIFIED
+            }
+            val cmd = overlay.cmdStatus[entity.deviceId] ?: CommandStatus.IDLE
+            val reqId = overlay.cmdReqIds[entity.deviceId] ?: ""
+            val latchedOffline = entity.deviceId in overlay.offlineLatched
+            val cachedOffline = conn == DeviceConnectionState.OFFLINE &&
+                (entity.lastSeenAt > 0L || entity.deviceId in overlay.cachedOffline)
+            val epId = overlay.episodes[entity.deviceId]
+                ?: if (entity.lastKnownAlarm || telem.alarm) 1L else 0L
+
+            SmartFireNode(
+                deviceId = entity.deviceId,
+                displayName = entity.displayName,
+                homeId = entity.homeId,
+                floorId = entity.floorId,
+                roomId = entity.roomId,
+                firmwareRoomId = entity.firmwareRoomId,
+                ipAddress = entity.lastKnownIp,
+                lastSeenAt = entity.lastSeenAt,
+                bootId = entity.bootId,
+                latestSeq = entity.latestSeq,
+                firmwareState = FirmwareState.fromString(telem.state.ifBlank { entity.lastKnownState }),
+                connectionState = conn,
+                lastKnownAlarm = entity.lastKnownAlarm || telem.alarm,
+                telemetry = telem,
+                xNormalized = entity.xNormalized,
+                yNormalized = entity.yNormalized,
+                activeCommandStatus = cmd,
+                lastCommandRequestId = reqId,
+                isDemoSensor = isDemoFlag,
+                suspectedBurnedOffline = latchedOffline,
+                isCachedOfflineData = cachedOffline,
+                alarmEpisodeId = epId
+            )
+        }
+
         if (isDemo) {
-            demoNodesList
-        } else {
-            val cmdMap = _liveCommandStatus.value
-            val reqMap = _liveCommandRequestIds.value
-            dbDevices.map { entity ->
-                val isDemoFlag = entity.firmwareRoomId.startsWith("demo") ||
-                    entity.firmwareRoomId.startsWith("sov-") ||
-                    entity.displayName.contains("DEMO", ignoreCase = true)
-
-                val telem = telemetryMap[entity.deviceId] ?: SmartFireTelemetry(
-                    gasRaw = if (entity.lastKnownAlarm) 2350 else 960,
-                    temperatureCelsius = if (entity.lastKnownAlarm) 74.8f else 28.6f,
-                    flame = entity.lastKnownAlarm,
-                    gasReady = true,
-                    alarm = entity.lastKnownAlarm,
-                    hornRequested = entity.lastKnownAlarm,
-                    hornEnabled = true,
-                    state = entity.lastKnownState.ifBlank { "NORMAL" }
-                )
-                val conn = connMap[entity.deviceId] ?: DeviceConnectionState.ONLINE_FRESH
-                val cmd = cmdMap[entity.deviceId] ?: CommandStatus.IDLE
-                val reqId = reqMap[entity.deviceId] ?: ""
-
-                SmartFireNode(
-                    deviceId = entity.deviceId,
-                    displayName = entity.displayName,
-                    homeId = entity.homeId,
-                    floorId = entity.floorId,
-                    roomId = entity.roomId,
-                    firmwareRoomId = entity.firmwareRoomId,
-                    ipAddress = entity.lastKnownIp,
-                    lastSeenAt = entity.lastSeenAt,
-                    bootId = entity.bootId,
-                    latestSeq = entity.latestSeq,
-                    firmwareState = FirmwareState.fromString(telem.state.ifBlank { entity.lastKnownState }),
-                    connectionState = conn,
-                    lastKnownAlarm = entity.lastKnownAlarm || telem.alarm,
-                    telemetry = telem,
-                    xNormalized = entity.xNormalized,
-                    yNormalized = entity.yNormalized,
-                    activeCommandStatus = cmd,
-                    lastCommandRequestId = reqId,
-                    isDemoSensor = isDemoFlag
+            val hydratedDemoNodes = demoNodesList.map { d ->
+                d.copy(
+                    suspectedBurnedOffline = d.deviceId in overlay.offlineLatched,
+                    isCachedOfflineData = d.connectionState == DeviceConnectionState.OFFLINE && d.lastSeenAt > 0L,
+                    alarmEpisodeId = overlay.episodes[d.deviceId] ?: d.alarmEpisodeId
                 )
             }
+            (realDbNodes + hydratedDemoNodes).distinctBy { it.deviceId }
+        } else {
+            realDbNodes
         }
     }.flowOn(Dispatchers.IO)
+
+    suspend fun getAllDeviceEntitiesWithTokens(): List<Pair<DeviceEntity, String?>> = withContext(Dispatchers.IO) {
+        val entities = dao.getAllDevices().firstOrNull() ?: emptyList()
+        entities.map { entity -> entity to getDeviceToken(entity.deviceId) }
+    }
+
+    suspend fun importDeviceFromBackup(entity: DeviceEntity, token: String?) = withContext(Dispatchers.IO) {
+        dao.insertDevice(entity)
+        val cleanToken = token?.trim()
+        if (!cleanToken.isNullOrBlank()) {
+            try {
+                tokenStore.saveToken(entity.deviceId, cleanToken)
+            } catch (_: Throwable) {}
+        }
+        if (entity.deviceId !in _liveConnectionState.value) {
+            _liveConnectionState.value = _liveConnectionState.value + (
+                entity.deviceId to if (entity.lastSeenAt > 0L) DeviceConnectionState.OFFLINE else DeviceConnectionState.UNVERIFIED
+            )
+        }
+    }
 
     suspend fun registerDevice(
         deviceId: String,
@@ -947,44 +1292,98 @@ class SmartFireRepository(context: Context) {
         yNormalized: Float = 0.5f,
         isDemo: Boolean = false
     ): Result<Unit> = withContext(Dispatchers.IO) {
-        val cleanId = deviceId.trim().ifBlank { "smartfire-node-${UUID.randomUUID().toString().take(4)}" }
+        var cleanId = deviceId.trim().ifBlank {
+            if (isDemo) "smartfire-demo-${UUID.randomUUID().toString().take(6)}"
+            else "smartfire-node-${UUID.randomUUID().toString().take(4)}"
+        }
+        if (isDemo) {
+            val existing = dao.getDeviceById(cleanId)
+            val existingIsDemo = existing != null && (
+                existing.firmwareRoomId.startsWith("demo") ||
+                    existing.firmwareRoomId.startsWith("sov-") ||
+                    existing.displayName.contains("DEMO", ignoreCase = true)
+                )
+            if (existing != null && !existingIsDemo) {
+                cleanId = "smartfire-demo-${UUID.randomUUID().toString().take(6)}"
+            }
+            if (_demoNodes.value.any { it.deviceId == cleanId }) {
+                cleanId = "smartfire-demo-${UUID.randomUUID().toString().take(6)}"
+            }
+        }
+
         val rawName = displayName.trim().ifBlank { cleanId }
         val cleanName = if (isDemo && !rawName.contains("[DEMO]", ignoreCase = true)) "[DEMO] $rawName" else rawName
         val cleanIp = ipAddress.trim().ifBlank { "192.168.1.150" }
         val cleanToken = token.trim().ifBlank { DEFAULT_TOKEN }
 
-        if (_isDemoMode.value) {
-            val newNode = SmartFireNode(
+        if (isDemo) {
+            if (_isDemoMode.value) {
+                val now = System.currentTimeMillis()
+                val newNode = SmartFireNode(
+                    deviceId = cleanId,
+                    displayName = cleanName,
+                    homeId = homeId,
+                    floorId = floorId,
+                    roomId = roomId,
+                    firmwareRoomId = "demo-node",
+                    ipAddress = cleanIp,
+                    lastSeenAt = now,
+                    bootId = "boot-${UUID.randomUUID().toString().take(4)}",
+                    latestSeq = 1L,
+                    firmwareState = FirmwareState.NORMAL,
+                    connectionState = DeviceConnectionState.ONLINE_FRESH,
+                    lastKnownAlarm = false,
+                    telemetry = SmartFireTelemetry(
+                        uptimeMs = 60_000L,
+                        gasRaw = 940,
+                        temperatureCelsius = 28.4f,
+                        flame = false,
+                        gasReady = true,
+                        alarm = false,
+                        hornEnabled = true,
+                        gasCommissioned = true,
+                        state = "NORMAL",
+                        receivedAt = now
+                    ),
+                    xNormalized = xNormalized,
+                    yNormalized = yNormalized,
+                    isDemoSensor = true
+                )
+                _demoNodes.value = _demoNodes.value + newNode
+                return@withContext Result.success(Unit)
+            }
+
+            val demoEntity = DeviceEntity(
                 deviceId = cleanId,
                 displayName = cleanName,
                 homeId = homeId,
                 floorId = floorId,
                 roomId = roomId,
-                firmwareRoomId = if (isDemo) "demo-node" else "user-node",
-                ipAddress = cleanIp,
-                lastSeenAt = System.currentTimeMillis(),
-                bootId = "boot-${UUID.randomUUID().toString().take(4)}",
-                latestSeq = 1L,
-                firmwareState = FirmwareState.NORMAL,
-                connectionState = DeviceConnectionState.ONLINE_FRESH,
+                firmwareRoomId = "demo-node",
+                lastKnownIp = cleanIp,
+                lastSeenAt = 0L,
+                bootId = "boot-demo",
+                latestSeq = 0L,
+                lastKnownState = "NORMAL",
                 lastKnownAlarm = false,
-                telemetry = SmartFireTelemetry(
-                    uptimeMs = 60_000L,
-                    gasRaw = 940,
-                    temperatureCelsius = 28.4f,
-                    flame = false,
-                    gasReady = true,
-                    alarm = false,
-                    hornEnabled = true,
-                    gasCommissioned = true,
-                    state = "NORMAL",
-                    receivedAt = System.currentTimeMillis()
-                ),
                 xNormalized = xNormalized,
-                yNormalized = yNormalized,
-                isDemoSensor = isDemo || cleanName.contains("DEMO", ignoreCase = true)
+                yNormalized = yNormalized
             )
-            _demoNodes.value = _demoNodes.value + newNode
+            dao.insertDevice(demoEntity)
+            _liveTelemetry.value = _liveTelemetry.value + (cleanId to SmartFireTelemetry(
+                uptimeMs = 60_000L,
+                gasRaw = 940,
+                temperatureCelsius = 28.4f,
+                flame = false,
+                gasReady = true,
+                alarm = false,
+                hornEnabled = true,
+                gasCommissioned = true,
+                state = "NORMAL",
+                receivedAt = System.currentTimeMillis()
+            ))
+            _liveConnectionState.value = _liveConnectionState.value + (cleanId to DeviceConnectionState.ONLINE_FRESH)
+            return@withContext Result.success(Unit)
         }
 
         try {
@@ -995,8 +1394,11 @@ class SmartFireRepository(context: Context) {
 
         // Attempt live HTTP check first, but fallback gracefully to local registration if ESP32 is offline
         try {
-            val service = SmartFireHttpClientFactory.getService(cleanIp, cleanToken)
-            val response = service.getStatus()
+            val timeoutSec = _httpTimeoutSeconds.value
+            val service = SmartFireHttpClientFactory.getService(cleanIp, cleanToken, timeoutSec)
+            val response = SmartFireHttpClientFactory.withDeviceLock(cleanIp) {
+                service.getStatus()
+            }
             val body = response.body()
             if (response.isSuccessful && body != null) {
                 val finalId = body.deviceId.ifBlank { cleanId }
@@ -1011,7 +1413,7 @@ class SmartFireRepository(context: Context) {
                     homeId = homeId,
                     floorId = floorId,
                     roomId = roomId,
-                    firmwareRoomId = body.roomId ?: (if (isDemo) "demo-node" else "user-node"),
+                    firmwareRoomId = body.roomId ?: "user-node",
                     lastKnownIp = cleanIp,
                     lastSeenAt = now,
                     bootId = body.bootId,
@@ -1022,7 +1424,7 @@ class SmartFireRepository(context: Context) {
                     yNormalized = yNormalized
                 )
                 dao.insertDevice(entity)
-                _liveTelemetry.value = _liveTelemetry.value + (finalId to SmartFireTelemetry(
+                val telemetry = SmartFireTelemetry(
                     uptimeMs = st.uptimeMs,
                     temperatureCelsius = st.temperatureCelsius,
                     humidityPercent = st.humidityPercent,
@@ -1038,13 +1440,29 @@ class SmartFireRepository(context: Context) {
                     muted = st.muted,
                     acknowledged = st.acknowledged,
                     testing = st.testing,
+                    disarmed = st.disarmed,
                     hornRequested = st.hornRequested,
                     hornEnabled = st.hornEnabled,
                     gasCommissioned = st.gasCommissioned,
                     state = st.state.ifBlank { "NORMAL" },
                     receivedAt = now
-                ))
+                )
+                _liveTelemetry.value = _liveTelemetry.value + (finalId to telemetry)
                 _liveConnectionState.value = _liveConnectionState.value + (finalId to DeviceConnectionState.ONLINE_FRESH)
+                _cachedOfflineDevices.value = _cachedOfflineDevices.value - finalId
+                _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - finalId
+                val regNode = SmartFireNode(
+                    deviceId = finalId,
+                    displayName = cleanName,
+                    homeId = homeId,
+                    floorId = floorId,
+                    roomId = roomId,
+                    ipAddress = cleanIp,
+                    firmwareState = FirmwareState.fromString(telemetry.state),
+                    lastKnownAlarm = st.alarm,
+                    telemetry = telemetry
+                )
+                updateAlarmEpisodeForDevice(finalId, regNode.isEffectivelyAlarming(_savedEspConfig.value))
                 return@withContext Result.success(Unit)
             }
         } catch (_: Throwable) {
@@ -1057,7 +1475,7 @@ class SmartFireRepository(context: Context) {
             homeId = homeId,
             floorId = floorId,
             roomId = roomId,
-            firmwareRoomId = if (isDemo) "demo-node" else "user-node",
+            firmwareRoomId = "user-node",
             lastKnownIp = cleanIp,
             lastSeenAt = 0L,
             bootId = "",
@@ -1127,6 +1545,12 @@ class SmartFireRepository(context: Context) {
         _demoNodes.value = _demoNodes.value.filterNot { it.deviceId == deviceId }
         _liveTelemetry.value = _liveTelemetry.value - deviceId
         _liveConnectionState.value = _liveConnectionState.value - deviceId
+        _mutedUntilByDevice.value = _mutedUntilByDevice.value - deviceId
+        _dismissedAlarmEpisodeByDevice.value = _dismissedAlarmEpisodeByDevice.value - deviceId
+        _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - deviceId
+        _alertedAlarmEpisodeByDevice.value = _alertedAlarmEpisodeByDevice.value - deviceId
+        _cachedOfflineDevices.value = _cachedOfflineDevices.value - deviceId
+        _alarmEpisodeByDevice.value = _alarmEpisodeByDevice.value - deviceId
     }
 
     fun getDeviceToken(deviceId: String): String? = try {
@@ -1145,6 +1569,26 @@ class SmartFireRepository(context: Context) {
     ) = withContext(Dispatchers.IO) {
         _liveTelemetry.value = _liveTelemetry.value + (deviceId to telemetry)
         _liveConnectionState.value = _liveConnectionState.value + (deviceId to connState)
+        _cachedOfflineDevices.value = _cachedOfflineDevices.value - deviceId
+        _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - deviceId
+
+        val deviceEntity = dao.getDeviceById(deviceId)
+        val deviceName = deviceEntity?.displayName ?: deviceId
+        val evalNode = SmartFireNode(
+            deviceId = deviceId,
+            displayName = deviceName,
+            homeId = deviceEntity?.homeId ?: "",
+            floorId = deviceEntity?.floorId ?: "",
+            roomId = deviceEntity?.roomId ?: "",
+            ipAddress = deviceEntity?.lastKnownIp ?: "",
+            firmwareState = FirmwareState.fromString(telemetry.state),
+            connectionState = connState,
+            lastKnownAlarm = telemetry.alarm,
+            telemetry = telemetry,
+            isDemoSensor = false
+        )
+        val isAlarming = evalNode.isEffectivelyAlarming(_savedEspConfig.value)
+        updateAlarmEpisodeForDevice(deviceId, isAlarming)
 
         // Persist snapshot
         dao.insertSnapshot(
@@ -1183,9 +1627,10 @@ class SmartFireRepository(context: Context) {
             dao.pruneOldSnapshots(deviceId)
         }
 
-        // Run local analytics
+        // Run local analytics (delete stale insights for this device before inserting fresh ones)
         val recentSnapshots = dao.getSnapshotsSince(deviceId, System.currentTimeMillis() - 3600_000L)
-        val insights = LocalAnalyticsEngine.analyzeSnapshots(deviceId, deviceId, recentSnapshots)
+        val insights = LocalAnalyticsEngine.analyzeSnapshots(deviceId, deviceName, recentSnapshots)
+        dao.deleteInsightsForDevice(deviceId)
         insights.forEach { ins ->
             dao.insertInsight(
                 AnalysisInsightEntity(
@@ -1212,20 +1657,31 @@ class SmartFireRepository(context: Context) {
         deviceId: String,
         commandType: String // "ack", "silence", "test", "disarm", "arm"
     ): Result<String> = withContext(Dispatchers.IO) {
-        when (commandType.lowercase()) {
+        val cmdLower = commandType.lowercase()
+        when (cmdLower) {
             "silence" -> {
-                muteLocalNotificationsTemporarily(30_000L)
-                notificationManager.cancelAllAlertNotifications()
+                muteDeviceLocally(deviceId, 30_000L)
+                notificationManager.cancelFireAlarmNotification(deviceId)
             }
             "disarm" -> {
-                muteLocalNotificationsTemporarily(300_000L)
-                notificationManager.cancelAllAlertNotifications()
+                muteDeviceLocally(deviceId, 300_000L)
+                notificationManager.cancelFireAlarmNotification(deviceId)
             }
             "arm" -> {
-                unmuteLocalNotifications()
+                unmuteDeviceLocally(deviceId)
+                _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - deviceId
+            }
+            "test" -> {
+                unmuteDeviceLocally(deviceId)
+                _localAlarmMutedUntilMs.value = 0L
+                _dismissedAlarmEpisodeByDevice.value = _dismissedAlarmEpisodeByDevice.value - deviceId
+                _alertedAlarmEpisodeByDevice.value = _alertedAlarmEpisodeByDevice.value - deviceId
+                _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - deviceId
             }
         }
-        if (_isDemoMode.value) {
+
+        val isDemoTarget = _isDemoMode.value && _demoNodes.value.any { it.deviceId == deviceId }
+        if (isDemoTarget) {
             handleDemoCommand(deviceId, commandType)
             return@withContext Result.success("Lệnh mô phỏng đã thực thi")
         }
@@ -1235,10 +1691,18 @@ class SmartFireRepository(context: Context) {
         val now = System.currentTimeMillis()
 
         if (device != null) {
+            if (device.lastKnownIp.isBlank()) {
+                _liveCommandStatus.value = _liveCommandStatus.value + (deviceId to CommandStatus.UNKNOWN_OUTCOME)
+                return@withContext Result.failure(IllegalStateException("Thiết bị chưa có địa chỉ IP LAN"))
+            }
             try {
                 _liveCommandStatus.value = _liveCommandStatus.value + (deviceId to CommandStatus.PENDING)
-                val service = SmartFireHttpClientFactory.getService(device.lastKnownIp, token)
-                val response = when (commandType.lowercase()) {
+                val service = SmartFireHttpClientFactory.getService(
+                    ipAddress = device.lastKnownIp,
+                    bearerToken = token,
+                    timeoutSeconds = _httpTimeoutSeconds.value
+                )
+                suspend fun dispatchOnce() = when (cmdLower) {
                     "ack" -> service.sendAcknowledge()
                     "silence" -> service.sendSilence()
                     "test" -> service.sendTest()
@@ -1247,11 +1711,23 @@ class SmartFireRepository(context: Context) {
                     else -> null
                 }
 
+                val response = SmartFireHttpClientFactory.withDeviceLock(device.lastKnownIp) {
+                    try {
+                        dispatchOnce()
+                    } catch (_: IOException) {
+                        delay(150L)
+                        dispatchOnce()
+                    }
+                }
+
                 if (response != null && response.code() == 202) {
                     val body = response.body()
                     val reqId = body?.requestIdString?.ifBlank { null } ?: "req_$now"
                     _liveCommandRequestIds.value = _liveCommandRequestIds.value + (deviceId to reqId)
                     _liveCommandStatus.value = _liveCommandStatus.value + (deviceId to CommandStatus.PENDING)
+                    if (cmdLower == "test") {
+                        updateAlarmEpisodeForDevice(deviceId, isAlarming = true, forceNewEpisode = true)
+                    }
                     return@withContext Result.success(reqId)
                 } else {
                     _liveCommandStatus.value = _liveCommandStatus.value + (deviceId to CommandStatus.UNKNOWN_OUTCOME)
@@ -1273,33 +1749,8 @@ class SmartFireRepository(context: Context) {
 
     // --- EVENTS ---
     fun getEventsForDevice(deviceId: String): Flow<List<DeviceEvent>> {
-        return if (_isDemoMode.value) {
-            _demoEvents.map { it.filter { ev -> ev.deviceId == deviceId } }
-        } else {
-            dao.getEventsForDevice(deviceId).map { list ->
-                list.map {
-                    DeviceEvent(
-                        id = it.id,
-                        deviceId = it.deviceId,
-                        bootId = it.bootId,
-                        seq = it.seq,
-                        receivedAt = it.receivedAt,
-                        kind = it.kind,
-                        requestId = it.requestId,
-                        result = it.result,
-                        state = it.state,
-                        rawPayload = it.rawPayload
-                    )
-                }
-            }
-        }
-    }
-
-    val allEvents: Flow<List<DeviceEvent>> = combine(dao.getAllEvents(), _isDemoMode, _demoEvents) { dbEvents, isDemo, demoList ->
-        if (isDemo) {
-            demoList
-        } else {
-            dbEvents.map {
+        return combine(dao.getEventsForDevice(deviceId), _isDemoMode, _demoEvents) { dbList, isDemo, demoList ->
+            val mappedDb = dbList.map {
                 DeviceEvent(
                     id = it.id,
                     deviceId = it.deviceId,
@@ -1313,6 +1764,37 @@ class SmartFireRepository(context: Context) {
                     rawPayload = it.rawPayload
                 )
             }
+            if (isDemo) {
+                (demoList.filter { ev -> ev.deviceId == deviceId } + mappedDb)
+                    .distinctBy { Triple(it.deviceId, it.bootId, it.seq) }
+                    .sortedByDescending { it.receivedAt }
+            } else {
+                mappedDb
+            }
+        }.flowOn(Dispatchers.IO)
+    }
+
+    val allEvents: Flow<List<DeviceEvent>> = combine(dao.getAllEvents(), _isDemoMode, _demoEvents) { dbEvents, isDemo, demoList ->
+        val mappedDb = dbEvents.map {
+            DeviceEvent(
+                id = it.id,
+                deviceId = it.deviceId,
+                bootId = it.bootId,
+                seq = it.seq,
+                receivedAt = it.receivedAt,
+                kind = it.kind,
+                requestId = it.requestId,
+                result = it.result,
+                state = it.state,
+                rawPayload = it.rawPayload
+            )
+        }
+        if (isDemo) {
+            (demoList + mappedDb)
+                .distinctBy { Triple(it.deviceId, it.bootId, it.seq) }
+                .sortedByDescending { it.receivedAt }
+        } else {
+            mappedDb
         }
     }.flowOn(Dispatchers.IO)
 
@@ -1538,23 +2020,26 @@ class SmartFireRepository(context: Context) {
 
     // --- INSIGHTS ---
     val allInsights: Flow<List<AiInsight>> = combine(dao.getAllInsights(), _isDemoMode, _demoInsights) { dbInsights, isDemo, demoList ->
-        if (isDemo && demoList.isNotEmpty()) {
-            demoList
+        val mappedDb = dbInsights.map {
+            AiInsight(
+                id = it.id,
+                deviceId = it.deviceId,
+                title = it.title,
+                explanation = it.explanation,
+                sourceMeasurements = it.sourceMeasurements,
+                analysisMethod = it.analysisMethod,
+                freshness = it.freshness,
+                severity = it.severity,
+                recommendation = it.recommendation,
+                timestamp = it.timestamp
+            )
+        }
+        if (isDemo) {
+            (demoList + mappedDb)
+                .distinctBy { "${it.deviceId}::${it.title}" }
+                .sortedByDescending { it.timestamp }
         } else {
-            dbInsights.map {
-                AiInsight(
-                    id = it.id,
-                    deviceId = it.deviceId,
-                    title = it.title,
-                    explanation = it.explanation,
-                    sourceMeasurements = it.sourceMeasurements,
-                    analysisMethod = it.analysisMethod,
-                    freshness = it.freshness,
-                    severity = it.severity,
-                    recommendation = it.recommendation,
-                    timestamp = it.timestamp
-                )
-            }
+            mappedDb
         }
     }.flowOn(Dispatchers.IO)
 
@@ -1563,13 +2048,23 @@ class SmartFireRepository(context: Context) {
         _isDemoMode.value = active
         if (active) {
             initializeDemoScenario()
+        } else {
+            val demoIds = _demoNodes.value.map { it.deviceId }.toSet()
+            if (demoIds.isNotEmpty()) {
+                _alarmEpisodeByDevice.value = _alarmEpisodeByDevice.value - demoIds
+                _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - demoIds
+                _dismissedAlarmEpisodeByDevice.value = _dismissedAlarmEpisodeByDevice.value - demoIds
+                _alertedAlarmEpisodeByDevice.value = _alertedAlarmEpisodeByDevice.value - demoIds
+            }
         }
     }
 
     private fun initializeDemoScenario() {
         val now = System.currentTimeMillis()
+        val ep2 = updateAlarmEpisodeForDevice("demo-sov-02", isAlarming = true)
+
         val node1 = SmartFireNode(
-            deviceId = "smartfire-node-01",
+            deviceId = "demo-sov-01",
             displayName = "[DEMO] Cảm biến Khu Vực A (SOV Lab)",
             homeId = "demo_home",
             floorId = "floor_1",
@@ -1584,6 +2079,7 @@ class SmartFireRepository(context: Context) {
             lastKnownAlarm = false,
             telemetry = SmartFireTelemetry(
                 uptimeMs = 345000L,
+                state = "NORMAL",
                 gasRaw = 1040,
                 temperatureCelsius = 28.6f,
                 flame = false,
@@ -1600,7 +2096,7 @@ class SmartFireRepository(context: Context) {
         )
 
         val node2 = SmartFireNode(
-            deviceId = "smartfire-node-02",
+            deviceId = "demo-sov-02",
             displayName = "[DEMO] Cảm biến Khu Vực B (Kho Hóa Chất)",
             homeId = "demo_home",
             floorId = "floor_1",
@@ -1615,6 +2111,8 @@ class SmartFireRepository(context: Context) {
             lastKnownAlarm = true,
             telemetry = SmartFireTelemetry(
                 uptimeMs = 890000L,
+                state = "ALARM",
+                alarmStartedAtMs = now,
                 gasRaw = 2240,
                 temperatureCelsius = 76.5f,
                 flame = true,
@@ -1628,11 +2126,12 @@ class SmartFireRepository(context: Context) {
             ),
             xNormalized = 0.72f,
             yNormalized = 0.32f,
-            isDemoSensor = true
+            isDemoSensor = true,
+            alarmEpisodeId = ep2
         )
 
         val node3 = SmartFireNode(
-            deviceId = "smartfire-node-03",
+            deviceId = "demo-sov-03",
             displayName = "[DEMO] Cảm biến Hành Lang Chính",
             homeId = "demo_home",
             floorId = "floor_1",
@@ -1647,6 +2146,7 @@ class SmartFireRepository(context: Context) {
             lastKnownAlarm = false,
             telemetry = SmartFireTelemetry(
                 uptimeMs = 12000L,
+                state = "WARMING",
                 gasRaw = 890,
                 temperatureCelsius = 27.9f,
                 flame = false,
@@ -1667,7 +2167,7 @@ class SmartFireRepository(context: Context) {
         _demoEvents.value = listOf(
             DeviceEvent(
                 id = 1,
-                deviceId = "smartfire-node-02",
+                deviceId = "demo-sov-02",
                 bootId = "boot-stem-02",
                 seq = 24,
                 receivedAt = now,
@@ -1678,7 +2178,7 @@ class SmartFireRepository(context: Context) {
             ),
             DeviceEvent(
                 id = 2,
-                deviceId = "smartfire-node-02",
+                deviceId = "demo-sov-02",
                 bootId = "boot-stem-02",
                 seq = 23,
                 receivedAt = now - 15000L,
@@ -1689,7 +2189,7 @@ class SmartFireRepository(context: Context) {
             ),
             DeviceEvent(
                 id = 3,
-                deviceId = "smartfire-node-01",
+                deviceId = "demo-sov-01",
                 bootId = "boot-stem-01",
                 seq = 12,
                 receivedAt = now - 30000L,
@@ -1703,7 +2203,7 @@ class SmartFireRepository(context: Context) {
         _demoInsights.value = listOf(
             AiInsight(
                 id = 1,
-                deviceId = "smartfire-node-02",
+                deviceId = "demo-sov-02",
                 title = "CẢNH BÁO: Phát hiện ngọn lửa, nhiệt độ 76.5°C và khí gas tăng tại Khu Vực B",
                 explanation = "Cảm biến nhiệt độ vượt 70°C, Flame Sensor DO=true và MQ-2 ADC raw tăng lên 2240.",
                 sourceMeasurements = "Temp=76.5°C, Flame=Active, MQ-2=2240 ADC",
@@ -1720,60 +2220,81 @@ class SmartFireRepository(context: Context) {
         val current = _demoNodes.value.toMutableList()
         when (scenario) {
             "KITCHEN_ALARM" -> {
-                val idx = current.indexOfFirst { it.deviceId == "smartfire-node-02" }
+                val idx = current.indexOfFirst { it.deviceId == "demo-sov-02" }
                 if (idx >= 0) {
                     val n = current[idx]
-                    current[idx] = n.copy(
+                    _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - n.deviceId
+                    _dismissedAlarmEpisodeByDevice.value = _dismissedAlarmEpisodeByDevice.value - n.deviceId
+                    _alertedAlarmEpisodeByDevice.value = _alertedAlarmEpisodeByDevice.value - n.deviceId
+                    unmuteDeviceLocally(n.deviceId)
+                    val ep = updateAlarmEpisodeForDevice(n.deviceId, isAlarming = true, forceNewEpisode = true)
+                    val updated = n.copy(
                         firmwareState = FirmwareState.ALARM,
                         connectionState = DeviceConnectionState.ONLINE_FRESH,
                         lastKnownAlarm = true,
+                        suspectedBurnedOffline = false,
+                        alarmEpisodeId = ep,
                         telemetry = n.telemetry.copy(
+                            state = "ALARM",
                             alarm = true,
                             flame = true,
                             gasRaw = 2500,
                             temperatureCelsius = 78.4f,
+                            alarmStartedAtMs = now,
                             receivedAt = now
                         )
                     )
+                    current[idx] = updated
+                    emitNewlyTriggeredAlarm(updated)
                 }
             }
             "DISCONNECT_DURING_ALARM" -> {
-                val idx = current.indexOfFirst { it.deviceId == "smartfire-node-02" }
+                val idx = current.indexOfFirst { it.deviceId == "demo-sov-02" }
                 if (idx >= 0) {
                     val n = current[idx]
+                    markDeviceOfflineDuringFire(n.deviceId)
                     current[idx] = n.copy(
                         connectionState = DeviceConnectionState.OFFLINE,
-                        lastKnownAlarm = true
+                        lastKnownAlarm = true,
+                        suspectedBurnedOffline = true
                     )
                 }
             }
             "CLEAR_NORMAL" -> {
-                val idx = current.indexOfFirst { it.deviceId == "smartfire-node-02" }
+                val idx = current.indexOfFirst { it.deviceId == "demo-sov-02" }
                 if (idx >= 0) {
                     val n = current[idx]
+                    _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - n.deviceId
+                    updateAlarmEpisodeForDevice(n.deviceId, isAlarming = false)
                     current[idx] = n.copy(
                         firmwareState = FirmwareState.NORMAL,
                         connectionState = DeviceConnectionState.ONLINE_FRESH,
                         lastKnownAlarm = false,
+                        suspectedBurnedOffline = false,
+                        alarmEpisodeId = 0L,
                         telemetry = n.telemetry.copy(
+                            state = "NORMAL",
                             alarm = false,
                             flame = false,
                             gasRaw = 950,
                             temperatureCelsius = 28.5f,
+                            alarmStartedAtMs = 0L,
                             receivedAt = now
                         )
                     )
                 }
             }
             "SIMULATE_REBOOT" -> {
-                val idx = current.indexOfFirst { it.deviceId == "smartfire-node-01" }
+                val idx = current.indexOfFirst { it.deviceId == "demo-sov-01" }
                 if (idx >= 0) {
                     val n = current[idx]
+                    updateAlarmEpisodeForDevice(n.deviceId, isAlarming = false)
                     current[idx] = n.copy(
                         bootId = "boot-new-${UUID.randomUUID().toString().take(6)}",
                         latestSeq = 1,
                         firmwareState = FirmwareState.WARMING,
-                        telemetry = n.telemetry.copy(uptimeMs = 1500, gasReady = false)
+                        alarmEpisodeId = 0L,
+                        telemetry = n.telemetry.copy(uptimeMs = 1500, state = "WARMING", gasReady = false)
                     )
                 }
             }
@@ -1786,6 +2307,7 @@ class SmartFireRepository(context: Context) {
         val idx = current.indexOfFirst { it.deviceId == deviceId }
         if (idx >= 0) {
             val node = current[idx]
+            val now = System.currentTimeMillis()
             when (commandType.lowercase()) {
                 "ack" -> {
                     current[idx] = node.copy(
@@ -1794,24 +2316,30 @@ class SmartFireRepository(context: Context) {
                     )
                 }
                 "silence" -> {
+                    updateAlarmEpisodeForDevice(deviceId, isAlarming = false)
                     current[idx] = node.copy(
                         firmwareState = FirmwareState.NORMAL,
                         lastKnownAlarm = false,
+                        alarmEpisodeId = 0L,
                         telemetry = node.telemetry.copy(
+                            state = "NORMAL",
                             alarm = false,
                             flame = false,
                             muted = true,
                             hornRequested = false,
                             gasRaw = 960,
-                            temperatureCelsius = 28.6f
+                            temperatureCelsius = 28.6f,
+                            alarmStartedAtMs = 0L
                         ),
                         activeCommandStatus = CommandStatus.APPLIED
                     )
                 }
                 "test" -> {
-                    current[idx] = node.copy(
+                    val ep = updateAlarmEpisodeForDevice(deviceId, isAlarming = true, forceNewEpisode = true)
+                    val updated = node.copy(
                         firmwareState = FirmwareState.ALARM,
                         lastKnownAlarm = true,
+                        alarmEpisodeId = ep,
                         telemetry = node.telemetry.copy(
                             testing = true,
                             disarmed = false,
@@ -1820,15 +2348,21 @@ class SmartFireRepository(context: Context) {
                             hornRequested = true,
                             gasRaw = 2280,
                             temperatureCelsius = 77.2f,
-                            state = "ALARM"
+                            state = "ALARM",
+                            alarmStartedAtMs = now,
+                            receivedAt = now
                         ),
                         activeCommandStatus = CommandStatus.APPLIED
                     )
+                    current[idx] = updated
+                    emitNewlyTriggeredAlarm(updated)
                 }
                 "disarm" -> {
+                    updateAlarmEpisodeForDevice(deviceId, isAlarming = false)
                     current[idx] = node.copy(
                         firmwareState = FirmwareState.DISARMED,
                         lastKnownAlarm = false,
+                        alarmEpisodeId = 0L,
                         telemetry = node.telemetry.copy(
                             disarmed = true,
                             alarm = false,
@@ -1836,15 +2370,20 @@ class SmartFireRepository(context: Context) {
                             muted = false,
                             testing = false,
                             hornRequested = false,
-                            state = "DISARMED"
+                            state = "DISARMED",
+                            alarmStartedAtMs = 0L
                         ),
                         activeCommandStatus = CommandStatus.APPLIED
                     )
                 }
                 "arm" -> {
+                    _offlineFireLatchedDevices.value = _offlineFireLatchedDevices.value - deviceId
+                    updateAlarmEpisodeForDevice(deviceId, isAlarming = false)
                     current[idx] = node.copy(
                         firmwareState = FirmwareState.NORMAL,
                         lastKnownAlarm = false,
+                        suspectedBurnedOffline = false,
+                        alarmEpisodeId = 0L,
                         telemetry = node.telemetry.copy(
                             disarmed = false,
                             alarm = false,
@@ -1854,7 +2393,8 @@ class SmartFireRepository(context: Context) {
                             hornRequested = false,
                             gasRaw = 920,
                             temperatureCelsius = 28.5f,
-                            state = "NORMAL"
+                            state = "NORMAL",
+                            alarmStartedAtMs = 0L
                         ),
                         activeCommandStatus = CommandStatus.APPLIED
                     )
